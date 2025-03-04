@@ -1,0 +1,145 @@
+{
+  // ==========================================================================
+  // Ultra-Large Spectral Prediction Model Configuration (40,000+ points)
+  // ==========================================================================
+  // Highly optimized configuration for predicting extremely large spectral 
+  // sequences from atmospheric profile inputs.
+  // ==========================================================================
+
+  // Model will be automatically set to OptimizedLargeSequenceModel for 30k+ sequences
+  "model_type": "optimized_large_sequence",
+  
+  // ==========================================================================
+  // Data Configuration
+  // ==========================================================================
+  
+  // Input variables (features) for the model - atmospheric profile inputs
+  "input_variables": [
+    "pressure",       // Atmospheric pressure at each layer
+    "temperature",    // Temperature at each layer
+    "orbital_sep",    // Orbital separation
+    "grav",           // Gravity
+    "Tstar",          // Stellar temperature
+    "stellar_radius", // Stellar radius
+    "Rp",             // Planet radius
+    "planet_mass",    // Planet mass
+    "star_met",       // Stellar metallicity
+    "logg"            // Log of stellar surface gravity
+  ],
+  
+  // Target variables to predict - spectral outputs
+  "target_variables": [
+    "transit_depth"  // Transit depth at each wavelength
+  ],
+  
+  // Coordinate variables - define the spectral grid points
+  // Can be any name, not hardcoded to "wavenumber" - system will adapt to whatever is specified
+  "coordinate_variable": [
+    "wavenumber"      // Spectral coordinate (could be wavelength, wavenumber, frequency, etc.)
+  ],
+  
+  // Pressure range configuration for input profiles
+  "pressure_range": {
+    "min": 1e-6,      // Minimum pressure (bars)
+    "max": 100.0,     // Maximum pressure (bars)
+    "points": 100     // Number of pressure levels (input sequence length)
+  },
+  
+  // Fraction of data to use (1.0 = use all data)
+  "frac_of_data": 1.0,
+
+  // ==========================================================================
+  // Memory Efficiency Parameters (critical for ultra-large sequences)
+  // ==========================================================================
+  
+  // Extremely small chunk size for processing spectral points
+  "chunk_size": 100,
+  
+  // Enable mixed precision for massive memory savings
+  "use_mixed_precision": true,
+  "use_amp": true,
+  
+  // Progressive dimension reduction factor for memory efficiency
+  "bottleneck_factor": 4,
+
+  // ==========================================================================
+  // Model Architecture (optimized for ultra-large sequences)
+  // ==========================================================================
+  
+  // Hidden dimension - smaller for memory efficiency
+  "hidden_dim": 128,
+  
+  // Number of layers - fewer layers use less memory
+  "num_layers": 2,
+  
+  // Activation function: "relu" is most memory-efficient
+  "activation": "relu",
+  
+  // Loss function: "mse", "l1", or "smooth_l1"
+  "loss_function": "mse",
+
+  // ==========================================================================
+  // Regularization
+  // ==========================================================================
+  
+  // Dropout probability
+  "dropout": 0.1,
+  
+  // L2 regularization coefficient
+  "weight_decay": 1e-5,
+
+  // ==========================================================================
+  // Training Configuration
+  // ==========================================================================
+  
+  // Number of training epochs
+  "epochs": 100,
+  
+  // Batch size for training (very small for ultra-large sequences)
+  // Will be automatically reduced to 2 for sequences > 40k points
+  "batch_size": 4,
+  
+  // Number of worker processes for data loading
+  "num_workers": 4,
+  
+  // Early stopping patience (epochs without improvement before stopping)
+  "early_stopping_patience": 15,
+  
+  // Minimum improvement to count as progress for early stopping
+  "min_delta": 1e-6,
+  
+  // Maximum gradient norm for gradient clipping
+  "gradient_clip_val": 1.0,
+  
+  // Number of epochs to wait before reducing learning rate
+  "lr_patience": 5,
+
+  // ==========================================================================
+  // Optimizer Configuration
+  // ==========================================================================
+  
+  // Optimizer type: "adamw", "adam", "sgd"
+  "optimizer": "adamw",
+  
+  // Base learning rate
+  "learning_rate": 5e-5,
+  
+  // Minimum learning rate
+  "min_lr": 1e-7,
+  
+  // Learning rate decay factor
+  "gamma": 0.5,
+  
+  // ==========================================================================
+  // Hyperparameter Tuning Configuration
+  // ==========================================================================
+  
+  // Reduced trials for ultra-large sequences
+  "hypertuning_trials": 10,
+  
+  // Fewer epochs per hyperparameter tuning trial
+  "hypertuning_epochs": 5,
+  
+  // Random seed for reproducibility
+  "random_seed": 42
+}
