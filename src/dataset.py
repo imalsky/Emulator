@@ -22,7 +22,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-class SpectralProfileDataset(Dataset):
+class Dataset(Dataset):
     """
     PyTorch Dataset for atmospheric profile data paired with spectral outputs.
     
@@ -377,6 +377,12 @@ class SpectralProfileDataset(Dataset):
                     
                     coordinates = coord_data
                     break  # Use the first available coordinate variable
+            
+            # If no coordinate variable was found in the profile but it was requested,
+            # generate a default set of coordinates
+            if coordinates is None and self.coordinate_variable:
+                logger.debug(f"No coordinate variable found in profile for {file_path.name}, generating default coordinates")
+                coordinates = torch.linspace(0, 1, output_seq_length, dtype=torch.float32)
         
         # Update cache
         if len(self.cache) >= self.cache_size:
@@ -413,6 +419,19 @@ class SpectralProfileDataset(Dataset):
                 logger.warning(f"Reducing batch size from {batch_size} to 4 due to large sequence length")
                 batch_size = 4
         
+        # Check if dataset is empty
+        if len(dataset) == 0:
+            logger.error("Dataset is empty - cannot create DataLoader")
+            raise ValueError("Cannot create DataLoader from empty dataset")
+            
+        # Check persistent_workers setting with num_workers
+        if persistent_workers and num_workers == 0:
+            logger.warning("persistent_workers=True has no effect when num_workers=0, setting to False")
+            persistent_workers = False
+        
+        # Set prefetch_factor only if num_workers > 0
+        prefetch_factor = 2 if num_workers > 0 else None
+        
         return DataLoader(
             dataset,
             batch_size=batch_size,
@@ -420,6 +439,6 @@ class SpectralProfileDataset(Dataset):
             num_workers=num_workers,
             pin_memory=pin_memory and torch.cuda.is_available(),
             persistent_workers=persistent_workers and num_workers > 0,
-            prefetch_factor=2 if num_workers > 0 else None,
+            prefetch_factor=prefetch_factor,
             drop_last=drop_last
         )

@@ -1,14 +1,10 @@
 {
   // ==========================================================================
-  // Ultra-Large Spectral Prediction Model Configuration (40,000+ points)
+  // Spectral Prediction Model Configuration
   // ==========================================================================
-  // Highly optimized configuration for predicting extremely large spectral 
-  // sequences from atmospheric profile inputs.
+  // Configuration for predicting spectral sequences from atmospheric profiles
   // ==========================================================================
 
-  // Model will be automatically set to OptimizedLargeSequenceModel for 30k+ sequences
-  "model_type": "optimized_large_sequence",
-  
   // ==========================================================================
   // Data Configuration
   // ==========================================================================
@@ -17,93 +13,120 @@
   "input_variables": [
     "pressure",       // Atmospheric pressure at each layer
     "temperature",    // Temperature at each layer
-    "orbital_sep",    // Orbital separation
-    "grav",           // Gravity
-    "Tstar",          // Stellar temperature
-    "stellar_radius", // Stellar radius
-    "Rp",             // Planet radius
-    "planet_mass",    // Planet mass
-    "star_met",       // Stellar metallicity
-    "logg"            // Log of stellar surface gravity
+    "orbital_sep"    // Orbital separation
   ],
   
   // Target variables to predict - spectral outputs
   "target_variables": [
-    "transit_depth"  // Transit depth at each wavelength
+    "thermal_net_flux",
+    "reflected_net_flux"    
   ],
   
   // Coordinate variables - define the spectral grid points
-  // Can be any name, not hardcoded to "wavenumber" - system will adapt to whatever is specified
   "coordinate_variable": [
-    "wavenumber"      // Spectral coordinate (could be wavelength, wavenumber, frequency, etc.)
+    "pressure"    
   ],
   
   // Pressure range configuration for input profiles
   "pressure_range": {
-    "min": 1e-6,      // Minimum pressure (bars)
+    "min": 1e-5,      // Minimum pressure (bars)
     "max": 100.0,     // Maximum pressure (bars)
-    "points": 100     // Number of pressure levels (input sequence length)
+    "points": 50     // Number of pressure levels (input sequence length)
   },
   
   // Fraction of data to use (1.0 = use all data)
   "frac_of_data": 1.0,
 
   // ==========================================================================
-  // Memory Efficiency Parameters (critical for ultra-large sequences)
+  // Data Normalization
+  // ==========================================================================
+  "normalization": {
+    // Specific normalization methods for individual variables
+    "key_methods": {
+      "pressure": "log-min-max",
+      "thermal_net_flux": "custom",
+      "reflected_net_flux": "custom"
+    },
+    // Default method for variables not specified in key_methods
+    "default_method": "iqr",
+    // Whether to clip outliers before normalization
+    "clip_outliers_before_scaling": false
+  },
+
+  // ==========================================================================
+  // Memory Efficiency Parameters
   // ==========================================================================
   
-  // Extremely small chunk size for processing spectral points
-  "chunk_size": 100,
-  
-  // Enable mixed precision for massive memory savings
+  // Enable mixed precision for memory savings
   "use_mixed_precision": true,
   "use_amp": true,
   
-  // Progressive dimension reduction factor for memory efficiency
-  "bottleneck_factor": 4,
+  // Chunk size for processing long sequences
+  "chunk_size": 5000,
 
   // ==========================================================================
-  // Model Architecture (optimized for ultra-large sequences)
+  // Model Architecture
   // ==========================================================================
   
-  // Hidden dimension - smaller for memory efficiency
-  "hidden_dim": 128,
+  // Hidden dimension size
+  "hidden_dim": 256,
   
-  // Number of layers - fewer layers use less memory
-  "num_layers": 2,
+  // Number of attention heads (must divide hidden_dim evenly)
+  "nhead": 4,
   
-  // Activation function: "relu" is most memory-efficient
-  "activation": "relu",
+  // Number of transformer layers
+  "num_layers": 8,
   
-  // Loss function: "mse", "l1", or "smooth_l1"
-  "loss_function": "mse",
+  // Feedforward dimension (typically 2-4x hidden_dim)
+  "dim_feedforward": 1024,
+  
+  // Positional encoding dimension for coordinates
+  "pos_encoding_dim": 64,
+  
+  // Maximum frequency for positional encoding
+  "max_freq": 50.0,
+  
+  // Positional encoding type: "sine" (fixed sinusoidal) or "learned" (trainable)
+  "pos_encoding_type": "sine",
+
+  // Integration method for global and sequential features
+  // "add" (simple addition), "film" (feature-wise linear modulation), "concat" (concatenation)
+  "integration_method": "film",
+  
+  // Use torch.compile for acceleration (if available)
+  "use_torch_compile": true,
+  
+  // Stochastic depth rate for regularization (0.0 = disabled)
+  "stochastic_depth_rate": 0.1,
 
   // ==========================================================================
   // Regularization
   // ==========================================================================
   
   // Dropout probability
-  "dropout": 0.1,
+  "dropout": 0.05,
   
   // L2 regularization coefficient
   "weight_decay": 1e-5,
+  
+  // Loss function: "mse", "l1", or "smooth_l1"
+  "loss_function": "mse",
 
   // ==========================================================================
   // Training Configuration
   // ==========================================================================
   
   // Number of training epochs
-  "epochs": 100,
+  "epochs": 60,
   
-  // Batch size for training (very small for ultra-large sequences)
-  // Will be automatically reduced to 2 for sequences > 40k points
-  "batch_size": 4,
+  // Batch size for training
+  "batch_size": 16,
   
   // Number of worker processes for data loading
   "num_workers": 4,
   
   // Early stopping patience (epochs without improvement before stopping)
-  "early_stopping_patience": 15,
+  "early_stopping_patience": 20,
   
   // Minimum improvement to count as progress for early stopping
   "min_delta": 1e-6,
@@ -122,23 +145,13 @@
   "optimizer": "adamw",
   
   // Base learning rate
-  "learning_rate": 5e-5,
+  "learning_rate": 3e-4,
   
   // Minimum learning rate
   "min_lr": 1e-7,
   
   // Learning rate decay factor
   "gamma": 0.5,
-  
-  // ==========================================================================
-  // Hyperparameter Tuning Configuration
-  // ==========================================================================
-  
-  // Reduced trials for ultra-large sequences
-  "hypertuning_trials": 10,
-  
-  // Fewer epochs per hyperparameter tuning trial
-  "hypertuning_epochs": 5,
   
   // Random seed for reproducibility
   "random_seed": 42

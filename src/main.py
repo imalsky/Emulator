@@ -1,71 +1,90 @@
 #!/usr/bin/env python3
 """
-main_spectral.py - Entry point for spectral prediction pipeline
-Handles ultra-large spectral sequences (up to 40,000 points)
+main.py - Entry point 
 """
 
 import sys
 import argparse
 import logging
 from pathlib import Path
-import os
 import torch
 import numpy as np
 
 from utils import setup_logging, load_config, setup_device, ensure_dirs, save_json
 
-logger = logging.getLogger("spectral_prediction")
+logger = logging.getLogger("Prediction")
 
-
-def normalize_spectral_data(config=None):
+def normalize_data(config=None):
     """
-    Normalize input profiles and spectral data.
+    Normalize raw profile data using global statistics.
     
     Parameters
     ----------
     config : dict, optional
-        Configuration dictionary that may contain coordinate_variable info
+        Configuration dictionary which may contain normalization settings
+    
+    Returns
+    -------
+    bool
+        True if normalization succeeds, False otherwise
     """
     try:
-        from normalizer import SpectralDataNormalizer
+        from normalizer import DataNormalizer
+        import shutil
+        import time
         
+        logger.info("Starting data normalization...")
+        
+        # Setup directories with fixed paths
         raw_dir = "data/profiles"
         norm_dir = "data/normalized_profiles"
-        Path(norm_dir).mkdir(parents=True, exist_ok=True)
+        norm_dir_path = Path(norm_dir)
+            
+        norm_dir_path.mkdir(parents=True, exist_ok=True)
         
-        # Set up variable methods - adjust based on your data characteristics
-        variable_methods = {
-            "pressure": "log",           # Log scaling works well for pressure values
-            "temperature": "standard",   # Z-score for temperature
-            "transit_depth": "standard",  # Z-score for target values
-            "wavenumber": "log"
-        }
+        # Initialize normalizer
+        normalizer = DataNormalizer(raw_dir, norm_dir)
         
-        # Add coordinate variables dynamically from config if available
-        #if config and "coordinate_variable" in config:
-        #    for coord_var in config["coordinate_variable"]:
-        #        logger.info(f"Setting normalization method for coordinate variable '{coord_var}' to 'log'")
-        #        variable_methods[coord_var] = "log"
+        # Get normalization settings from config if available
+        key_methods = {}
+        default_method = "iqr"
+        clip_outliers = False
         
-        normalizer = SpectralDataNormalizer(raw_dir, norm_dir)
+        if config is not None:
+            # Extract normalization settings from config
+            norm_config = config.get("normalization", {})
+            key_methods = norm_config.get("key_methods", {})
+            default_method = norm_config.get("default_method", default_method)
+            clip_outliers = norm_config.get("clip_outliers_before_scaling", clip_outliers)
+        
+        # Calculate global statistics
+        logger.info("Calculating global normalization statistics...")
         stats = normalizer.calculate_global_stats(
-            variable_methods=variable_methods,
-            default_method="standard"
+            key_methods=key_methods,
+            default_method=default_method,
+            clip_outliers_before_scaling=clip_outliers,
         )
         
-        normalizer.process_data(stats)
+        # Process and normalize profiles
+        logger.info("Applying normalization to profiles...")
+        normalizer.process_profiles(stats)
+        
+        logger.info("Data normalization completed successfully")
         return True
+
     except Exception as e:
         logger.error(f"Data normalization failed: {e}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Detailed error:", exc_info=True)
         return False
 
 
-def setup_spectral_dataset(config):
-    """Initialize dataset with improved auto-detection for ultra-large spectral sequences."""
+def setup_dataset(config):
+    """Initialize dataset with improved auto-detection for ultra-large sequences."""
     try:
-        from dataset import SpectralProfileDataset
+        from dataset import Dataset
         
-        logger.info("Initializing spectral dataset with auto variable detection...")
+        logger.info("Initializing dataset with auto variable detection...")
         
         # Check for required configuration
         required_keys = ["input_variables", "target_variables"]
@@ -84,10 +103,10 @@ def setup_spectral_dataset(config):
             input_seq_length = config["pressure_range"].get("points", 100)
             logger.info(f"Using pressure_range.points ({input_seq_length}) for input_seq_length")
         
-        # Let the dataset auto-detect output sequence length if not specified
+        # Let the dataset auto-detect output sequence length
         output_seq_length = config.get("output_seq_length", None)
         
-        full_dataset = SpectralProfileDataset(
+        full_dataset = Dataset(
             data_folder="data/normalized_profiles",
             input_seq_length=input_seq_length,
             output_seq_length=output_seq_length,
@@ -135,13 +154,14 @@ def setup_spectral_dataset(config):
         return None
 
 
-def train_spectral_model(config, device, dataset):
-    """Train a spectral prediction model with optimizations for large sequences."""
+def train_model(config, device, dataset):
+    """Train a prediction model with optimizations for large sequences."""
     try:
-        if not dataset:
+        if dataset is None:
+            logger.error("Cannot train model: dataset is None")
             return False
         
-        model_dir = "data/spectral_model"
+        model_dir = "data/model"
         Path(model_dir).mkdir(parents=True, exist_ok=True)
         
         # Adjust batch size automatically for ultra-large sequences
@@ -175,9 +195,10 @@ def train_spectral_model(config, device, dataset):
         
         if final_model_path:
             test_metrics = trainer.test()
-            logger.info(f"Test metrics: {test_metrics}")
+            logger.info(f"Test metrics: {test_metrics:.3e}")
             return True
         else:
+            logger.warning("Training did not produce a final model")
             return False
     except Exception as e:
         logger.error(f"Model training failed: {e}")
@@ -185,10 +206,15 @@ def train_spectral_model(config, device, dataset):
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Spectral prediction pipeline")
+    # Get directory where this script is located
+    script_dir = Path(__file__).parent.absolute()
+    project_root = script_dir.parent  # Go up one level to project root
+    default_config = project_root / "inputs" / "model_input_params.jsonc"
+    
+    parser = argparse.ArgumentParser(description="Prediction pipeline")
     parser.add_argument("--normalize-data", action="store_true", help="Normalize data")
     parser.add_argument("--train-model", action="store_true", help="Train model")
-    parser.add_argument("--config", type=str, default="inputs/model_input_params.jsonc", 
+    parser.add_argument("--config", type=str, default=str(default_config), 
                         help="Configuration file path")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     return parser.parse_args()
@@ -198,27 +224,32 @@ def main():
     args = parse_arguments()
     setup_logging(level=logging.DEBUG if args.debug else logging.INFO)
     
-    ensure_dirs("data/profiles", "data/normalized_profiles", "data/spectral_model")
+    ensure_dirs("data/profiles", "data/normalized_profiles", "data/model")
     
     overall_success = True
     
     # Load config early so we can use it for normalization
     config = None
     if args.train_model or args.normalize_data:
-        config = load_config(args.config)
-        if not config and (args.train_model):
+        config_path = Path(args.config)
+        if not config_path.exists():
+            logger.error(f"Config file not found: {config_path}")
+            return False
+            
+        config = load_config(str(config_path))
+        if not config and args.train_model:
+            logger.error("Failed to load config file and training was requested")
             return False
     
     if args.normalize_data:
-        success = normalize_spectral_data(config)
+        success = normalize_data(config)
         overall_success = overall_success and success
     
-    if overall_success and (args.train_model):
+    if overall_success and args.train_model:
         if not config:
             # Should never happen due to earlier check, but just in case
-            config = load_config(args.config)
-            if not config:
-                return False
+            logger.error("Config is required for training")
+            return False
         
         device = setup_device()
         
@@ -229,13 +260,13 @@ def main():
         if device.type == "cuda":
             torch.cuda.manual_seed_all(random_seed)
         
-        dataset = setup_spectral_dataset(config)
+        dataset = setup_dataset(config)
         if dataset is None:
+            logger.error("Failed to setup dataset")
             return False
         
-        if args.train_model:
-            success = train_spectral_model(config, device, dataset)
-            overall_success = overall_success and success
+        success = train_model(config, device, dataset)
+        overall_success = overall_success and success
     
     return overall_success
 
