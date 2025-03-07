@@ -17,10 +17,10 @@ import os
 import json
 from pathlib import Path
 from typing import Dict, Any,  Union, Optional
-
+import random
 import torch
 import numpy as np
-
+import re
 
 def setup_logging(level=logging.INFO, log_file: Optional[str] = None):
     """
@@ -90,7 +90,6 @@ def load_config(config_path: str) -> Optional[Dict[str, Any]]:
             def json_loader(f):
                 content = f.read()
                 # Remove both single-line and multi-line comments (basic approach)
-                import re
                 content = re.sub(r'//.*?$', '', content, flags=re.MULTILINE)
                 content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
                 return json.loads(content)
@@ -296,8 +295,6 @@ def seed_everything(seed: int = 42) -> None:
     seed : int
         Seed value to use
     """
-    import random
-    
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-train.py - Training infrastructure for sequence prediction models.
-"""
-
 import time
 import json
 import logging
@@ -38,8 +33,9 @@ class ModelTrainer:
         self._prepare_datasets(dataset, test_size, val_size)
         self._create_dataloaders()
         
-        # Initialize model
-        self.model = create_prediction_model(config).to(device)
+        # Initialize model - pass sample data for automatic feature detection
+        sample_data = dataset[0][0] if hasattr(dataset, '__getitem__') else None
+        self.model = create_prediction_model(config, sample_data=sample_data).to(device)
         logger.info(f"Model created with {self.model.count_parameters():,} parameters")
         
         # Setup training components
@@ -49,6 +45,9 @@ class ModelTrainer:
         self.best_val_loss = float("inf")
         self.best_state = None
         self.best_epoch = -1
+        
+        # Save test profile names
+        self._save_test_profiles(dataset)
 
     def _prepare_datasets(self, dataset, test_size, val_size):
         """Split dataset into training, validation, and test sets."""
@@ -58,11 +57,31 @@ class ModelTrainer:
         train_count = dataset_size - test_count - val_count
 
         generator = torch.Generator().manual_seed(42)
-        self.train_dataset, self.val_dataset, self.test_dataset = random_split(
+        # Get the splits from random_split and ensure we get three datasets back
+        splits = random_split(
             dataset, [train_count, val_count, test_count], generator=generator
         )
+        self.train_dataset, self.val_dataset, self.test_dataset = splits
         
         logger.info(f"Dataset split: {train_count} train, {val_count} validation, {test_count} test samples")
+
+    def _save_test_profiles(self, dataset):
+        """Save the names of test profiles to a file."""
+        try:
+            if hasattr(dataset, 'filenames') and hasattr(self.test_dataset, 'indices'):
+                # Get the test profile names using indices
+                test_profile_names = [dataset.filenames[i] for i in self.test_dataset.indices]
+                
+                # Save to a JSON file in the model directory
+                test_profiles_path = self.save_path / "test_profiles.json"
+                with open(test_profiles_path, 'w') as f:
+                    json.dump(test_profile_names, f, indent=2)
+                
+                logger.info(f"Saved {len(test_profile_names)} test profile names to {test_profiles_path}")
+            else:
+                logger.warning("Could not save test profile names - dataset missing required attributes")
+        except Exception as e:
+            logger.error(f"Error saving test profile names: {str(e)}")
 
     def _create_dataloaders(self):
         """Create DataLoaders for training, validation, and testing."""
@@ -245,13 +264,11 @@ class ModelTrainer:
         
         for batch_idx, batch in enumerate(self.train_loader):
             try:
-                # Extract inputs, targets and coordinates from batch
+                # Extract inputs and targets from batch (ignore coordinates for now)
                 if len(batch) == 3:
-                    inputs, targets, coordinates = batch
-                    coordinates = coordinates.to(device=self.device, dtype=torch.float32)
+                    inputs, targets, _ = batch
                 else:
                     inputs, targets = batch
-                    coordinates = None
                 
                 # Move data to device
                 inputs = inputs.to(device=self.device, dtype=torch.float32)
@@ -263,7 +280,8 @@ class ModelTrainer:
                 # Forward pass with mixed precision if enabled
                 if self.use_amp and self.scaler is not None:
                     with torch.amp.autocast(device_type=self.device.type, enabled=True):
-                        outputs = self.model(inputs, coordinates)
+                        # Use just inputs for our model (fixed model doesn't use coordinates)
+                        outputs = self.model(inputs)
                         loss = self.criterion(outputs, targets)
                     
                     # Skip batch if loss is NaN
@@ -288,7 +306,8 @@ class ModelTrainer:
                 else:
                     # Standard precision training
                     try:
-                        outputs = self.model(inputs, coordinates)
+                        # Use just inputs for our model
+                        outputs = self.model(inputs)
                         loss = self.criterion(outputs, targets)
                         
                         # Skip batch if loss is NaN
@@ -306,6 +325,7 @@ class ModelTrainer:
                         
                         self.optimizer.step()
                     except RuntimeError as e:
+                        logger.warning(f"RuntimeError in training: {str(e)}")
                         # Clear CUDA cache if applicable
                         if self.device.type == 'cuda' and torch.cuda.is_available():
                             torch.cuda.empty_cache()
@@ -331,13 +351,11 @@ class ModelTrainer:
         
         for batch_idx, batch in enumerate(self.val_loader):
             try:
-                # Extract inputs, targets and coordinates from batch
+                # Extract inputs and targets from batch (ignore coordinates for now)
                 if len(batch) == 3:
-                    inputs, targets, coordinates = batch
-                    coordinates = coordinates.to(device=self.device, dtype=torch.float32)
+                    inputs, targets, _ = batch
                 else:
                     inputs, targets = batch
-                    coordinates = None
                 
                 # Move data to device
                 inputs = inputs.to(device=self.device, dtype=torch.float32)
@@ -347,10 +365,10 @@ class ModelTrainer:
                     # Forward pass
                     if self.use_amp and self.device.type == 'cuda':
                         with torch.amp.autocast(device_type=self.device.type, enabled=True):
-                            outputs = self.model(inputs, coordinates)
+                            outputs = self.model(inputs)
                             loss = self.criterion(outputs, targets)
                     else:
-                        outputs = self.model(inputs, coordinates)
+                        outputs = self.model(inputs)
                         loss = self.criterion(outputs, targets)
                     
                     # Skip batch if loss is NaN
@@ -359,12 +377,14 @@ class ModelTrainer:
                         
                     total_loss += loss.item()
                     batch_count += 1
-                except RuntimeError:
+                except RuntimeError as e:
+                    logger.warning(f"RuntimeError in evaluation: {str(e)}")
                     if self.device.type == 'cuda' and torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     continue
                 
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Exception in evaluation: {str(e)}")
                 continue
         
         # Return average loss
@@ -380,13 +400,11 @@ class ModelTrainer:
         
         for batch in self.test_loader:
             try:
-                # Extract inputs, targets and coordinates from batch
+                # Extract inputs and targets from batch (ignore coordinates for now)
                 if len(batch) == 3:
-                    inputs, targets, coordinates = batch
-                    coordinates = coordinates.to(device=self.device, dtype=torch.float32)
+                    inputs, targets, _ = batch
                 else:
                     inputs, targets = batch
-                    coordinates = None
                 
                 # Move data to device
                 inputs = inputs.to(device=self.device, dtype=torch.float32)
@@ -396,10 +414,10 @@ class ModelTrainer:
                     # Forward pass
                     if self.use_amp and self.device.type == 'cuda':
                         with torch.amp.autocast(device_type=self.device.type, enabled=True):
-                            outputs = self.model(inputs, coordinates)
+                            outputs = self.model(inputs)
                             loss = self.criterion(outputs, targets)
                     else:
-                        outputs = self.model(inputs, coordinates)
+                        outputs = self.model(inputs)
                         loss = self.criterion(outputs, targets)
                     
                     # Skip batch if loss is NaN
@@ -408,12 +426,14 @@ class ModelTrainer:
                         
                     total_loss += loss.item()
                     batch_count += 1
-                except RuntimeError:
+                except RuntimeError as e:
+                    logger.warning(f"RuntimeError in testing: {str(e)}")
                     if self.device.type == 'cuda' and torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     continue
                     
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Exception in testing: {str(e)}")
                 continue
         
         # Return test loss

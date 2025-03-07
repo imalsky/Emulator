@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-model.py
+enhanced_transformer_model.py
 
-Encoder-Decoder Transformer models for atmospheric variable prediction, with model creation functions
+Transformer models for atmospheric variable prediction, with model creation functions
 that maintain compatibility with train.py.
 """
 
@@ -120,87 +120,6 @@ class MultiHeadAttention(nn.Module):
         return torch.matmul(attn_weights, v)
 
 
-class CrossAttention(nn.Module):
-    """Cross-attention module for decoder to attend to encoder outputs."""
-    
-    def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
-        super().__init__()
-        assert d_model % nhead == 0, f"d_model ({d_model}) must be divisible by nhead ({nhead})"
-        
-        self.d_model = d_model
-        self.nhead = nhead
-        self.head_dim = d_model // nhead
-        self.scale = self.head_dim ** -0.5
-        
-        # Separate projections for query, key, value
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-        
-        # Check if Flash Attention is available
-        self.use_flash = hasattr(F, 'scaled_dot_product_attention')
-    
-    def _reshape_for_multi_head(self, x, batch_size):
-        """Reshape input for multi-head attention."""
-        # x shape: [batch_size, seq_len, d_model]
-        # Reshape to [batch_size, nhead, seq_len, head_dim]
-        return x.view(batch_size, -1, self.nhead, self.head_dim).transpose(1, 2)
-    
-    def forward(self, query, key_value, attn_mask=None):
-        """
-        Forward pass for cross-attention.
-        
-        Args:
-            query: Query tensor from decoder [batch_size, tgt_len, d_model]
-            key_value: Key/value tensor from encoder [batch_size, src_len, d_model]
-            attn_mask: Optional mask tensor [batch_size, nhead, tgt_len, src_len]
-            
-        Returns:
-            attn_output: Attention output [batch_size, tgt_len, d_model]
-        """
-        batch_size, tgt_len = query.shape[:2]
-        src_len = key_value.shape[1]
-        
-        # Project and reshape
-        q = self._reshape_for_multi_head(self.q_proj(query), batch_size)  # [batch, nhead, tgt_len, head_dim]
-        k = self._reshape_for_multi_head(self.k_proj(key_value), batch_size)  # [batch, nhead, src_len, head_dim]
-        v = self._reshape_for_multi_head(self.v_proj(key_value), batch_size)  # [batch, nhead, src_len, head_dim]
-        
-        # Use Flash Attention if available
-        if self.use_flash and torch.cuda.is_available():
-            try:
-                attn_output = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, dropout_p=self.dropout.p if self.training else 0.0
-                )
-            except Exception as e:
-                logger.warning(f"Flash attention failed ({e}); falling back to standard attention")
-                attn_output = self._standard_cross_attention(q, k, v, attn_mask)
-        else:
-            attn_output = self._standard_cross_attention(q, k, v, attn_mask)
-        
-        # Reshape and project output
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, tgt_len, self.d_model)
-        return self.out_proj(attn_output)
-    
-    def _standard_cross_attention(self, q, k, v, attn_mask):
-        """Standard scaled dot-product cross-attention."""
-        # Scale dot product
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        
-        # Apply mask if provided
-        if attn_mask is not None:
-            attn_weights = attn_weights + attn_mask
-            
-        # Softmax and dropout
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # Apply attention to values
-        return torch.matmul(attn_weights, v)
-
-
 class FeedForward(nn.Module):
     """Feed-forward network with residual connection."""
     
@@ -293,84 +212,6 @@ class TransformerEncoderLayer(nn.Module):
         return src
 
 
-class TransformerDecoderLayer(nn.Module):
-    """Transformer decoder layer with pre-norm or post-norm architecture."""
-    
-    def __init__(
-        self, d_model: int, nhead: int, dim_feedforward: int = 2048,
-        dropout: float = 0.1, activation: str = "gelu", norm_first: bool = True,
-        drop_path_rate: float = 0.0, layer_norm_eps: float = 1e-5
-    ):
-        super().__init__()
-        self.norm_first = norm_first
-        
-        # Self-attention block
-        self.self_attn = MultiHeadAttention(d_model, nhead, dropout)
-        self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
-        self.dropout1 = nn.Dropout(dropout)
-        
-        # Cross-attention block
-        self.cross_attn = CrossAttention(d_model, nhead, dropout)
-        self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps)
-        self.dropout2 = nn.Dropout(dropout)
-        
-        # Feedforward block
-        self.ff = FeedForward(d_model, dim_feedforward, dropout, activation)
-        self.norm3 = nn.LayerNorm(d_model, eps=layer_norm_eps)
-        self.dropout3 = nn.Dropout(dropout)
-        
-        # Optional stochastic depth
-        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
-    
-    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None):
-        """
-        Forward pass for decoder layer.
-        
-        Args:
-            tgt: Target sequence [batch_size, tgt_len, d_model]
-            memory: Encoder output [batch_size, src_len, d_model]
-            tgt_mask: Optional mask for target sequence [batch_size, nhead, tgt_len, tgt_len]
-            memory_mask: Optional mask for source sequence [batch_size, nhead, tgt_len, src_len]
-            
-        Returns:
-            tgt: Processed target sequence [batch_size, tgt_len, d_model]
-        """
-        if self.norm_first:
-            # Pre-norm
-            # Self-attention block
-            tgt2 = self.norm1(tgt)
-            tgt2 = self.self_attn(tgt2, tgt_mask)
-            tgt = tgt + self.drop_path(self.dropout1(tgt2))
-            
-            # Cross-attention block
-            tgt2 = self.norm2(tgt)
-            tgt2 = self.cross_attn(tgt2, memory, memory_mask)
-            tgt = tgt + self.drop_path(self.dropout2(tgt2))
-            
-            # Feedforward block
-            tgt2 = self.norm3(tgt)
-            tgt2 = self.ff(tgt2)
-            tgt = tgt + self.drop_path(self.dropout3(tgt2))
-        else:
-            # Post-norm
-            # Self-attention block
-            tgt2 = self.self_attn(tgt, tgt_mask)
-            tgt = tgt + self.drop_path(self.dropout1(tgt2))
-            tgt = self.norm1(tgt)
-            
-            # Cross-attention block
-            tgt2 = self.cross_attn(tgt, memory, memory_mask)
-            tgt = tgt + self.drop_path(self.dropout2(tgt2))
-            tgt = self.norm2(tgt)
-            
-            # Feedforward block
-            tgt2 = self.ff(tgt)
-            tgt = tgt + self.drop_path(self.dropout3(tgt2))
-            tgt = self.norm3(tgt)
-            
-        return tgt
-
-
 class TransformerEncoder(nn.Module):
     """Stack of transformer encoder layers."""
     
@@ -417,63 +258,6 @@ class TransformerEncoder(nn.Module):
         return output
 
 
-class TransformerDecoder(nn.Module):
-    """Stack of transformer decoder layers."""
-    
-    def __init__(
-        self, d_model: int, nhead: int, num_layers: int, dim_feedforward: int = 2048,
-        dropout: float = 0.1, activation: str = "gelu", norm_first: bool = True,
-        layer_norm_eps: float = 1e-5, stochastic_depth_rate: float = 0.0
-    ):
-        super().__init__()
-        
-        # Generate stochastic depth rates if needed
-        drop_path_rates = None
-        if stochastic_depth_rate > 0:
-            drop_path_rates = torch.linspace(0, stochastic_depth_rate, num_layers).tolist()
-        
-        # Create layers
-        self.layers = nn.ModuleList([
-            TransformerDecoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                activation=activation,
-                norm_first=norm_first,
-                layer_norm_eps=layer_norm_eps,
-                drop_path_rate=drop_path_rates[i] if drop_path_rates else 0.0
-            )
-            for i in range(num_layers)
-        ])
-        
-        # Final normalization for pre-norm architecture
-        self.norm = nn.LayerNorm(d_model, eps=layer_norm_eps) if norm_first else None
-    
-    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None):
-        """
-        Process target through all decoder layers.
-        
-        Args:
-            tgt: Target sequence [batch_size, tgt_len, d_model]
-            memory: Encoder output [batch_size, src_len, d_model]
-            tgt_mask: Optional mask for target sequence [batch_size, nhead, tgt_len, tgt_len]
-            memory_mask: Optional mask for source sequence [batch_size, nhead, tgt_len, src_len]
-            
-        Returns:
-            output: Processed target sequence [batch_size, tgt_len, d_model]
-        """
-        output = tgt
-        
-        for layer in self.layers:
-            output = layer(output, memory, tgt_mask, memory_mask)
-            
-        if self.norm is not None:
-            output = self.norm(output)
-            
-        return output
-
-
 class OutputHead(nn.Module):
     """Output projection with optional MLP."""
     
@@ -513,7 +297,7 @@ class OutputHead(nn.Module):
 
 class AtmosphericModel(nn.Module):
     """
-    Transformer encoder-decoder model that handles both sequential and global features.
+    Transformer model that handles both sequential and global features.
     
     Sequential features: Variables that change by position in sequence (e.g., pressure profiles)
     Global features: Variables constant across all positions (e.g., orbital parameters)
@@ -522,8 +306,7 @@ class AtmosphericModel(nn.Module):
     def __init__(
         self, nx_seq: int, nx_global: int, ny: int,
         seq_indices: List[int], global_indices: List[int],
-        d_model: int = 256, nhead: int = 8, 
-        num_encoder_layers: int = 6, num_decoder_layers: int = 6,
+        d_model: int = 256, nhead: int = 8, num_encoder_layers: int = 6,
         dim_feedforward: int = 1024, dropout: float = 0.1, activation: str = "gelu",
         norm_first: bool = True, max_seq_length: int = 512, pos_encoding_type: str = "sine",
         mlp_layers: int = 3, mlp_hidden_dim: Optional[int] = None,
@@ -542,8 +325,9 @@ class AtmosphericModel(nn.Module):
         self.batch_first = batch_first
         
         # Sequence length tracking
-        self.input_seq_length = default_input_seq_length
+        self.input_seq_length = None
         self.output_seq_length = default_output_seq_length
+        self.default_input_seq_length = default_input_seq_length or max_seq_length
         
         # Store feature indices for forward pass
         self.seq_indices = seq_indices
@@ -555,11 +339,8 @@ class AtmosphericModel(nn.Module):
         # Sequential feature projection
         self.seq_proj = nn.Linear(nx_seq, d_model)
         
-        # Positional encodings
-        self.encoder_pos_encoder = PositionalEncoding(
-            d_model, max_seq_length, dropout, pos_encoding_type
-        )
-        self.decoder_pos_encoder = PositionalEncoding(
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(
             d_model, max_seq_length, dropout, pos_encoding_type
         )
         
@@ -585,7 +366,7 @@ class AtmosphericModel(nn.Module):
                 raise ValueError(f"Unknown integration method: {integration_method}")
         
         # Transformer encoder
-        self.encoder = TransformerEncoder(
+        self.transformer = TransformerEncoder(
             d_model=d_model,
             nhead=nhead,
             num_layers=num_encoder_layers,
@@ -596,22 +377,6 @@ class AtmosphericModel(nn.Module):
             layer_norm_eps=layer_norm_eps,
             stochastic_depth_rate=stochastic_depth_rate
         )
-        
-        # Transformer decoder
-        self.decoder = TransformerDecoder(
-            d_model=d_model,
-            nhead=nhead,
-            num_layers=num_decoder_layers,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation=activation,
-            norm_first=norm_first,
-            layer_norm_eps=layer_norm_eps,
-            stochastic_depth_rate=stochastic_depth_rate
-        )
-        
-        # Decoder initial input projection
-        self.decoder_input_proj = nn.Linear(1, d_model)
         
         # Output projection
         self.output_head = OutputHead(
@@ -664,34 +429,16 @@ class AtmosphericModel(nn.Module):
                 logger.warning(f"Compilation failed: {e}")
         return self
     
-    def _generate_square_subsequent_mask(self, sz, device):
-        """Generate a square mask for the sequence to hide future positions."""
-        mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
-    
-    def _create_causal_mask(self, tgt_len, device):
-        """Create a causal mask to prevent attending to future positions."""
-        return self._generate_square_subsequent_mask(tgt_len, device)
-        
-    def _get_decoder_input(self, batch_size, target_seq_length, device):
-        """Generate initial decoder input sequence."""
-        # Create a position embedding tensor for the decoder to start from
-        # This is a learned starting point for the decoder
-        return torch.zeros(batch_size, target_seq_length, 1, device=device)
-    
-    def forward(self, src, target_seq_length=None, tgt_mask=None, memory_mask=None):
+    def forward(self, src, target_seq_length=None):
         """
         Forward pass integrating sequential and global features.
         
         Args:
             src: Input tensor [batch_size, seq_length, features]
             target_seq_length: Optional output sequence length
-            tgt_mask: Optional mask for target sequence
-            memory_mask: Optional mask for source-target attention
             
         Returns:
-            outputs: Model outputs [batch_size, target_seq_length, output_features]
+            outputs: Model outputs [batch_size, seq_length, output_features]
         """
         # Convert to float32 for better numerical stability
         src = src.to(torch.float32)
@@ -703,7 +450,6 @@ class AtmosphericModel(nn.Module):
             self.input_seq_length = current_input_seq_length
             logger.debug(f"Input sequence length set to {self.input_seq_length}")
         
-        # Determine target sequence length
         if target_seq_length is not None:
             if self.output_seq_length != target_seq_length:
                 self.output_seq_length = target_seq_length
@@ -711,10 +457,6 @@ class AtmosphericModel(nn.Module):
         elif self.output_seq_length is None:
             self.output_seq_length = self.input_seq_length
             logger.debug(f"No target sequence length specified, using input length: {self.output_seq_length}")
-        
-        # Set the target sequence length
-        target_seq_length = self.output_seq_length
-        device = src.device
         
         # Process according to whether we have global features
         if self.nx_global > 0:
@@ -724,7 +466,7 @@ class AtmosphericModel(nn.Module):
             
             # Process sequential features
             seq_embedding = self.seq_proj(x_seq)
-            seq_embedding = self.encoder_pos_encoder(seq_embedding)
+            seq_embedding = self.pos_encoder(seq_embedding)
             
             # Process global features
             global_embedding = self.global_proj(x_global)
@@ -734,139 +476,35 @@ class AtmosphericModel(nn.Module):
                 # FiLM conditioning: Generate scaling (gamma) and shift (beta)
                 gamma = self.gamma_proj(global_embedding).unsqueeze(1)  # [batch, 1, d_model]
                 beta = self.beta_proj(global_embedding).unsqueeze(1)    # [batch, 1, d_model]
-                encoder_input = gamma * seq_embedding + beta
+                x = gamma * seq_embedding + beta
             elif self.integration_method == "concat":
                 # Expand global embedding to match sequence length
                 global_expanded = global_embedding.unsqueeze(1).expand(-1, seq_length, -1)
                 # Concatenate and project
                 x_combined = torch.cat([seq_embedding, global_expanded], dim=2)
-                encoder_input = self.integration_proj(x_combined)
+                x = self.integration_proj(x_combined)
             elif self.integration_method == "add":
                 # Simple addition of global features to each position
-                encoder_input = seq_embedding + global_embedding.unsqueeze(1)
+                x = seq_embedding + global_embedding.unsqueeze(1)
             else:
                 raise ValueError(f"Unknown integration method: {self.integration_method}")
         else:
             # No global features - just process sequential data
             x_seq = src[:, :, self.seq_indices]
-            encoder_input = self.seq_proj(x_seq)
-            encoder_input = self.encoder_pos_encoder(encoder_input)
+            x = self.seq_proj(x_seq)
+            x = self.pos_encoder(x)
         
-        # Process through encoder
-        memory = self.encoder(encoder_input)
-        
-        # Generate decoder input placeholder
-        decoder_input = self._get_decoder_input(batch_size, target_seq_length, device)
-        decoder_input = self.decoder_input_proj(decoder_input)
-        decoder_input = self.decoder_pos_encoder(decoder_input)
-        
-        # Process through decoder
-        decoder_output = self.decoder(decoder_input, memory, tgt_mask, memory_mask)
+        # Process through transformer
+        transformer_output = self.transformer(x)
         
         # Generate output
-        outputs = self.output_head(decoder_output)
+        outputs = self.output_head(transformer_output)
         
         return outputs
     
     def count_parameters(self):
         """Count trainable parameters in the model."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-    def generate(self, src, max_length=None, temperature=1.0, autoregressive=False):
-        """
-        Generate outputs with optional autoregressive decoding.
-        
-        Args:
-            src: Input tensor [batch_size, seq_length, features]
-            max_length: Maximum sequence length to generate
-            temperature: Temperature for sampling (1.0 = no sampling)
-            autoregressive: Whether to use autoregressive generation
-            
-        Returns:
-            outputs: Generated outputs [batch_size, max_length, output_features]
-        """
-        if not autoregressive:
-            # Standard parallel generation
-            return self.forward(src, target_seq_length=max_length)
-        
-        # Autoregressive generation is only implemented for demonstration
-        # For a real implementation, this would need to be expanded
-        logger.warning("Autoregressive generation is experimental")
-        
-        batch_size = src.shape[0]
-        device = src.device
-        
-        if max_length is None:
-            max_length = self.output_seq_length or self.input_seq_length
-        
-        # Initial forward pass to get encoder memory
-        with torch.no_grad():
-            # Process encoder part 
-            if self.nx_global > 0:
-                x_seq = src[:, :, self.seq_indices]
-                x_global = src[:, 0, self.global_indices]
-                
-                seq_embedding = self.seq_proj(x_seq)
-                seq_embedding = self.encoder_pos_encoder(seq_embedding)
-                
-                global_embedding = self.global_proj(x_global)
-                
-                if self.integration_method == "film":
-                    gamma = self.gamma_proj(global_embedding).unsqueeze(1)
-                    beta = self.beta_proj(global_embedding).unsqueeze(1)
-                    encoder_input = gamma * seq_embedding + beta
-                elif self.integration_method == "concat":
-                    global_expanded = global_embedding.unsqueeze(1).expand(-1, x_seq.shape[1], -1)
-                    x_combined = torch.cat([seq_embedding, global_expanded], dim=2)
-                    encoder_input = self.integration_proj(x_combined)
-                elif self.integration_method == "add":
-                    encoder_input = seq_embedding + global_embedding.unsqueeze(1)
-                else:
-                    raise ValueError(f"Unknown integration method: {self.integration_method}")
-            else:
-                x_seq = src[:, :, self.seq_indices]
-                encoder_input = self.seq_proj(x_seq)
-                encoder_input = self.encoder_pos_encoder(encoder_input)
-            
-            memory = self.encoder(encoder_input)
-            
-            # Initialize storage for outputs
-            all_outputs = torch.zeros(batch_size, max_length, self.ny, device=device)
-            
-            # Initialize decoder input with start token
-            curr_input = torch.zeros(batch_size, 1, 1, device=device)
-            curr_input = self.decoder_input_proj(curr_input)
-            curr_input = self.decoder_pos_encoder(curr_input)
-            
-            # Generate one position at a time
-            for i in range(max_length):
-                # Create a causal mask for the current length
-                tgt_mask = self._create_causal_mask(curr_input.size(1), device)
-                
-                # Decode current sequence
-                decoder_output = self.decoder(curr_input, memory, tgt_mask)
-                
-                # Get next token prediction
-                next_output = self.output_head(decoder_output[:, -1:])
-                
-                # Store the output
-                all_outputs[:, i:i+1] = next_output
-                
-                # For next iteration, use the current outputs as input
-                # In a real implementation, we'd need further processing here
-                # based on the specific task (e.g., sampling, argmax)
-                if i < max_length - 1:
-                    # Prepare next position's input embedding
-                    next_input = torch.zeros(batch_size, 1, 1, device=device)
-                    next_input = self.decoder_input_proj(next_input) 
-                    next_input = self.decoder_pos_encoder(next_input)
-                    
-                    # Concatenate to existing sequence
-                    curr_input = torch.cat([curr_input, next_input], dim=1)
-            
-            return all_outputs
-        
-
 
 
 def detect_variable_types(sample_data, input_var_names, rtol=1e-5, atol=1e-8):

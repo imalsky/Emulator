@@ -12,6 +12,10 @@ import numpy as np
 
 from utils import setup_logging, load_config, setup_device, ensure_dirs, save_json
 
+from normalizer import DataNormalizer
+from dataset import Dataset
+from train import ModelTrainer
+
 logger = logging.getLogger("Prediction")
 
 def normalize_data(config=None):
@@ -29,10 +33,6 @@ def normalize_data(config=None):
         True if normalization succeeds, False otherwise
     """
     try:
-        from normalizer import DataNormalizer
-        import shutil
-        import time
-        
         logger.info("Starting data normalization...")
         
         # Setup directories with fixed paths
@@ -80,10 +80,8 @@ def normalize_data(config=None):
 
 
 def setup_dataset(config):
-    """Initialize dataset with improved auto-detection for ultra-large sequences."""
-    try:
-        from dataset import Dataset
-        
+    """Initialize dataset with improved auto-detection for variable sequence lengths."""
+    try:        
         logger.info("Initializing dataset with auto variable detection...")
         
         # Check for required configuration
@@ -92,27 +90,17 @@ def setup_dataset(config):
             if key not in config:
                 raise ValueError(f"Missing required configuration: {key}")
         
-        # Get coordinate variables from config
-        coordinate_variable = config.get("coordinate_variable", [])
-        if coordinate_variable:
-            logger.info(f"Using coordinate variables: {coordinate_variable}")
-        
-        # Auto-detect input sequence length from pressure range or first profile variable
+        # Get sequence lengths from config if provided
         input_seq_length = config.get("input_seq_length")
-        if not input_seq_length and "pressure_range" in config:
-            input_seq_length = config["pressure_range"].get("points", 100)
-            logger.info(f"Using pressure_range.points ({input_seq_length}) for input_seq_length")
+        output_seq_length = config.get("output_seq_length")
         
-        # Let the dataset auto-detect output sequence length
-        output_seq_length = config.get("output_seq_length", None)
-        
+        # Initialize dataset with auto-detection for sequence lengths
         full_dataset = Dataset(
             data_folder="data/normalized_profiles",
             input_seq_length=input_seq_length,
             output_seq_length=output_seq_length,
             input_variables=config["input_variables"],
-            target_variables=config["target_variables"],
-            coordinate_variable=coordinate_variable
+            target_variables=config["target_variables"]
         )
         
         # Update config with detected sequence lengths and variable types
@@ -121,22 +109,40 @@ def setup_dataset(config):
             logger.info(f"Auto-detected output_seq_length: {detected_length}")
             config["output_seq_length"] = detected_length
             
-            # Adjust chunk size based on sequence length
-            if detected_length > 100000:
-                logger.warning(f"Extremely large sequence length detected ({detected_length} points)")
-                config["chunk_size"] = min(config.get("chunk_size", 100), 50)  # Ultra-conservative
-            elif detected_length > 40000:
-                logger.warning(f"Ultra-large sequence length detected ({detected_length} points)")
-                config["chunk_size"] = min(config.get("chunk_size", 100), 100)  # Very conservative
-            elif detected_length > 10000:
-                logger.warning(f"Very large sequence length detected ({detected_length} points)")
-                config["chunk_size"] = min(config.get("chunk_size", 250), 250)  # Conservative
-            
             # Auto-enable mixed precision for large sequences
             if detected_length > 20000 and not config.get("use_mixed_precision") and not config.get("use_amp"):
                 logger.info("Auto-enabling mixed precision for large sequence")
                 config["use_mixed_precision"] = True
                 config["use_amp"] = True
+        
+        if hasattr(full_dataset, "input_seq_length") and full_dataset.input_seq_length:
+            config["input_seq_length"] = full_dataset.input_seq_length
+        
+        # Update config with detected variable types
+        if hasattr(full_dataset, "global_variables"):
+            global_indices = [i for i, var in enumerate(config["input_variables"]) 
+                            if var in full_dataset.global_variables]
+            if global_indices:
+                config["global_feature_indices"] = global_indices
+                logger.info(f"Setting global_feature_indices: {global_indices}")
+                
+        if hasattr(full_dataset, "sequence_variables"):
+            seq_indices = [i for i, var in enumerate(config["input_variables"]) 
+                        if var in full_dataset.sequence_variables]
+            if seq_indices:
+                config["seq_feature_indices"] = seq_indices
+                logger.info(f"Setting seq_feature_indices: {seq_indices}")
+            
+        # Ensure all input variables are accounted for
+        all_indices = set(config.get("global_feature_indices", [])) | set(config.get("seq_feature_indices", []))
+        if len(all_indices) != len(config["input_variables"]):
+            logger.warning("Some input variables couldn't be classified as global or sequential")
+            # Default unclassified variables to sequential
+            unclassified = [i for i in range(len(config["input_variables"])) if i not in all_indices]
+            if "seq_feature_indices" not in config:
+                config["seq_feature_indices"] = []
+            config["seq_feature_indices"].extend(unclassified)
+            logger.info(f"Added unclassified variables to seq_feature_indices: {unclassified}")
         
         # Optionally use only a fraction of the data for quick experiments
         if config.get("frac_of_data", 1.0) < 1.0:
@@ -176,7 +182,7 @@ def train_model(config, device, dataset):
             config["use_mixed_precision"] = config.get("use_mixed_precision", True)
             config["use_amp"] = config.get("use_amp", True)
             
-        from train import ModelTrainer
+        
         
         trainer = ModelTrainer(
             config=config,

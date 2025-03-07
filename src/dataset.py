@@ -5,7 +5,7 @@ spectral_dataset.py
 Enhanced PyTorch Dataset implementation for atmospheric profiles paired with spectral data.
 Features:
 - Automatic detection of sequence vs. global variables
-- Improved handling of coordinate variables for large spectral outputs
+- Support for variable sequence lengths between input and output
 - Optimized for ultra-large sequences (40,000+ points)
 - Efficient LRU caching for file access
 - Validation for profiles and spectra
@@ -38,7 +38,6 @@ class Dataset(Dataset):
         output_seq_length=None,  # Optional, will auto-detect if None
         input_variables=None,
         target_variables=None,
-        coordinate_variable=None,
         cache_size=1024
     ):
         """Initialize the dataset with the given configuration."""
@@ -51,13 +50,9 @@ class Dataset(Dataset):
         self.output_seq_length = output_seq_length  # Will be auto-detected if None
         self.input_variables = input_variables or ["pressure", "temperature"]
         self.target_variables = target_variables or ["transit_depth"]
-        self.coordinate_variable = coordinate_variable or []
         
-        # Validate coordinate variable is a list
-        if isinstance(self.coordinate_variable, str):
-            self.coordinate_variable = [self.coordinate_variable]
-        
-        self.all_variables = self.input_variables + self.target_variables + self.coordinate_variable
+        # Store all variables and required keys
+        self.all_variables = list(set(self.input_variables + self.target_variables))  # Remove duplicates
         self.required_keys = set(self.input_variables + self.target_variables)
         self.cache_size = cache_size
         self.cache = OrderedDict()
@@ -78,8 +73,6 @@ class Dataset(Dataset):
             logger.info(f"Detected global (scalar) variables: {self.global_variables}")
         if self.sequence_variables:
             logger.info(f"Detected sequence variables: {self.sequence_variables}")
-        if self.coordinate_variable:
-            logger.info(f"Coordinate variable(s): {self.coordinate_variable}")
 
     def _initialize_dataset(self):
         """Scan data folder for JSON files and build the dataset index with enhanced auto-detection."""
@@ -100,20 +93,15 @@ class Dataset(Dataset):
         invalid_count = 0
         
         # For auto-detecting output sequence length and variable types
-        coordinate_lengths = {}  # Dictionary to store lengths for each coordinate variable
         variable_types = {var: {"is_sequence": False, "count": 0, "lengths": []} for var in self.all_variables}
         
         # First pass: detect variable types and sequence lengths
-        for file_path in json_files[:min(50, len(json_files))]:  # Sample up to 50 files for detection
+        num_sample_files = min(50, len(json_files))
+        logger.info(f"Analyzing {num_sample_files} files to detect variable types and sequence lengths")
+        
+        for file_path in json_files[:num_sample_files]:
             try:
                 profile = self._safe_load_json(file_path)
-                
-                # Check for any coordinate variables
-                for coord_var in self.coordinate_variable:
-                    if coord_var in profile and isinstance(profile[coord_var], list):
-                        if coord_var not in coordinate_lengths:
-                            coordinate_lengths[coord_var] = len(profile[coord_var])
-                            logger.info(f"Detected {coord_var} sequence length: {coordinate_lengths[coord_var]}")
                 
                 # Analyze variable types
                 for var in self.all_variables:
@@ -139,15 +127,39 @@ class Dataset(Dataset):
                 else:
                     self.global_variables.append(var)
         
-        # Choose output sequence length from coordinate lengths if available
-        detected_output_seq_length = None
-        if coordinate_lengths:
-            # Use the first coordinate's length as our reference
-            coord_var = next(iter(coordinate_lengths))
-            detected_output_seq_length = coordinate_lengths[coord_var]
-            logger.info(f"Using {coord_var} length ({detected_output_seq_length}) as output sequence length")
+        # Auto-detect typical sequence lengths for input and output
+        input_seq_lengths = []
+        output_seq_lengths = []
+        
+        for var in self.input_variables:
+            if var in self.sequence_variables and variable_types[var]["lengths"]:
+                input_seq_lengths.extend(variable_types[var]["lengths"])
+                
+        for var in self.target_variables:
+            if var in self.sequence_variables and variable_types[var]["lengths"]:
+                output_seq_lengths.extend(variable_types[var]["lengths"])
+        
+        # Set detected sequence lengths if not provided
+        if self.input_seq_length is None:
+            if input_seq_lengths:
+                self.input_seq_length = int(np.median(input_seq_lengths))
+                logger.info(f"Auto-detected input_seq_length: {self.input_seq_length}")
+            else:
+                # Default to 1 if no sequences found
+                self.input_seq_length = 1
+                logger.warning("No sequential input variables found, setting input_seq_length=1")
+            
+        if self.output_seq_length is None:
+            if output_seq_lengths:
+                self.output_seq_length = int(np.median(output_seq_lengths))
+                logger.info(f"Auto-detected output_seq_length: {self.output_seq_length}")
+            else:
+                # Default to 1 if no sequences found
+                self.output_seq_length = 1
+                logger.warning("No sequential output variables found, setting output_seq_length=1")
         
         # Second pass: validate and build dataset
+        logger.info(f"Validating all {len(json_files)} files")
         for file_path in json_files:
             try:
                 profile = self._safe_load_json(file_path)
@@ -157,14 +169,7 @@ class Dataset(Dataset):
                     
                     # Get sequence lengths for input and output
                     input_seq_length = self._get_sequence_length(profile, self.input_variables)
-                    
-                    # Determine output sequence length
-                    output_seq_length = self.output_seq_length
-                    if output_seq_length is None:
-                        if detected_output_seq_length is not None:
-                            output_seq_length = detected_output_seq_length
-                        else:
-                            output_seq_length = self._get_sequence_length(profile, self.target_variables)
+                    output_seq_length = self._get_sequence_length(profile, self.target_variables)
                     
                     self.metadata[str(file_path)] = {
                         "input_seq_length": input_seq_length,
@@ -180,15 +185,23 @@ class Dataset(Dataset):
 
         if not self.valid_files:
             raise ValueError(f"No valid profiles found in {self.data_folder}")
-        
-        # Set the output_seq_length based on what we found
-        if self.output_seq_length is None:
-            if detected_output_seq_length is not None:
-                self.output_seq_length = detected_output_seq_length
-            else:
-                # Use the first valid file's output sequence length as default
-                first_file = str(self.valid_files[0])
-                self.output_seq_length = self.metadata[first_file]["output_seq_length"]
+            
+        # Final check for sequence lengths - ensure they are set
+        if self.input_seq_length is None or self.input_seq_length <= 0:
+            # Use the first valid file's input sequence length as default
+            first_file = str(self.valid_files[0])
+            self.input_seq_length = self.metadata[first_file]["input_seq_length"]
+            if self.input_seq_length <= 0:
+                self.input_seq_length = 1
+                logger.warning("Invalid input sequence length detected, setting to 1")
+            
+        if self.output_seq_length is None or self.output_seq_length <= 0:
+            # Use the first valid file's output sequence length as default
+            first_file = str(self.valid_files[0])
+            self.output_seq_length = self.metadata[first_file]["output_seq_length"]
+            if self.output_seq_length <= 0:
+                self.output_seq_length = 1
+                logger.warning("Invalid output sequence length detected, setting to 1")
         
         if invalid_count:
             logger.warning(f"Found {invalid_count} invalid files")
@@ -290,17 +303,20 @@ class Dataset(Dataset):
         # Check if variable exists in profile
         if var_name not in profile:
             # Handle missing variable by creating a tensor of zeros
+            logger.debug(f"Variable {var_name} not found in profile, using zeros")
             return torch.zeros(seq_length, dtype=torch.float32)
         
         val = profile[var_name]
         
         if val is None:
             # Handle null value by creating a tensor of zeros
+            logger.debug(f"Variable {var_name} is None, using zeros")
             return torch.zeros(seq_length, dtype=torch.float32)
         
         if isinstance(val, list):
             # Handle list (sequence) variable
             if not val:  # Empty list
+                logger.debug(f"Variable {var_name} is an empty list, using zeros")
                 return torch.zeros(seq_length, dtype=torch.float32)
                 
             data = torch.tensor(val, dtype=torch.float32)
@@ -309,9 +325,11 @@ class Dataset(Dataset):
             if len(data) != seq_length:
                 if len(data) > seq_length:
                     # Truncate
+                    logger.debug(f"Truncating {var_name} from length {len(data)} to {seq_length}")
                     data = data[:seq_length]
                 else:
                     # Pad with last value or zeros
+                    logger.debug(f"Padding {var_name} from length {len(data)} to {seq_length}")
                     padding = torch.full((seq_length - len(data),), data[-1] if len(data) > 0 else 0.0, 
                                         dtype=torch.float32)
                     data = torch.cat([data, padding])
@@ -329,14 +347,33 @@ class Dataset(Dataset):
             self.cache.move_to_end(idx)
             return self.cache[idx]
 
+        # Validate idx is in range
+        if idx < 0 or idx >= len(self.valid_files):
+            raise IndexError(f"Index {idx} out of range for dataset with {len(self.valid_files)} items")
+
         # Load and process the profile
         file_path = self.valid_files[idx]
-        profile = self._safe_load_json(file_path)
+        try:
+            profile = self._safe_load_json(file_path)
+        except Exception as e:
+            logger.error(f"Error loading profile {file_path}: {e}")
+            # Return a default profile if there's an error loading
+            # This prevents crashes during training
+            input_tensor = torch.zeros((self.input_seq_length, len(self.input_variables)), dtype=torch.float32)
+            target_tensor = torch.zeros((self.output_seq_length, len(self.target_variables)), dtype=torch.float32)
+            return (input_tensor, target_tensor)
         
-        # Get sequence lengths from metadata or compute them
-        metadata = self.metadata[str(file_path)]
-        input_seq_length = metadata.get("input_seq_length", self.input_seq_length or 1)
-        output_seq_length = metadata.get("output_seq_length", self.output_seq_length or 1)
+        # Get sequence lengths from metadata or use defaults
+        metadata_key = str(file_path)
+        if metadata_key in self.metadata:
+            metadata = self.metadata[metadata_key]
+            input_seq_length = metadata.get("input_seq_length", self.input_seq_length or 1)
+            output_seq_length = metadata.get("output_seq_length", self.output_seq_length or 1)
+        else:
+            # Fallback if metadata is missing
+            logger.warning(f"Metadata missing for {file_path}, using default sequence lengths")
+            input_seq_length = self.input_seq_length or 1
+            output_seq_length = self.output_seq_length or 1
 
         # Process input variables
         input_tensors = []
@@ -352,44 +389,11 @@ class Dataset(Dataset):
         input_tensor = torch.stack(input_tensors, dim=1)
         target_tensor = torch.stack(target_tensors, dim=1)
         
-        # Process coordinates if provided
-        coordinates = None
-        if self.coordinate_variable:
-            for coord_var in self.coordinate_variable:
-                if coord_var in profile and isinstance(profile[coord_var], list):
-                    coord_data = torch.tensor(profile[coord_var], dtype=torch.float32)
-                    
-                    # Ensure correct length
-                    if len(coord_data) != output_seq_length:
-                        if len(coord_data) > output_seq_length:
-                            coord_data = coord_data[:output_seq_length]
-                        else:
-                            # Extend coordinates by linear interpolation if possible
-                            orig_len = len(coord_data)
-                            if orig_len > 1:
-                                # Create interpolated values
-                                step = (coord_data[-1] - coord_data[0]) / (orig_len - 1)
-                                extended = torch.tensor([coord_data[-1] + step * (i+1) for i in range(output_seq_length - orig_len)])
-                                coord_data = torch.cat([coord_data, extended])
-                            else:
-                                # If only one value, just repeat it
-                                coord_data = coord_data.repeat(output_seq_length)
-                    
-                    coordinates = coord_data
-                    break  # Use the first available coordinate variable
-            
-            # If no coordinate variable was found in the profile but it was requested,
-            # generate a default set of coordinates
-            if coordinates is None and self.coordinate_variable:
-                logger.debug(f"No coordinate variable found in profile for {file_path.name}, generating default coordinates")
-                coordinates = torch.linspace(0, 1, output_seq_length, dtype=torch.float32)
-        
         # Update cache
         if len(self.cache) >= self.cache_size:
             self.cache.popitem(last=False)  # Remove oldest item
             
-        # Include coordinates in cache if available
-        result = (input_tensor, target_tensor, coordinates) if coordinates is not None else (input_tensor, target_tensor)
+        result = (input_tensor, target_tensor)
         self.cache[idx] = result
         
         return result
@@ -397,6 +401,7 @@ class Dataset(Dataset):
     def clear_cache(self):
         """Clear the LRU cache to free memory."""
         self.cache.clear()
+        logger.debug("Dataset cache cleared")
 
     @classmethod
     def create_dataloader(
@@ -411,13 +416,14 @@ class Dataset(Dataset):
     ):
         """Create an optimized DataLoader for the dataset."""
         # Auto-adjust batch size for very large sequences
+        original_batch_size = batch_size
         if hasattr(dataset, 'output_seq_length'):
             if dataset.output_seq_length > 40000 and batch_size > 2:
-                logger.warning(f"Reducing batch size from {batch_size} to 2 due to extremely large sequence length")
                 batch_size = 2
+                logger.warning(f"Reducing batch size from {original_batch_size} to {batch_size} due to extremely large sequence length")
             elif dataset.output_seq_length > 20000 and batch_size > 4:
-                logger.warning(f"Reducing batch size from {batch_size} to 4 due to large sequence length")
                 batch_size = 4
+                logger.warning(f"Reducing batch size from {original_batch_size} to {batch_size} due to large sequence length")
         
         # Check if dataset is empty
         if len(dataset) == 0:
@@ -432,6 +438,8 @@ class Dataset(Dataset):
         # Set prefetch_factor only if num_workers > 0
         prefetch_factor = 2 if num_workers > 0 else None
         
+        # Create and return the DataLoader
+        logger.info(f"Creating DataLoader with batch_size={batch_size}, num_workers={num_workers}")
         return DataLoader(
             dataset,
             batch_size=batch_size,

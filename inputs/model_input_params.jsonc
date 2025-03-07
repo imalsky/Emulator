@@ -1,158 +1,95 @@
 {
   // ==========================================================================
-  // Spectral Prediction Model Configuration
+  // Enhanced Transformer Model Configuration
   // ==========================================================================
-  // Configuration for predicting spectral sequences from atmospheric profiles
+  // Configuration for predicting atmospheric variables and spectral sequences
+  // using an advanced transformer architecture with global-local feature integration
   // ==========================================================================
 
   // ==========================================================================
-  // Data Configuration
+  // DATA SPECIFICATION AND PREPROCESSING
   // ==========================================================================
+
+  "model_type": "encoder",  
   
-  // Input variables (features) for the model - atmospheric profile inputs
+  // Variables specification - determines model input/output dimensions
   "input_variables": [
-    "pressure",       // Atmospheric pressure at each layer
-    "temperature",    // Temperature at each layer
-    "orbital_sep"    // Orbital separation
+    "pressure",       // Atmospheric pressure profile [sequential]
+    "temperature",    // Temperature profile [sequential]
+    "orbital_sep"     // Orbital separation [global]
   ],
-  
-  // Target variables to predict - spectral outputs
   "target_variables": [
-    "thermal_net_flux",
-    "reflected_net_flux"    
+    "thermal_net_flux",    // Thermal emission spectrum
+    "reflected_net_flux"   // Reflected light spectrum
   ],
   
-  // Coordinate variables - define the spectral grid points
-  "coordinate_variable": [
-    "pressure"    
-  ],
-  
-  // Pressure range configuration for input profiles
-  "pressure_range": {
-    "min": 1e-5,      // Minimum pressure (bars)
-    "max": 100.0,     // Maximum pressure (bars)
-    "points": 50     // Number of pressure levels (input sequence length)
-  },
-  
-  // Fraction of data to use (1.0 = use all data)
-  "frac_of_data": 1.0,
-
-  // ==========================================================================
-  // Data Normalization
-  // ==========================================================================
+  // Data preprocessing
+  "frac_of_data": 1.0,     // Fraction of dataset to use (useful for quick tests)
   "normalization": {
-    // Specific normalization methods for individual variables
+    // Variable-specific normalization methods
     "key_methods": {
-      "pressure": "log-min-max",
-      "thermal_net_flux": "custom",
-      "reflected_net_flux": "custom"
+      "pressure": "log-min-max",         // Log-scale normalization for pressure
+      "thermal_net_flux": "custom",      // Custom scaling for thermal flux
+      "reflected_net_flux": "custom"     // Custom scaling for reflected flux
     },
-    // Default method for variables not specified in key_methods
-    "default_method": "iqr",
-    // Whether to clip outliers before normalization
-    "clip_outliers_before_scaling": false
+    "default_method": "iqr",             // Inter-quartile range normalization for other variables
+    "clip_outliers_before_scaling": false // Whether to clip extreme values before normalization
   },
 
   // ==========================================================================
-  // Memory Efficiency Parameters
+  // MODEL ARCHITECTURE 
   // ==========================================================================
   
-  // Enable mixed precision for memory savings
-  "use_mixed_precision": true,
-  "use_amp": true,
+  // Core architecture parameters
+  "d_model": 256,             // Hidden dimension size (larger = more capacity, doubled from original)
+  "nhead": 8,                 // Number of attention heads (doubled from original, must divide d_model evenly)
+  "num_layers": 6,            // Number of transformer layers (increased from 4 for more depth)
+  "dim_feedforward": 1024,    // Feedforward network size (typically 4x d_model)
+  "mlp_layers": 3,            // Number of layers in output MLP
+  "mlp_hidden_dim": 128,      // Hidden dimension in output MLP (doubled from original)
   
-  // Chunk size for processing long sequences
-  "chunk_size": 5000,
-
+  // Feature integration and encoding
+  "integration_method": "film", // How to combine global and sequential features:
+                               // "add" - simple addition
+                               // "film" - feature-wise linear modulation (better)
+                               // "concat" - concatenation followed by projection
+  "pos_encoding_type": "sine", // Positional encoding: "sine" (fixed) or "learned" (trainable)
+  
+  // Regularization parameters
+  "norm_first": true,           // Use pre-norm architecture (generally more stable)
+  "stochastic_depth_rate": 0.1, // Probability of dropping layers during training (modern regularization)
+  "dropout": 0.1,               // Dropout probability (increased slightly from 0.05)
+  "weight_decay": 1e-5,         // L2 regularization coefficient
+  "activation": "gelu",         // Activation function: "gelu" is preferred over "relu" for transformers
+  "layer_norm_eps": 1e-5,       // Epsilon for LayerNorm stability
+  "max_sequence_length": 100,
+  
+  // Performance optimization
+  "use_torch_compile": true,    // Use PyTorch 2.0+ compilation for speed
+  "use_amp": true,              // Enable automatic mixed precision for memory/speed
+  
   // ==========================================================================
-  // Model Architecture
-  // ==========================================================================
-  
-  // Hidden dimension size
-  "hidden_dim": 256,
-  
-  // Number of attention heads (must divide hidden_dim evenly)
-  "nhead": 4,
-  
-  // Number of transformer layers
-  "num_layers": 8,
-  
-  // Feedforward dimension (typically 2-4x hidden_dim)
-  "dim_feedforward": 1024,
-  
-  // Positional encoding dimension for coordinates
-  "pos_encoding_dim": 64,
-  
-  // Maximum frequency for positional encoding
-  "max_freq": 50.0,
-  
-  // Positional encoding type: "sine" (fixed sinusoidal) or "learned" (trainable)
-  "pos_encoding_type": "sine",
-
-  // Integration method for global and sequential features
-  // "add" (simple addition), "film" (feature-wise linear modulation), "concat" (concatenation)
-  "integration_method": "film",
-  
-  // Use torch.compile for acceleration (if available)
-  "use_torch_compile": true,
-  
-  // Stochastic depth rate for regularization (0.0 = disabled)
-  "stochastic_depth_rate": 0.1,
-
-  // ==========================================================================
-  // Regularization
+  // TRAINING PARAMETERS
   // ==========================================================================
   
-  // Dropout probability
-  "dropout": 0.05,
+  // Basic training settings
+  "batch_size": 16,                  // Increased batch size from 16 for better statistics
+  "epochs": 100,                     // Increased maximum training epochs
+  "num_workers": 4,                  // Number of worker processes for data loading
+  "loss_function": "mse",            // Loss function: "mse", "l1", or "smooth_l1"
+  "gradient_clip_val": 1.0,          // Maximum gradient norm for clipping
   
-  // L2 regularization coefficient
-  "weight_decay": 1e-5,
+  // Optimizer settings
+  "optimizer": "adamw",              // Optimizer type: "adamw", "adam", "sgd"
+  "learning_rate": 5e-4,             // Slightly increased from 3e-4 for faster initial convergence
+  "min_lr": 1e-8,                    // Minimum learning rate
+  "gamma": 0.2,                      // Learning rate decay factor
+  "lr_patience": 5,                  // Epochs to wait before reducing learning rate
   
-  // Loss function: "mse", "l1", or "smooth_l1"
-  "loss_function": "mse",
-
-  // ==========================================================================
-  // Training Configuration
-  // ==========================================================================
+  // Early stopping settings
+  "early_stopping_patience": 20,     // Stop training after N epochs without improvement
+  "min_delta": 1e-8,                 // Minimum improvement to reset patience counter
   
-  // Number of training epochs
-  "epochs": 60,
-  
-  // Batch size for training
-  "batch_size": 16,
-  
-  // Number of worker processes for data loading
-  "num_workers": 4,
-  
-  // Early stopping patience (epochs without improvement before stopping)
-  "early_stopping_patience": 20,
-  
-  // Minimum improvement to count as progress for early stopping
-  "min_delta": 1e-6,
-  
-  // Maximum gradient norm for gradient clipping
-  "gradient_clip_val": 1.0,
-  
-  // Number of epochs to wait before reducing learning rate
-  "lr_patience": 5,
-
-  // ==========================================================================
-  // Optimizer Configuration
-  // ==========================================================================
-  
-  // Optimizer type: "adamw", "adam", "sgd"
-  "optimizer": "adamw",
-  
-  // Base learning rate
-  "learning_rate": 3e-4,
-  
-  // Minimum learning rate
-  "min_lr": 1e-7,
-  
-  // Learning rate decay factor
-  "gamma": 0.5,
-  
-  // Random seed for reproducibility
-  "random_seed": 42
+  // Reproducibility
+  "random_seed": 42                  // Random seed for reproducible results
 }
