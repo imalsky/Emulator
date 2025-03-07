@@ -313,3 +313,4 @@ def seed_everything(seed: int = 42) -> None:
     
     os.environ['PYTHONHASHSEED'] = str(seed)
     logging.info(f"Random seed set to {seed} for reproducibility")
+    

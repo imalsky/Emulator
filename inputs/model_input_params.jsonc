@@ -24,7 +24,7 @@
   ],
   
   // Data preprocessing
-  "frac_of_data": 1.0,     // Fraction of dataset to use (useful for quick tests)
+  "frac_of_data": 0.25,     // Fraction of dataset to use (useful for quick tests)
   "normalization": {
     // Variable-specific normalization methods
     "key_methods": {
