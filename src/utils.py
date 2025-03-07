@@ -90,6 +90,7 @@ def load_config(config_path: str) -> Optional[Dict[str, Any]]:
             def json_loader(f):
                 content = f.read()
                 # Remove both single-line and multi-line comments (basic approach)
+                
                 content = re.sub(r'//.*?$', '', content, flags=re.MULTILINE)
                 content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
                 return json.loads(content)
@@ -313,4 +314,3 @@ def seed_everything(seed: int = 42) -> None:
     
     os.environ['PYTHONHASHSEED'] = str(seed)
     logging.info(f"Random seed set to {seed} for reproducibility")
-    

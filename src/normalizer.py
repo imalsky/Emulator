@@ -311,20 +311,23 @@ class DataNormalizer:
             stats.update({"mean": mean, "std": std})
             
         elif method == "custom":
-            # Compute y = sign(x)*log1p(|x|) for each element
-            y_positive = torch.log1p(torch.clamp(values, min=0))
-            y_negative = -torch.log1p(torch.clamp(-values, min=0))
+            # Add small epsilon for better numerical stability
+            epsilon = 1e-10
+            
+            # Compute y = sign(x)*log1p(|x| + epsilon) for each element
+            y_positive = torch.log1p(torch.clamp(values, min=0) + epsilon)
+            y_negative = -torch.log1p(torch.clamp(-values, min=0) + epsilon)
             
             # Combine based on the sign of values
             y = torch.where(values >= 0, y_positive, y_negative)
             
-            m_pos = torch.log1p(torch.tensor(global_max)).item() if global_max > 0 else 0.0
-            m_neg = torch.log1p(torch.tensor(-global_min)).item() if global_min < 0 else 0.0
+            m_pos = torch.log1p(torch.tensor(global_max) + epsilon).item() if global_max > 0 else 0.0
+            m_neg = torch.log1p(torch.tensor(-global_min) + epsilon).item() if global_min < 0 else 0.0
             m = max(m_pos, m_neg)
             if m < 1e-6:
                 m = 1.0
             
-            stats.update({"m": m})
+            stats.update({"m": m, "epsilon": epsilon})
             
         elif method == "standard":
             mean = values.mean().item()
@@ -411,10 +414,12 @@ class DataNormalizer:
             
         elif method == "custom":
             m = max(stats["m"], eps)
+            # Use epsilon from stats or default to 1e-10
+            epsilon = stats.get("epsilon", 1e-10)
             
-            # Compute y = sign(x)*log1p(|x|) for each element
-            y_positive = torch.log1p(torch.clamp(data, min=0))
-            y_negative = -torch.log1p(torch.clamp(-data, min=0))
+            # Compute y = sign(x)*log1p(|x| + epsilon) for each element
+            y_positive = torch.log1p(torch.clamp(data, min=0) + epsilon)
+            y_negative = -torch.log1p(torch.clamp(-data, min=0) + epsilon)
             
             # Combine based on the sign of data
             y = torch.where(data >= 0, y_positive, y_negative)
@@ -517,11 +522,14 @@ class DataNormalizer:
             
         elif method == "custom":
             m = stats["m"]
+            # Use epsilon from stats or default to 1e-10
+            epsilon = stats.get("epsilon", 1e-10)
             y = norm_tensor * m
-            # Calculate the exponential minus 1 for positive and negative values separately
+            # Calculate the exponential minus 1 for positive and negative values separately,
+            # then subtract epsilon to reverse the addition during normalization
             denorm = torch.where(y >= 0, 
-                               torch.expm1(y), 
-                               -torch.expm1(-y))
+                               torch.expm1(y) - epsilon, 
+                               -torch.expm1(-y) - epsilon)
             
         elif method == "standard":
             mean = stats["mean"]

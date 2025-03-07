@@ -9,8 +9,6 @@
   // ==========================================================================
   // DATA SPECIFICATION AND PREPROCESSING
   // ==========================================================================
-
-  "model_type": "encoder",  
   
   // Variables specification - determines model input/output dimensions
   "input_variables": [
@@ -24,7 +22,7 @@
   ],
   
   // Data preprocessing
-  "frac_of_data": 0.25,     // Fraction of dataset to use (useful for quick tests)
+  "frac_of_data": 1.0,     // Fraction of dataset to use (useful for quick tests)
   "normalization": {
     // Variable-specific normalization methods
     "key_methods": {
@@ -41,7 +39,7 @@
   // ==========================================================================
   
   // Core architecture parameters
-  "d_model": 256,             // Hidden dimension size (larger = more capacity, doubled from original)
+  "d_model": 512,             // Hidden dimension size (larger = more capacity, doubled from original)
   "nhead": 8,                 // Number of attention heads (doubled from original, must divide d_model evenly)
   "num_layers": 6,            // Number of transformer layers (increased from 4 for more depth)
   "dim_feedforward": 1024,    // Feedforward network size (typically 4x d_model)
@@ -57,8 +55,8 @@
   
   // Regularization parameters
   "norm_first": true,           // Use pre-norm architecture (generally more stable)
-  "stochastic_depth_rate": 0.1, // Probability of dropping layers during training (modern regularization)
-  "dropout": 0.1,               // Dropout probability (increased slightly from 0.05)
+  "stochastic_depth_rate": 0.05, // Probability of dropping layers during training (modern regularization)
+  "dropout": 0.05,               // Dropout probability (increased slightly from 0.05)
   "weight_decay": 1e-5,         // L2 regularization coefficient
   "activation": "gelu",         // Activation function: "gelu" is preferred over "relu" for transformers
   "layer_norm_eps": 1e-5,       // Epsilon for LayerNorm stability
