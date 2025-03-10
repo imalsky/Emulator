@@ -14,11 +14,13 @@
   "input_variables": [
     "pressure",       // Atmospheric pressure profile [sequential]
     "temperature",    // Temperature profile [sequential]
-    "orbital_sep"     // Orbital separation [global]
+    "orbital_sep",     // Orbital separation [global]
+    "wavenumber",
+    "grav",
+    "orbital_sep"
   ],
   "target_variables": [
-    "thermal_net_flux",    // Thermal emission spectrum
-    "reflected_net_flux"   // Reflected light spectrum
+    "thermal",
   ],
   
   // Data preprocessing
@@ -27,8 +29,8 @@
     // Variable-specific normalization methods
     "key_methods": {
       "pressure": "log-min-max",         // Log-scale normalization for pressure
-      "thermal_net_flux": "custom",      // Custom scaling for thermal flux
-      "reflected_net_flux": "custom"     // Custom scaling for reflected flux
+      "wavenumber": "log-min-max", 
+      "thermal": "custom",      // Custom scaling for thermal flux
     },
     "default_method": "iqr",             // Inter-quartile range normalization for other variables
     "clip_outliers_before_scaling": false // Whether to clip extreme values before normalization
@@ -60,7 +62,7 @@
   "weight_decay": 1e-5,         // L2 regularization coefficient
   "activation": "gelu",         // Activation function: "gelu" is preferred over "relu" for transformers
   "layer_norm_eps": 1e-5,       // Epsilon for LayerNorm stability
-  "max_sequence_length": 100,
+  "max_sequence_length": 200,
   
   // Performance optimization
   "use_torch_compile": true,    // Use PyTorch 2.0+ compilation for speed
