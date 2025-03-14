@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-main.py - Entry point 
+main.py - Entry point for atmospheric profile prediction pipeline
+
+Provides command-line interface to normalize data, train models, and make predictions
+using a multi-source transformer architecture with separate encoders for different
+data types (global features, atmospheric profiles, and spectral sequences).
 """
 
 import sys
@@ -10,141 +14,91 @@ from pathlib import Path
 import torch
 import numpy as np
 
-from utils import setup_logging, load_config, setup_device, ensure_dirs, save_json
-
+from utils import (
+    setup_logging, load_config, ensure_dirs, save_config, 
+    create_prediction_model
+)
+from hardware import setup_device
 from normalizer import DataNormalizer
-from dataset import Dataset
+from dataset import AtmosphericDataset, create_multi_source_collate_fn
 from train import ModelTrainer
+from hyperparams import run_hyperparameter_search
 
-logger = logging.getLogger("Prediction")
+logger = logging.getLogger(__name__)
 
-def normalize_data(config=None):
+
+def normalize_data(config=None, data_dir="data"):
     """
     Normalize raw profile data using global statistics.
-    
-    Parameters
-    ----------
-    config : dict, optional
-        Configuration dictionary which may contain normalization settings
-    
-    Returns
-    -------
-    bool
-        True if normalization succeeds, False otherwise
     """
     try:
         logger.info("Starting data normalization...")
+        raw_dir = Path(data_dir) / "profiles"
+        norm_dir = Path(data_dir) / "normalized_profiles"
         
-        # Setup directories with fixed paths
-        raw_dir = "data/profiles"
-        norm_dir = "data/normalized_profiles"
-        norm_dir_path = Path(norm_dir)
-            
-        norm_dir_path.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize normalizer
         normalizer = DataNormalizer(raw_dir, norm_dir)
+        norm_config = config.get("normalization", {}) if config is not None else {}
+        key_methods = norm_config.get("key_methods", {})
+        default_method = norm_config.get("default_method", "iqr")
+        clip_outliers = norm_config.get("clip_outliers_before_scaling", False)
         
-        # Get normalization settings from config if available
-        key_methods = {}
-        default_method = "iqr"
-        clip_outliers = False
-        
-        if config is not None:
-            # Extract normalization settings from config
-            norm_config = config.get("normalization", {})
-            key_methods = norm_config.get("key_methods", {})
-            default_method = norm_config.get("default_method", default_method)
-            clip_outliers = norm_config.get("clip_outliers_before_scaling", clip_outliers)
-        
-        # Calculate global statistics
-        logger.info("Calculating global normalization statistics...")
+        logger.info(f"Calculating global normalization statistics using {default_method} as default method...")
         stats = normalizer.calculate_global_stats(
             key_methods=key_methods,
             default_method=default_method,
             clip_outliers_before_scaling=clip_outliers,
         )
-        
-        # Process and normalize profiles
         logger.info("Applying normalization to profiles...")
         normalizer.process_profiles(stats)
+        
+        stats_file = norm_dir / "normalization_stats.json"
+        if hasattr(normalizer, "save_stats"):
+            normalizer.save_stats(stats, stats_file)
         
         logger.info("Data normalization completed successfully")
         return True
 
     except Exception as e:
-        logger.error(f"Data normalization failed: {e}")
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("Detailed error:", exc_info=True)
+        logger.error(f"Data normalization failed: {e}", exc_info=True)
         return False
 
 
-def setup_dataset(config):
-    """Initialize dataset with improved auto-detection for variable sequence lengths."""
-    try:        
-        logger.info("Initializing dataset with auto variable detection...")
+def setup_dataset(config, data_dir="data"):
+    """
+    Initialize dataset with separation of data types.
+    """
+    try:
+        logger.info("Initializing dataset with data type separation...")
         
-        # Check for required configuration
-        required_keys = ["input_variables", "target_variables"]
-        for key in required_keys:
-            if key not in config:
-                raise ValueError(f"Missing required configuration: {key}")
+        if "input_variables" not in config or "target_variables" not in config:
+            raise ValueError("Missing required input_variables or target_variables in config")
         
-        # Get sequence lengths from config if provided
-        input_seq_length = config.get("input_seq_length")
-        output_seq_length = config.get("output_seq_length")
+        seq_types = config.get("sequence_types", {})
+        if not seq_types:
+            global_indices = config.get("global_feature_indices", [])
+            seq_types["profile"] = [i for i in range(len(config["input_variables"]))
+                                   if i not in global_indices]
         
-        # Initialize dataset with auto-detection for sequence lengths
-        full_dataset = Dataset(
-            data_folder="data/normalized_profiles",
-            input_seq_length=input_seq_length,
-            output_seq_length=output_seq_length,
+        config["sequence_types"] = seq_types
+        
+        full_dataset = AtmosphericDataset(
+            data_folder=Path(data_dir) / "normalized_profiles",
             input_variables=config["input_variables"],
-            target_variables=config["target_variables"]
+            target_variables=config["target_variables"],
+            global_indices=config.get("global_feature_indices", []),
+            sequence_types=seq_types,
+            allow_variable_length=True
         )
         
-        # Update config with detected sequence lengths and variable types
-        if hasattr(full_dataset, "output_seq_length") and full_dataset.output_seq_length:
-            detected_length = full_dataset.output_seq_length
-            logger.info(f"Auto-detected output_seq_length: {detected_length}")
-            config["output_seq_length"] = detected_length
-            
-            # Auto-enable mixed precision for large sequences
-            if detected_length > 20000 and not config.get("use_mixed_precision") and not config.get("use_amp"):
-                logger.info("Auto-enabling mixed precision for large sequence")
-                config["use_mixed_precision"] = True
-                config["use_amp"] = True
+        if hasattr(full_dataset, "sequence_lengths"):
+            config["sequence_lengths"] = dict(full_dataset.sequence_lengths)
+            for seq_type, length in config["sequence_lengths"].items():
+                if length > 10000:
+                    raise ValueError(f"Sequence length for {seq_type} is {length}, exceeding maximum allowed 10000")
+            logger.info(f"Detected sequence lengths: {config['sequence_lengths']}")
         
-        if hasattr(full_dataset, "input_seq_length") and full_dataset.input_seq_length:
-            config["input_seq_length"] = full_dataset.input_seq_length
+        config["collate_fn"] = create_multi_source_collate_fn()
         
-        # Update config with detected variable types
-        if hasattr(full_dataset, "global_variables"):
-            global_indices = [i for i, var in enumerate(config["input_variables"]) 
-                            if var in full_dataset.global_variables]
-            if global_indices:
-                config["global_feature_indices"] = global_indices
-                logger.info(f"Setting global_feature_indices: {global_indices}")
-                
-        if hasattr(full_dataset, "sequence_variables"):
-            seq_indices = [i for i, var in enumerate(config["input_variables"]) 
-                        if var in full_dataset.sequence_variables]
-            if seq_indices:
-                config["seq_feature_indices"] = seq_indices
-                logger.info(f"Setting seq_feature_indices: {seq_indices}")
-            
-        # Ensure all input variables are accounted for
-        all_indices = set(config.get("global_feature_indices", [])) | set(config.get("seq_feature_indices", []))
-        if len(all_indices) != len(config["input_variables"]):
-            logger.warning("Some input variables couldn't be classified as global or sequential")
-            # Default unclassified variables to sequential
-            unclassified = [i for i in range(len(config["input_variables"])) if i not in all_indices]
-            if "seq_feature_indices" not in config:
-                config["seq_feature_indices"] = []
-            config["seq_feature_indices"].extend(unclassified)
-            logger.info(f"Added unclassified variables to seq_feature_indices: {unclassified}")
-        
-        # Optionally use only a fraction of the data for quick experiments
         if config.get("frac_of_data", 1.0) < 1.0:
             dataset_size = len(full_dataset)
             subset_size = int(dataset_size * config["frac_of_data"])
@@ -156,123 +110,158 @@ def setup_dataset(config):
         
         return dataset
     except Exception as e:
-        logger.error(f"Dataset initialization failed: {e}")
+        logger.error(f"Dataset initialization failed: {e}", exc_info=True)
         return None
 
 
-def train_model(config, device, dataset):
-    """Train a prediction model with optimizations for large sequences."""
+def train_model(config, device, dataset, data_dir="data"):
+    """
+    Train a prediction model with the multi-source architecture.
+    """
     try:
         if dataset is None:
             logger.error("Cannot train model: dataset is None")
             return False
         
-        model_dir = "data/model"
-        Path(model_dir).mkdir(parents=True, exist_ok=True)
+        model_dir = Path(data_dir) / "model"
+        model_dir.mkdir(parents=True, exist_ok=True)
         
-        # Adjust batch size automatically for ultra-large sequences
-        if config.get("output_seq_length", 0) > 20000 and config.get("batch_size", 32) > 4:
-            original_batch = config.get("batch_size", 32)
-            config["batch_size"] = min(4, original_batch)
-            logger.info(f"Reduced batch size from {original_batch} to {config['batch_size']} "
-                       f"due to large sequence length ({config['output_seq_length']})")
-            
-        # Enable mixed precision by default for ultra-large sequences
-        if config.get("output_seq_length", 0) > 20000:
-            config["use_mixed_precision"] = config.get("use_mixed_precision", True)
-            config["use_amp"] = config.get("use_amp", True)
-            
-        
+        if config.get("use_amp", False):
+            logger.info("Enabling automatic mixed precision")
         
         trainer = ModelTrainer(
             config=config,
             device=device,
             save_path=model_dir,
-            dataset=dataset
+            dataset=dataset,
+            collate_fn=config.get("collate_fn")
         )
         
         epochs = config.get("epochs", 100)
         patience = config.get("early_stopping_patience", 15)
-        
-        final_model_path = trainer.train(
-            num_epochs=epochs,
-            early_stopping_patience=patience
-        )
+        final_model_path = trainer.train(num_epochs=epochs, early_stopping_patience=patience)
         
         if final_model_path:
             test_metrics = trainer.test()
             logger.info(f"Test metrics: {test_metrics:.3e}")
+            
+            best_val_metric = trainer.best_val_loss if hasattr(trainer, "best_val_loss") else None
+            if best_val_metric is not None:
+                metric_path = model_dir / "best_val_metric.txt"
+                with open(metric_path, 'w') as f:
+                    f.write(f"{best_val_metric:.10e}")
+            
             return True
         else:
             logger.warning("Training did not produce a final model")
             return False
     except Exception as e:
-        logger.error(f"Model training failed: {e}")
+        logger.error(f"Model training failed: {e}", exc_info=True)
+        return False
+
+
+def run_hyperparameter_tuning(base_config, data_dir, output_dir, num_trials=100):
+    """
+    Run hyperparameter tuning with a limited number of trials.
+    """
+    try:
+        logger.info(f"Starting hyperparameter search with {num_trials} trials")
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        import random
+        random.seed(42)
+        
+        # Pass an empty dict for the param grid (unused in the new version)
+        best_config = run_hyperparameter_search(
+            base_config=base_config,
+            param_grid_config={},
+            data_dir=data_dir,
+            output_dir=output_dir,
+            setup_dataset_func=setup_dataset,
+            train_model_func=train_model,
+            setup_device_func=setup_device,
+            ensure_dirs_func=ensure_dirs,
+            save_config_func=save_config,
+            num_trials=num_trials
+        )
+        
+        if best_config:
+            logger.info("Hyperparameter tuning complete. Best configuration saved.")
+            logger.info(f"To use the best configuration for training, run:")
+            logger.info(f"python main.py --train --config {output_dir}/best_config.json")
+        
+        return best_config is not None
+    except Exception as e:
+        logger.error(f"Hyperparameter tuning failed: {e}", exc_info=True)
         return False
 
 
 def parse_arguments():
-    # Get directory where this script is located
-    script_dir = Path(__file__).parent.absolute()
-    project_root = script_dir.parent  # Go up one level to project root
-    default_config = project_root / "inputs" / "model_input_params.jsonc"
-    
-    parser = argparse.ArgumentParser(description="Prediction pipeline")
-    parser.add_argument("--normalize-data", action="store_true", help="Normalize data")
-    parser.add_argument("--train-model", action="store_true", help="Train model")
-    parser.add_argument("--config", type=str, default=str(default_config), 
-                        help="Configuration file path")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Atmospheric profile prediction pipeline")
+    parser.add_argument("--normalize", action="store_true", help="Normalize data")
+    parser.add_argument("--train", action="store_true", help="Train model")
+    parser.add_argument("--tune", action="store_true", help="Run hyperparameter tuning")
+    parser.add_argument("--trials", type=int, default=100, help="Number of trials for hyperparameter tuning")
+    parser.add_argument("--config", type=str, default="inputs/model_input_params.jsonc", help="Configuration file path")
+    parser.add_argument("--data-dir", type=str, default="data", help="Base data directory")
     return parser.parse_args()
 
 
 def main():
+    """Main entry point for the atmospheric prediction pipeline."""
     args = parse_arguments()
-    setup_logging(level=logging.DEBUG if args.debug else logging.INFO)
+    setup_logging()
     
-    ensure_dirs("data/profiles", "data/normalized_profiles", "data/model")
+    if not (args.normalize or args.train or args.tune):
+        logger.error("No action specified. Use --normalize, --train, or --tune")
+        return False
+    
+    data_dir = args.data_dir
+    ensure_dirs(
+        Path(data_dir) / "profiles", 
+        Path(data_dir) / "normalized_profiles", 
+        Path(data_dir) / "model"
+    )
+    
+    config_path = Path(args.config)
+    if not config_path.exists():
+        logger.error(f"Config file not found: {config_path}")
+        return False
+    
+    config = load_config(str(config_path))
+    if not config:
+        logger.error("Failed to load config file")
+        return False
     
     overall_success = True
     
-    # Load config early so we can use it for normalization
-    config = None
-    if args.train_model or args.normalize_data:
-        config_path = Path(args.config)
-        if not config_path.exists():
-            logger.error(f"Config file not found: {config_path}")
-            return False
-            
-        config = load_config(str(config_path))
-        if not config and args.train_model:
-            logger.error("Failed to load config file and training was requested")
-            return False
+    if args.normalize:
+        normalize_success = normalize_data(config, data_dir)
+        overall_success = overall_success and normalize_success
     
-    if args.normalize_data:
-        success = normalize_data(config)
-        overall_success = overall_success and success
-    
-    if overall_success and args.train_model:
-        if not config:
-            # Should never happen due to earlier check, but just in case
-            logger.error("Config is required for training")
-            return False
-        
+    if (args.train or args.tune) and overall_success:
         device = setup_device()
-        
-        # Set random seed
         random_seed = config.get("random_seed", 42)
         torch.manual_seed(random_seed)
         np.random.seed(random_seed)
         if device.type == "cuda":
             torch.cuda.manual_seed_all(random_seed)
         
-        dataset = setup_dataset(config)
-        if dataset is None:
-            logger.error("Failed to setup dataset")
-            return False
+        if args.train:
+            dataset = setup_dataset(config, data_dir)
+            if dataset is None:
+                logger.error("Failed to setup dataset")
+                return False
+            train_success = train_model(config, device, dataset, data_dir)
+            overall_success = overall_success and train_success
         
-        success = train_model(config, device, dataset)
-        overall_success = overall_success and success
+        if args.tune:
+            output_dir = "tuning_results"
+            tune_success = run_hyperparameter_tuning(config, data_dir, output_dir, args.trials)
+            overall_success = overall_success and tune_success
     
     return overall_success
 
@@ -284,5 +273,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         sys.exit(130)
     except Exception as e:
-        logger.error(f"Unhandled error: {e}")
+        logger.error(f"Unhandled error: {e}", exc_info=True)
         sys.exit(1)

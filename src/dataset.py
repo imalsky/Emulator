@@ -1,452 +1,602 @@
 #!/usr/bin/env python3
 """
-spectral_dataset.py
+dataset.py - Atmospheric profile dataset for multi-source transformer model
 
-Enhanced PyTorch Dataset implementation for atmospheric profiles paired with spectral data.
-Features:
-- Automatic detection of sequence vs. global variables
-- Support for variable sequence lengths between input and output
-- Optimized for ultra-large sequences (40,000+ points)
-- Efficient LRU caching for file access
-- Validation for profiles and spectra
+Handles atmospheric profile data with support for:
+- Separate processing of different data types (global, profile, spectral)
+- Variable-length sequences without excessive padding
+- Automatic detection of feature types
+- Efficient data caching
+- Custom collation for structured batch processing
 """
 
 import json
 import logging
 from pathlib import Path
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
+# Import hardware utilities
+from hardware import configure_dataloader_settings
+
 logger = logging.getLogger(__name__)
 
 
-class Dataset(Dataset):
+class AtmosphericDataset(Dataset):
     """
-    PyTorch Dataset for atmospheric profile data paired with spectral outputs.
+    Dataset for atmospheric profile data with support for multiple data sources.
     
-    Handles the case where input profiles and output spectra have different sequence lengths.
-    Optimized for ultra-large spectral outputs (up to 40,000+ points).
-    Uses an LRU cache to speed up repeated file access.
+    Separates data into different types (global, profile, spectral) to allow
+    efficient processing by specialized encoders without excessive padding.
     """
-    
+
     def __init__(
         self,
         data_folder,
-        input_seq_length=None,
-        output_seq_length=None,  # Optional, will auto-detect if None
         input_variables=None,
         target_variables=None,
-        cache_size=1024
+        global_indices=None,
+        sequence_types=None,
+        cache_size=1024,
+        allow_variable_length=True
     ):
-        """Initialize the dataset with the given configuration."""
+        """
+        Initialize dataset with multi-source configuration.
+        
+        Parameters
+        ----------
+        data_folder : str or Path
+            Path to the folder containing profile data
+        input_variables : list of str, optional
+            Names of input variables to use
+        target_variables : list of str, optional
+            Names of target variables to predict
+        global_indices : list of int, optional
+            Indices of global (non-sequential) features
+        sequence_types : dict, optional
+            Mapping of sequence type names to feature indices
+        cache_size : int, optional
+            Maximum number of profiles to cache in memory
+        allow_variable_length : bool, optional
+            Whether to allow variable-length sequences
+        """
         super().__init__()
         self.data_folder = Path(data_folder)
         if not self.data_folder.exists():
             raise FileNotFoundError(f"Data folder not found: {data_folder}")
-            
-        self.input_seq_length = input_seq_length
-        self.output_seq_length = output_seq_length  # Will be auto-detected if None
+
+        # Variables configuration
         self.input_variables = input_variables or ["pressure", "temperature"]
         self.target_variables = target_variables or ["transit_depth"]
-        
-        # Store all variables and required keys
-        self.all_variables = list(set(self.input_variables + self.target_variables))  # Remove duplicates
-        self.required_keys = set(self.input_variables + self.target_variables)
+        self.all_variables = list(set(self.input_variables + self.target_variables))
+        self.required_keys = set(self.all_variables)
+
+        # Variable classification
+        self.global_indices = global_indices or []
+        self.sequence_types = sequence_types or {}
+
+        # If sequence types not specified, create a default structure
+        if not self.sequence_types:
+            seq_indices = [i for i in range(len(self.input_variables)) if i not in self.global_indices]
+            self.sequence_types = {"profile": seq_indices}
+
+        # Tracking sequence lengths for each type
+        self.sequence_lengths = defaultdict(int)
+        self.allow_variable_length = allow_variable_length
+
+        # File caching
         self.cache_size = cache_size
         self.cache = OrderedDict()
-        
-        # Additional properties for variable type tracking
-        self.global_variables = []  # Will store scalar variables
-        self.sequence_variables = []  # Will store sequence variables
-        
-        # Initialize dataset will auto-detect output_seq_length and variable types
+
+        # Initialize dataset from files
         self._initialize_dataset()
-        
+        self._log_initialization_info()
+
+    def _log_initialization_info(self):
+        """Log information about the initialized dataset."""
         logger.info(f"Initialized dataset with {len(self.valid_files)} valid profiles")
-        logger.info(f"Input variables: {self.input_variables} (seq length: {self.input_seq_length})")
-        logger.info(f"Target variables: {self.target_variables} (seq length: {self.output_seq_length})")
+        logger.info(f"Input variables: {self.input_variables}")
+        logger.info(f"Target variables: {self.target_variables}")
         
-        # Log detected variable types
-        if self.global_variables:
-            logger.info(f"Detected global (scalar) variables: {self.global_variables}")
-        if self.sequence_variables:
-            logger.info(f"Detected sequence variables: {self.sequence_variables}")
+        if self.global_indices:
+            global_vars = [self.input_variables[i] for i in self.global_indices]
+            logger.info(f"Global variables: {global_vars}")
+        
+        for seq_type, indices in self.sequence_types.items():
+            seq_vars = [self.input_variables[i] for i in indices]
+            logger.info(f"Sequence type '{seq_type}': {seq_vars}")
+            logger.info(f"  - Sequence length: {self.sequence_lengths[seq_type]}")
+        
+        for var in self.target_variables:
+            logger.info(f"Target '{var}' sequence length: {self.sequence_lengths[var]}")
 
     def _initialize_dataset(self):
-        """Scan data folder for JSON files and build the dataset index with enhanced auto-detection."""
-        if not self.data_folder.exists():
-            raise FileNotFoundError(f"Data folder not found: {self.data_folder}")
-            
-        json_files = [
-            f for f in self.data_folder.glob("*.json")
-            if f.name != "normalization_metadata.json"
-        ]
-        
+        """Analyze JSON files, detect variable types, and build the dataset."""
+        # Get all JSON files except the normalization metadata file
+        json_files = [f for f in self.data_folder.glob("*.json") if f.name != "normalization_metadata.json"]
         if not json_files:
             raise FileNotFoundError(f"No JSON files found in {self.data_folder}")
 
+        # Initialize storage for dataset index
         self.valid_files = []
         self.metadata = {}
         self.filenames = []
+
+        # Validate files and detect sequence lengths
+        self._detect_sequence_lengths(json_files[:min(50, len(json_files))])
+        self._validate_and_build_dataset(json_files)
+
+    def _detect_sequence_lengths(self, sample_files):
+        """Detect typical sequence lengths for each data type."""
+        # Initialize storage for sequence length statistics
+        seq_length_stats = defaultdict(list)
+        target_length_stats = defaultdict(list)
+        
+        logger.info(f"Analyzing {len(sample_files)} files to detect sequence lengths")
+        
+        # Process each sample file
+        for file_path in sample_files:
+            try:
+                profile = self._load_json_safely(file_path)
+                if not profile:
+                    continue
+                    
+                # Check each sequence type
+                for seq_type, indices in self.sequence_types.items():
+                    # Get typical length from the first variable in this sequence type
+                    if indices:
+                        var_name = self.input_variables[indices[0]]
+                        if var_name in profile and isinstance(profile[var_name], list):
+                            seq_length_stats[seq_type].append(len(profile[var_name]))
+                
+                # Check target variables
+                for var in self.target_variables:
+                    if var in profile and isinstance(profile[var], list):
+                        target_length_stats[var].append(len(profile[var]))
+                        
+            except Exception as e:
+                logger.warning(f"Error analyzing {file_path.name}: {e}")
+        
+        # Set typical sequence lengths based on median values
+        for seq_type, lengths in seq_length_stats.items():
+            if lengths:
+                self.sequence_lengths[seq_type] = int(np.median(lengths))
+        
+        # Set target sequence lengths
+        for var, lengths in target_length_stats.items():
+            if lengths:
+                self.sequence_lengths[var] = int(np.median(lengths))
+                self.sequence_lengths["output"] = int(np.median(lengths))  # Use for convenience
+
+    def _validate_and_build_dataset(self, json_files):
+        """Validate JSON files and build the dataset index."""
+        logger.info(f"Validating {len(json_files)} files")
         invalid_count = 0
         
-        # For auto-detecting output sequence length and variable types
-        variable_types = {var: {"is_sequence": False, "count": 0, "lengths": []} for var in self.all_variables}
-        
-        # First pass: detect variable types and sequence lengths
-        num_sample_files = min(50, len(json_files))
-        logger.info(f"Analyzing {num_sample_files} files to detect variable types and sequence lengths")
-        
-        for file_path in json_files[:num_sample_files]:
-            try:
-                profile = self._safe_load_json(file_path)
-                
-                # Analyze variable types
-                for var in self.all_variables:
-                    if var in profile:
-                        if isinstance(profile[var], list):
-                            variable_types[var]["is_sequence"] = True
-                            variable_types[var]["count"] += 1
-                            variable_types[var]["lengths"].append(len(profile[var]))
-                        else:
-                            variable_types[var]["count"] += 1
-            except Exception as e:
-                logger.warning(f"Error analyzing file {file_path.name}: {str(e)}")
-        
-        # Categorize variables as global or sequence
-        for var, info in variable_types.items():
-            if info["count"] > 0:
-                if info["is_sequence"]:
-                    self.sequence_variables.append(var)
-                    # Log median sequence length for this variable
-                    if info["lengths"]:
-                        median_length = np.median(info["lengths"]).astype(int)
-                        logger.debug(f"Variable {var} has median sequence length: {median_length}")
-                else:
-                    self.global_variables.append(var)
-        
-        # Auto-detect typical sequence lengths for input and output
-        input_seq_lengths = []
-        output_seq_lengths = []
-        
-        for var in self.input_variables:
-            if var in self.sequence_variables and variable_types[var]["lengths"]:
-                input_seq_lengths.extend(variable_types[var]["lengths"])
-                
-        for var in self.target_variables:
-            if var in self.sequence_variables and variable_types[var]["lengths"]:
-                output_seq_lengths.extend(variable_types[var]["lengths"])
-        
-        # Set detected sequence lengths if not provided
-        if self.input_seq_length is None:
-            if input_seq_lengths:
-                self.input_seq_length = int(np.median(input_seq_lengths))
-                logger.info(f"Auto-detected input_seq_length: {self.input_seq_length}")
-            else:
-                # Default to 1 if no sequences found
-                self.input_seq_length = 1
-                logger.warning("No sequential input variables found, setting input_seq_length=1")
-            
-        if self.output_seq_length is None:
-            if output_seq_lengths:
-                self.output_seq_length = int(np.median(output_seq_lengths))
-                logger.info(f"Auto-detected output_seq_length: {self.output_seq_length}")
-            else:
-                # Default to 1 if no sequences found
-                self.output_seq_length = 1
-                logger.warning("No sequential output variables found, setting output_seq_length=1")
-        
-        # Second pass: validate and build dataset
-        logger.info(f"Validating all {len(json_files)} files")
         for file_path in json_files:
             try:
-                profile = self._safe_load_json(file_path)
-                
+                profile = self._load_json_safely(file_path)
+                if not profile:
+                    invalid_count += 1
+                    continue
+                    
                 if self._validate_profile(profile):
                     self.valid_files.append(file_path)
                     
-                    # Get sequence lengths for input and output
-                    input_seq_length = self._get_sequence_length(profile, self.input_variables)
-                    output_seq_length = self._get_sequence_length(profile, self.target_variables)
+                    # Collect sequence lengths for this file
+                    seq_lengths = {}
+                    for seq_type, indices in self.sequence_types.items():
+                        if indices:
+                            var_name = self.input_variables[indices[0]]
+                            if isinstance(profile.get(var_name), list):
+                                seq_lengths[seq_type] = len(profile[var_name])
                     
+                    # Collect target lengths
+                    target_lengths = {}
+                    for var in self.target_variables:
+                        if isinstance(profile.get(var), list):
+                            target_lengths[var] = len(profile[var])
+                    
+                    # Store metadata
                     self.metadata[str(file_path)] = {
-                        "input_seq_length": input_seq_length,
-                        "output_seq_length": output_seq_length
+                        "sequence_lengths": seq_lengths,
+                        "target_lengths": target_lengths
                     }
+                    
                     self.filenames.append(file_path.name)
                 else:
                     invalid_count += 1
             except Exception as e:
-                logger.warning(f"Skipping invalid file {file_path.name}: {str(e)}")
+                logger.warning(f"Skipping {file_path.name}: {e}")
                 invalid_count += 1
-                continue
-
+                
         if not self.valid_files:
             raise ValueError(f"No valid profiles found in {self.data_folder}")
             
-        # Final check for sequence lengths - ensure they are set
-        if self.input_seq_length is None or self.input_seq_length <= 0:
-            # Use the first valid file's input sequence length as default
-            first_file = str(self.valid_files[0])
-            self.input_seq_length = self.metadata[first_file]["input_seq_length"]
-            if self.input_seq_length <= 0:
-                self.input_seq_length = 1
-                logger.warning("Invalid input sequence length detected, setting to 1")
-            
-        if self.output_seq_length is None or self.output_seq_length <= 0:
-            # Use the first valid file's output sequence length as default
-            first_file = str(self.valid_files[0])
-            self.output_seq_length = self.metadata[first_file]["output_seq_length"]
-            if self.output_seq_length <= 0:
-                self.output_seq_length = 1
-                logger.warning("Invalid output sequence length detected, setting to 1")
-        
         if invalid_count:
             logger.warning(f"Found {invalid_count} invalid files")
-            
-        logger.info(f"Found {len(self.valid_files)} valid profile files")
-        
-        # Warn if dealing with ultra-large sequences
-        if self.output_seq_length > 30000:
-            logger.warning(f"Ultra-large output sequence detected ({self.output_seq_length} points)")
-            logger.warning("Memory usage may be high, consider using optimized architecture")
 
-    @staticmethod
-    def _safe_load_json(file_path):
-        """Safely load and parse a JSON file."""
+    def _load_json_safely(self, file_path):
+        """Load a JSON file with error handling."""
         try:
             with open(file_path, "r") as f:
                 return json.load(f)
-        except json.JSONDecodeError as e:
-            raise json.JSONDecodeError(f"Invalid JSON in {file_path.name}: {e.msg}", e.doc, e.pos)
-        except OSError as e:
-            raise OSError(f"Error reading file {file_path.name}: {e}")
+        except (json.JSONDecodeError, IOError, UnicodeDecodeError) as e:
+            logger.warning(f"Error loading JSON from {file_path}: {e}")
+            return None
 
     def _validate_profile(self, profile):
-        """
-        Validate a profile by checking required keys, data types, and sequence lengths.
-        """
-        # Check profile type
+        """Validate a profile by ensuring required keys exist and values are numeric."""
         if not isinstance(profile, dict):
-            logger.warning("Profile is not a dictionary")
             return False
-                
-        # Check required keys
         if not self.required_keys.issubset(profile.keys()):
-            missing = self.required_keys - set(profile.keys())
-            logger.warning(f"Missing required keys: {missing}")
             return False
-
-        # Check input sequence length if specified
-        try:
-            input_seq_length = self._get_sequence_length(profile, self.input_variables)
-            if self.input_seq_length and input_seq_length != self.input_seq_length:
-                logger.warning(f"Expected input sequence length {self.input_seq_length}, got {input_seq_length}")
-                return False
-        except Exception as e:
-            logger.warning(f"Error determining input sequence length: {str(e)}")
-            return False
-            
-        # Check values are numeric and finite
-        try:
-            for var in self.all_variables:
-                if var not in profile:
-                    continue
-                    
-                val = profile[var]
-                if isinstance(val, list):
-                    if not all(isinstance(x, (int, float)) for x in val):
-                        logger.warning(f"Non-numeric values in {var}")
-                        return False
-                    if not all(np.isfinite(x) for x in val):
-                        logger.warning(f"Non-finite values in {var}")
-                        return False
-                else:
-                    if not isinstance(val, (int, float)):
-                        logger.warning(f"{var} is not numeric: {type(val).__name__}")
-                        return False
-                    if not np.isfinite(val):
-                        logger.warning(f"{var} is not finite: {val}")
-                        return False
-            return True
-        except Exception as e:
-            logger.warning(f"Error validating values: {str(e)}")
-            return False
-
-    def _get_sequence_length(self, profile, variables):
-        """
-        Determine the maximum sequence length from a list of variables.
-        """
-        max_length = 1  # Default for scalar values
         
-        for var in variables:
-            # Skip if variable doesn't exist in this profile
-            if var not in profile:
-                continue
-                
-            val = profile[var]
+        for var in self.all_variables:
+            val = profile.get(var)
             if isinstance(val, list):
-                max_length = max(max_length, len(val))
-                
-        return max_length
+                if not val or not all(isinstance(x, (int, float)) and np.isfinite(x) for x in val):
+                    return False
+            else:
+                if not isinstance(val, (int, float)) or not np.isfinite(val):
+                    return False
+        return True
 
     def __len__(self):
-        """Return the number of valid profiles in the dataset."""
+        """Return the number of valid profiles."""
         return len(self.valid_files)
 
-    def _process_variable(self, profile, var_name, seq_length):
+    def _process_variable(self, profile, var_name, seq_length=None):
         """
-        Handle both sequence and global (scalar) variables with improved null handling.
-        """
-        # Check if variable exists in profile
-        if var_name not in profile:
-            # Handle missing variable by creating a tensor of zeros
-            logger.debug(f"Variable {var_name} not found in profile, using zeros")
-            return torch.zeros(seq_length, dtype=torch.float32)
+        Return a tensor for a variable, optionally resizing to specified length.
         
-        val = profile[var_name]
+        Parameters
+        ----------
+        profile : dict
+            Profile data
+        var_name : str
+            Variable name to process
+        seq_length : int, optional
+            Target sequence length (if None, uses natural length)
+            
+        Returns
+        -------
+        torch.Tensor
+            Processed variable as tensor
+        """
+        val = profile.get(var_name)
         
         if val is None:
-            # Handle null value by creating a tensor of zeros
-            logger.debug(f"Variable {var_name} is None, using zeros")
-            return torch.zeros(seq_length, dtype=torch.float32)
-        
+            return torch.zeros(1 if seq_length is None else seq_length, dtype=torch.float32)
+            
         if isinstance(val, list):
-            # Handle list (sequence) variable
-            if not val:  # Empty list
-                logger.debug(f"Variable {var_name} is an empty list, using zeros")
-                return torch.zeros(seq_length, dtype=torch.float32)
+            if not val:
+                return torch.zeros(1 if seq_length is None else seq_length, dtype=torch.float32)
                 
             data = torch.tensor(val, dtype=torch.float32)
             
-            # Handle sequence length mismatch
-            if len(data) != seq_length:
-                if len(data) > seq_length:
-                    # Truncate
-                    logger.debug(f"Truncating {var_name} from length {len(data)} to {seq_length}")
-                    data = data[:seq_length]
-                else:
-                    # Pad with last value or zeros
-                    logger.debug(f"Padding {var_name} from length {len(data)} to {seq_length}")
-                    padding = torch.full((seq_length - len(data),), data[-1] if len(data) > 0 else 0.0, 
-                                        dtype=torch.float32)
-                    data = torch.cat([data, padding])
+            # If seq_length is specified and differs from data length, adjust
+            if seq_length is not None and len(data) != seq_length:
+                return self._adjust_length(data, seq_length)
+            
             return data
         else:
-            # For global (scalar) variables, create a constant sequence
-            return torch.full((seq_length,), float(val), dtype=torch.float32)
+            # For scalars, either return as scalar or create constant sequence
+            if seq_length is None:
+                return torch.tensor(float(val), dtype=torch.float32).reshape(1)
+            else:
+                return torch.full((seq_length,), float(val), dtype=torch.float32)
 
     def __getitem__(self, idx):
         """
-        Get the input and target tensors for a profile with efficient memory handling.
+        Return inputs and targets for the given profile index.
+        
+        Returns inputs grouped by data type for the multi-source transformer.
+        
+        Parameters
+        ----------
+        idx : int
+            Profile index
+            
+        Returns
+        -------
+        tuple
+            (inputs, targets) where inputs is a dictionary mapping data type
+            to tensor and targets is a tensor
         """
-        # Check if item is in cache
+        # Use cached data if available
         if idx in self.cache:
             self.cache.move_to_end(idx)
             return self.cache[idx]
-
-        # Validate idx is in range
-        if idx < 0 or idx >= len(self.valid_files):
-            raise IndexError(f"Index {idx} out of range for dataset with {len(self.valid_files)} items")
-
-        # Load and process the profile
-        file_path = self.valid_files[idx]
-        try:
-            profile = self._safe_load_json(file_path)
-        except Exception as e:
-            logger.error(f"Error loading profile {file_path}: {e}")
-            # Return a default profile if there's an error loading
-            # This prevents crashes during training
-            input_tensor = torch.zeros((self.input_seq_length, len(self.input_variables)), dtype=torch.float32)
-            target_tensor = torch.zeros((self.output_seq_length, len(self.target_variables)), dtype=torch.float32)
-            return (input_tensor, target_tensor)
-        
-        # Get sequence lengths from metadata or use defaults
-        metadata_key = str(file_path)
-        if metadata_key in self.metadata:
-            metadata = self.metadata[metadata_key]
-            input_seq_length = metadata.get("input_seq_length", self.input_seq_length or 1)
-            output_seq_length = metadata.get("output_seq_length", self.output_seq_length or 1)
-        else:
-            # Fallback if metadata is missing
-            logger.warning(f"Metadata missing for {file_path}, using default sequence lengths")
-            input_seq_length = self.input_seq_length or 1
-            output_seq_length = self.output_seq_length or 1
-
-        # Process input variables
-        input_tensors = []
-        for var in self.input_variables:
-            input_tensors.append(self._process_variable(profile, var, input_seq_length))
             
+        if idx < 0 or idx >= len(self.valid_files):
+            raise IndexError(f"Index {idx} out of range")
+            
+        file_path = self.valid_files[idx]
+        
+        try:
+            profile = self._load_json_safely(file_path)
+            if not profile:
+                raise ValueError(f"Failed to load profile from {file_path}")
+                
+        except Exception as e:
+            logger.error(f"Error loading {file_path.name}: {e}")
+            # Return empty data on error
+            global_features = torch.zeros(len(self.global_indices), dtype=torch.float32)
+            inputs = {"global": global_features} if self.global_indices else {}
+            for seq_type, indices in self.sequence_types.items():
+                if indices:
+                    inputs[seq_type] = torch.zeros(
+                        self.sequence_lengths.get(seq_type, 1), 
+                        len(indices), 
+                        dtype=torch.float32
+                    )
+            targets = torch.zeros(
+                self.sequence_lengths.get("output", 1), 
+                len(self.target_variables), 
+                dtype=torch.float32
+            )
+            return (inputs, targets)
+        
+        # Process global features
+        if self.global_indices:
+            global_features = torch.stack([
+                self._process_variable(profile, self.input_variables[i]) 
+                for i in self.global_indices
+            ], dim=0).squeeze(1)  # Remove singleton dimension for scalar globals
+            
+            inputs = {"global": global_features}
+        else:
+            inputs = {}
+        
+        # Process each sequence type
+        for seq_type, indices in self.sequence_types.items():
+            if not indices:
+                continue
+                
+            # Determine sequence length for this type
+            if self.allow_variable_length:
+                # Use natural length
+                seq_length = None
+            else:
+                # Use predetermined length
+                seq_length = self.sequence_lengths.get(seq_type, 1)
+            
+            # Create a tensor for each variable in this sequence type
+            seq_features = []
+            for i in indices:
+                var_name = self.input_variables[i]
+                tensor = self._process_variable(profile, var_name, seq_length)
+                seq_features.append(tensor)
+            
+            # If variable length, ensure all features have the same length
+            if self.allow_variable_length and seq_features:
+                if not seq_features:
+                    # Handle case with no valid features
+                    inputs[seq_type] = torch.tensor([])
+                    continue
+                    
+                # Find max length, checking for empty tensors
+                max_len = max((t.shape[0] for t in seq_features if t.numel() > 0), default=1)
+                seq_features = [
+                    self._adjust_length(t, max_len) for t in seq_features
+                ]
+            
+            # Stack features along last dimension
+            inputs[seq_type] = torch.stack(seq_features, dim=1) if seq_features else torch.tensor([])
+        
         # Process target variables
         target_tensors = []
         for var in self.target_variables:
-            target_tensors.append(self._process_variable(profile, var, output_seq_length))
+            # For targets, always use their natural length
+            tensor = self._process_variable(profile, var)
+            target_tensors.append(tensor)
         
-        # Stack tensors along feature dimension
-        input_tensor = torch.stack(input_tensors, dim=1)
-        target_tensor = torch.stack(target_tensors, dim=1)
+        # Ensure all targets have the same length
+        if target_tensors:
+            # Find max length, checking for empty tensors
+            max_len = max((t.shape[0] for t in target_tensors if t.numel() > 0), default=1)
+            target_tensors = [
+                self._adjust_length(t, max_len) for t in target_tensors
+            ]
+            targets = torch.stack(target_tensors, dim=1)
+        else:
+            targets = torch.tensor([])
         
-        # Update cache
-        if len(self.cache) >= self.cache_size:
-            self.cache.popitem(last=False)  # Remove oldest item
-            
-        result = (input_tensor, target_tensor)
+        # Add to cache efficiently
+        result = (inputs, targets)
         self.cache[idx] = result
+        # Manage cache size after adding the new item
+        while len(self.cache) > self.cache_size:
+            self.cache.popitem(last=False)
         
         return result
+    
+    def _adjust_length(self, tensor, target_length):
+        """Adjust tensor to target length by truncating or padding."""
+        if tensor.shape[0] == target_length:
+            return tensor
+            
+        if tensor.shape[0] > target_length:
+            return tensor[:target_length]
+        else:
+            pad_val = tensor[-1] if tensor.numel() > 0 else 0.0
+            padding = torch.full((target_length - tensor.shape[0],), pad_val, dtype=tensor.dtype)
+            return torch.cat([tensor, padding])
 
     def clear_cache(self):
-        """Clear the LRU cache to free memory."""
+        """Clear the file cache."""
         self.cache.clear()
-        logger.debug("Dataset cache cleared")
 
-    @classmethod
-    def create_dataloader(
-        cls,
-        dataset,
-        batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=False,
-        persistent_workers=True
-    ):
-        """Create an optimized DataLoader for the dataset."""
-        # Auto-adjust batch size for very large sequences
-        original_batch_size = batch_size
-        if hasattr(dataset, 'output_seq_length'):
-            if dataset.output_seq_length > 40000 and batch_size > 2:
-                batch_size = 2
-                logger.warning(f"Reducing batch size from {original_batch_size} to {batch_size} due to extremely large sequence length")
-            elif dataset.output_seq_length > 20000 and batch_size > 4:
-                batch_size = 4
-                logger.warning(f"Reducing batch size from {original_batch_size} to {batch_size} due to large sequence length")
+
+# ------------------------------------------------------------------------------
+# Collation functions for batching
+# ------------------------------------------------------------------------------
+class MultiSourceCollate:
+    """
+    Collates samples with separate handling for different data types.
+    
+    Each data type (global, profile, spectral) is processed separately
+    and padded only within its group, avoiding excessive padding of
+    short sequences to match long ones.
+    """
+    
+    def __call__(self, batch):
+        """
+        Collate a batch of samples into structured batch data.
         
-        # Check if dataset is empty
-        if len(dataset) == 0:
-            logger.error("Dataset is empty - cannot create DataLoader")
-            raise ValueError("Cannot create DataLoader from empty dataset")
+        Parameters
+        ----------
+        batch : list of tuples
+            Each tuple contains (inputs, targets) where inputs is a dictionary
             
-        # Check persistent_workers setting with num_workers
-        if persistent_workers and num_workers == 0:
-            logger.warning("persistent_workers=True has no effect when num_workers=0, setting to False")
-            persistent_workers = False
+        Returns
+        -------
+        tuple
+            (inputs, targets) where inputs is a dictionary and targets is a tensor
+        """
+        if not batch:
+            return {}, torch.tensor([])
+            
+        # Initialize containers for each data type
+        inputs_dict = defaultdict(list)
+        targets_list = []
         
-        # Set prefetch_factor only if num_workers > 0
-        prefetch_factor = 2 if num_workers > 0 else None
+        # Collect inputs by type and targets
+        for sample_inputs, sample_targets in batch:
+            # Collect inputs by type
+            for key, value in sample_inputs.items():
+                inputs_dict[key].append(value)
+            
+            # Collect targets
+            targets_list.append(sample_targets)
         
-        # Create and return the DataLoader
-        logger.info(f"Creating DataLoader with batch_size={batch_size}, num_workers={num_workers}")
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory and torch.cuda.is_available(),
-            persistent_workers=persistent_workers and num_workers > 0,
-            prefetch_factor=prefetch_factor,
-            drop_last=drop_last
-        )
+        # Process each input type appropriately
+        collated_inputs = {}
+        
+        # Global features (simple stack)
+        if "global" in inputs_dict and inputs_dict["global"]:
+            collated_inputs["global"] = torch.stack(inputs_dict["global"])
+        
+        # Process each sequence type
+        for seq_type, tensors in inputs_dict.items():
+            if seq_type == "global" or not tensors:
+                continue
+            
+            # Pad sequences to the max length in this batch
+            collated_inputs[seq_type] = self._pad_and_stack(tensors)
+        
+        # Process targets
+        if targets_list:
+            collated_targets = self._pad_and_stack(targets_list)
+        else:
+            collated_targets = torch.tensor([])
+        
+        return collated_inputs, collated_targets
+    
+    def _pad_and_stack(self, tensors):
+        """
+        Pad tensors to max length in batch and stack them.
+        
+        Parameters
+        ----------
+        tensors : list of torch.Tensor
+            List of tensors to pad and stack
+            
+        Returns
+        -------
+        torch.Tensor
+            Batched tensor with consistent shapes
+        """
+        if not tensors:
+            return torch.tensor([])
+            
+        # Find max sequence length in this batch, handling empty tensors
+        max_len = max((t.shape[0] for t in tensors if t.numel() > 0), default=1)
+        
+        # Pad tensors to max length
+        padded = []
+        for t in tensors:
+            if t.numel() == 0:
+                # Handle empty tensor
+                shape = list(t.shape)
+                shape[0] = max_len
+                padded.append(torch.zeros(*shape, dtype=t.dtype))
+            elif t.shape[0] < max_len:
+                # Pad with the last value of each sequence
+                pad_values = t[-1:].expand(max_len - t.shape[0], *t.shape[1:])
+                padded.append(torch.cat([t, pad_values], dim=0))
+            else:
+                padded.append(t)
+        
+        # Stack along batch dimension
+        return torch.stack(padded)
+
+
+def create_multi_source_collate_fn():
+    """Return a collate function for multi-source transformer data."""
+    return MultiSourceCollate()
+
+
+def create_dataloader(dataset, batch_size, shuffle=True, num_workers=None,
+                      pin_memory=None, drop_last=False, persistent_workers=None, collate_fn=None):
+    """
+    Create an optimized DataLoader for the atmospheric dataset.
+    
+    Parameters
+    ----------
+    dataset : torch.utils.data.Dataset
+        Dataset to create loader for
+    batch_size : int
+        Batch size
+    shuffle : bool, optional
+        Whether to shuffle the data
+    num_workers : int, optional
+        Number of worker processes
+    pin_memory : bool, optional
+        Whether to pin memory (good for GPU training)
+    drop_last : bool, optional
+        Whether to drop the last incomplete batch
+    persistent_workers : bool, optional
+        Whether to keep worker processes alive between epochs
+    collate_fn : callable, optional
+        Custom batch collation function
+        
+    Returns
+    -------
+    torch.utils.data.DataLoader
+        Configured data loader
+    """
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty")
+        
+    # Get hardware-specific dataloader settings
+    hardware_settings = configure_dataloader_settings()
+    
+    # Use provided values or fall back to hardware-specific defaults
+    if num_workers is None:
+        num_workers = hardware_settings["num_workers"]
+    if pin_memory is None:
+        pin_memory = hardware_settings["pin_memory"]
+    if persistent_workers is None:
+        persistent_workers = hardware_settings["persistent_workers"] and num_workers > 0
+        
+    # If no collate function provided, use MultiSourceCollate for multi-source data
+    if collate_fn is None:
+        collate_fn = create_multi_source_collate_fn()
+            
+    logger.info(f"Creating DataLoader with batch_size={batch_size}, num_workers={num_workers}, persistent_workers={persistent_workers}")
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=2 if num_workers > 0 else None,
+        drop_last=drop_last,
+        collate_fn=collate_fn
+    )

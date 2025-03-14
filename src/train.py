@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+"""
+train.py - Model training for multi-source transformer architecture
+
+Implements training, validation, and testing for models with separate encoders
+for different data types (global features, atmospheric profiles, and spectral sequences).
+"""
+
 import time
 import json
 import logging
@@ -6,117 +14,133 @@ from pathlib import Path
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader, random_split
-import numpy as np
-from model import create_prediction_model
+
+from utils import create_prediction_model
+from hardware import get_device_type, configure_dataloader_settings
 
 logger = logging.getLogger(__name__)
 
+
 class ModelTrainer:
-    def __init__(self, config, device, save_path, dataset, test_size=0.15, val_size=0.15):
-        """Initialize the trainer with configuration and dataset."""
+    """
+    Trainer for multi-source transformer models.
+    
+    Handles dataset splitting, model training with early stopping,
+    and evaluation on validation and test sets.
+    """
+    
+    def __init__(self, config, device, save_path, dataset, 
+                 test_size=0.15, val_size=0.15, collate_fn=None):
+        """
+        Initialize the trainer with configuration and dataset.
+        
+        Parameters
+        ----------
+        config : dict
+            Model and training configuration
+        device : torch.device
+            Device to train on (CPU/GPU)
+        save_path : str or Path
+            Directory to save model checkpoints
+        dataset : torch.utils.data.Dataset
+            Dataset to train on
+        test_size : float
+            Fraction of dataset to use for testing
+        val_size : float
+            Fraction of dataset to use for validation
+        collate_fn : callable, optional
+            Custom batch collation function for multi-source data
+        """
         self.config = config
         self.device = device
         self.save_path = Path(save_path)
         self.save_path.mkdir(parents=True, exist_ok=True)
+        self.collate_fn = collate_fn
+        
+        # Store original dataset for file path access
+        self.original_dataset = dataset
         
         logger.info(f"Initializing ModelTrainer with device: {device}")
         
-        # Setup mixed precision training - CPU or CUDA only
-        self.use_amp = config.get("use_amp", False) or config.get("use_mixed_precision", False)
-        if self.device.type != 'cuda':
-            self.use_amp = False
-        
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        # Configure mixed precision training
+        device_type = get_device_type()
+        self.use_amp = (config.get("use_amp", False) and device_type == 'cuda')
+        self.scaler = torch.amp.GradScaler() if self.use_amp else None
         logger.info(f"Mixed precision training enabled: {self.use_amp}")
         
-        # Split dataset
+        # Initialize datasets and model
         self._prepare_datasets(dataset, test_size, val_size)
         self._create_dataloaders()
-        
-        # Initialize model - pass sample data for automatic feature detection
-        sample_data = dataset[0][0] if hasattr(dataset, '__getitem__') else None
-        self.model = create_prediction_model(config, sample_data=sample_data).to(device)
-        logger.info(f"Model created with {self.model.count_parameters():,} parameters")
-        
-        # Setup training components
+        self._initialize_model()
         self._setup_training_components()
         
-        # Training state
+        # Initialize tracking variables
         self.best_val_loss = float("inf")
         self.best_state = None
         self.best_epoch = -1
         
-        # Save test profile names
-        self._save_test_profiles(dataset)
+        # Save test profile information
+        self._save_test_profiles()
 
+    def _initialize_model(self):
+        """Initialize model with appropriate configuration."""
+        logger.info("Creating prediction model with multi-source architecture")
+        self.model = create_prediction_model(self.config)
+        self.model = self.model.to(self.device)
+        logger.info(f"Model created and moved to {self.device}")
+    
     def _prepare_datasets(self, dataset, test_size, val_size):
         """Split dataset into training, validation, and test sets."""
         dataset_size = len(dataset)
         test_count = int(test_size * dataset_size)
         val_count = int(val_size * dataset_size)
         train_count = dataset_size - test_count - val_count
-
-        generator = torch.Generator().manual_seed(42)
-        # Get the splits from random_split and ensure we get three datasets back
-        splits = random_split(
-            dataset, [train_count, val_count, test_count], generator=generator
-        )
-        self.train_dataset, self.val_dataset, self.test_dataset = splits
+        
+        # Generate indices for the split with fixed seed for reproducibility
+        generator = torch.Generator().manual_seed(self.config.get("random_seed", 42))
+        indices = torch.randperm(dataset_size, generator=generator).tolist()
+        
+        # Store test indices for filename lookup
+        self.test_indices = indices[:test_count]
+        val_indices = indices[test_count:test_count+val_count]
+        train_indices = indices[test_count+val_count:]
+        
+        # Create the subset datasets
+        self.train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        self.val_dataset = torch.utils.data.Subset(dataset, val_indices)
+        self.test_dataset = torch.utils.data.Subset(dataset, self.test_indices)
         
         logger.info(f"Dataset split: {train_count} train, {val_count} validation, {test_count} test samples")
 
-    def _save_test_profiles(self, dataset):
-        """Save the names of test profiles to a file."""
-        try:
-            if hasattr(dataset, 'filenames') and hasattr(self.test_dataset, 'indices'):
-                # Get the test profile names using indices
-                test_profile_names = [dataset.filenames[i] for i in self.test_dataset.indices]
-                
-                # Save to a JSON file in the model directory
-                test_profiles_path = self.save_path / "test_profiles.json"
-                with open(test_profiles_path, 'w') as f:
-                    json.dump(test_profile_names, f, indent=2)
-                
-                logger.info(f"Saved {len(test_profile_names)} test profile names to {test_profiles_path}")
-            else:
-                logger.warning("Could not save test profile names - dataset missing required attributes")
-        except Exception as e:
-            logger.error(f"Error saving test profile names: {str(e)}")
-
     def _create_dataloaders(self):
         """Create DataLoaders for training, validation, and testing."""
-        output_seq_length = self.config.get("output_seq_length", 0)
+        # Use specified batch size without sequence length adjustments
+        batch_size = self.config.get("batch_size", 16)
         
-        # Determine batch size based on sequence length
-        if output_seq_length > 40000:
-            default_batch = 2
-        elif output_seq_length > 20000:
-            default_batch = 4
-        elif output_seq_length > 10000:
-            default_batch = 16
-        else:
-            default_batch = 32
-            
-        batch_size = self.config.get("batch_size", default_batch)
-        num_workers = self.config.get("num_workers", min(4, os.cpu_count() or 1))
+        # Get hardware-specific dataloader settings
+        dataloader_settings = configure_dataloader_settings()
+        num_workers = self.config.get("num_workers", dataloader_settings["num_workers"])
         
         dataloader_kwargs = {
             "batch_size": batch_size,
             "num_workers": num_workers,
-            "pin_memory": self.device.type == "cuda",
-            "persistent_workers": num_workers > 0
+            "pin_memory": dataloader_settings["pin_memory"],
+            "persistent_workers": dataloader_settings["persistent_workers"] and num_workers > 0,
+            "collate_fn": self.collate_fn
         }
         
+        # Create dataloaders
         self.train_loader = DataLoader(self.train_dataset, shuffle=True, **dataloader_kwargs)
         self.val_loader = DataLoader(self.val_dataset, shuffle=False, **dataloader_kwargs)
         self.test_loader = DataLoader(self.test_dataset, shuffle=False, **dataloader_kwargs)
 
     def _setup_training_components(self):
         """Set up optimizer, loss function, and learning rate scheduler."""
+        # Get hyperparameters from config
         lr = self.config.get("learning_rate", 1e-4)
         weight_decay = self.config.get("weight_decay", 1e-5)
         
-        # Optimizer
+        # Initialize optimizer
         optimizer_name = self.config.get("optimizer", "adamw").lower()
         if optimizer_name == "adam":
             self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -125,7 +149,7 @@ class ModelTrainer:
         else:  # Default to AdamW
             self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
 
-        # Loss function
+        # Initialize loss function
         loss_type = self.config.get("loss_function", "mse").lower()
         if loss_type == "l1":
             self.criterion = nn.L1Loss()
@@ -134,20 +158,61 @@ class ModelTrainer:
         else:
             self.criterion = nn.MSELoss()
 
-        # Learning rate scheduler
+        # Initialize learning rate scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min',
             factor=self.config.get("gamma", 0.5),
             patience=self.config.get("lr_patience", 5),
             min_lr=self.config.get("min_lr", 1e-7),
-            verbose=False
         )
         
-        # Gradient clipping
+        # Gradient clipping value
         self.gradient_clip_val = self.config.get("gradient_clip_val", 1.0)
 
+    def _find_base_dataset(self, dataset):
+        """Recursively find the base dataset through potentially multiple Subset layers."""
+        if hasattr(dataset, 'dataset'):
+            return self._find_base_dataset(dataset.dataset)
+        return dataset
+
+    def _save_test_profiles(self):
+        """Save the names of test profiles to a file."""
+        try:
+            # Find the base dataset (unwrap any Subset layers)
+            base_dataset = self._find_base_dataset(self.original_dataset)
+            test_profile_names = []
+            
+            # Try to get file paths from dataset attributes
+            if hasattr(base_dataset, 'valid_files') and hasattr(self, 'test_indices'):
+                test_profile_paths = [base_dataset.valid_files[i] for i in self.test_indices]
+                test_profile_names = [p.name for p in test_profile_paths]
+            elif hasattr(base_dataset, 'filenames') and hasattr(self, 'test_indices'):
+                test_profile_names = [base_dataset.filenames[i] for i in self.test_indices]
+            else:
+                # Create placeholder names if necessary
+                test_profile_names = [f"test_sample_{i}" for i in range(len(self.test_dataset))]
+            
+            # Save to file
+            test_profiles_path = self.save_path / "test_profiles.json"
+            with open(test_profiles_path, 'w') as f:
+                json.dump(test_profile_names, f, indent=2)
+            
+            logger.info(f"Saved {len(test_profile_names)} test profile names")
+        
+        except Exception as e:
+            logger.error(f"Error saving test profile names: {e}")
+
     def save_model(self, path, metadata=None):
-        """Save model state and metadata to disk."""
+        """
+        Save model state and metadata to disk.
+        
+        Parameters
+        ----------
+        path : str
+            Path to save the model
+        metadata : dict, optional
+            Additional metadata to save with the model
+        """
         save_dict = {
             'state_dict': self.model.state_dict(),
             'config': self.config,
@@ -160,8 +225,24 @@ class ModelTrainer:
         torch.save(save_dict, path)
 
     def train(self, num_epochs=None, early_stopping_patience=None, min_delta=None):
-        """Train model with early stopping."""
-        # Get parameters from config if not provided
+        """
+        Train model with early stopping.
+        
+        Parameters
+        ----------
+        num_epochs : int, optional
+            Maximum number of epochs to train for
+        early_stopping_patience : int, optional
+            Number of epochs with no improvement after which training will be stopped
+        min_delta : float, optional
+            Minimum change in validation loss to qualify as improvement
+            
+        Returns
+        -------
+        str or None
+            Path to the saved model if training was successful, else None
+        """
+        # Get training parameters from config if not provided
         num_epochs = num_epochs or self.config.get("epochs", 100)
         early_stopping_patience = early_stopping_patience or self.config.get("early_stopping_patience", 10)
         min_delta = min_delta or self.config.get("min_delta", 1e-6)
@@ -184,29 +265,26 @@ class ModelTrainer:
         logger.info("-" * 80)
         logger.info(f"{'Epoch':^8} | {'Train Loss':^18} | {'Val Loss':^18} | {'LR':^10} | {'Time':^6}")
         logger.info("-" * 80)
-        start_time = time.time()
         
         try:
             for epoch in range(num_epochs):
                 epoch_start = time.time()
                 completed_epochs = epoch + 1
                 
-                # Train epoch
+                # Train and evaluate for this epoch
                 train_loss = self._train_epoch()
-                
-                # Validation phase
                 val_loss = self.evaluate()
                 
                 # Update learning rate scheduler
                 self.scheduler.step(val_loss)
                 
-                # Calculate metrics
+                # Calculate metrics and log progress
                 epoch_time = time.time() - epoch_start
                 current_lr = self.optimizer.param_groups[0]["lr"]
                 improved = val_loss < (self.best_val_loss - min_delta)
                 
-                # Print progress line
-                logger.info(f"{epoch+1:^8d} | {train_loss:^18.3e} | {val_loss:^18.3e} | {current_lr:^10.3e} | {epoch_time:^6.1f}")
+                logger.info(f"{epoch+1:^8d} | {train_loss:^18.3e} | {val_loss:^18.3e} | "
+                         f"{current_lr:^10.3e} | {epoch_time:^6.1f}")
                 
                 # Save logs to CSV
                 with open(log_path, "a") as f:
@@ -221,19 +299,22 @@ class ModelTrainer:
                     
                     # Save checkpoint for best model
                     self.save_model(str(self.save_path / "best_model.pt"), 
-                                    metadata={'val_loss': val_loss, 'epoch': epoch})
+                                  metadata={'val_loss': val_loss, 'epoch': epoch})
                 else:
                     patience_counter += 1
                     
                     if patience_counter >= early_stopping_patience:
-                        print(f"\nEarly stopping triggered after epoch {epoch+1}")
+                        logger.info(f"Early stopping triggered after epoch {epoch+1}")
                         break
-        
+                        
         except KeyboardInterrupt:
-            print("\nTraining interrupted by user")
-        
+            logger.info("Training interrupted by user")
+            
+        except Exception as e:
+            logger.error(f"Error during training: {e}", exc_info=True)
+            
         finally:
-            # Ensure best model is restored
+            # Ensure best model is restored and saved
             if self.best_state is not None:
                 self.model.load_state_dict(self.best_state)
                 
@@ -248,8 +329,8 @@ class ModelTrainer:
                     }
                 )
                 
-                print(f"\nTraining completed. Best model from epoch {self.best_epoch + 1}")
-                print(f"Best validation loss: {self.best_val_loss:.6e}")
+                logger.info(f"Training completed. Best model from epoch {self.best_epoch + 1}")
+                logger.info(f"Best validation loss: {self.best_val_loss:.6e}")
                 
                 return final_model_path
             else:
@@ -257,41 +338,48 @@ class ModelTrainer:
                 return None
 
     def _train_epoch(self):
-        """Train for one epoch."""
+        """
+        Train for one epoch.
+        
+        Returns
+        -------
+        float
+            Average loss for this epoch
+        """
         self.model.train()
         total_loss = 0.0
         batch_count = 0
         
         for batch_idx, batch in enumerate(self.train_loader):
             try:
-                # Extract inputs and targets from batch (ignore coordinates for now)
-                if len(batch) == 3:
-                    inputs, targets, _ = batch
-                else:
-                    inputs, targets = batch
+                # Extract inputs and targets
+                inputs, targets = batch
                 
                 # Move data to device
-                inputs = inputs.to(device=self.device, dtype=torch.float32)
-                targets = targets.to(device=self.device, dtype=torch.float32)
+                if isinstance(inputs, dict):
+                    inputs = {k: v.to(self.device, dtype=torch.float32) for k, v in inputs.items()}
+                else:
+                    inputs = inputs.to(self.device, dtype=torch.float32)
+                
+                targets = targets.to(self.device, dtype=torch.float32)
                 
                 # Reset gradients
                 self.optimizer.zero_grad()
                 
-                # Forward pass with mixed precision if enabled
-                if self.use_amp and self.scaler is not None:
-                    with torch.amp.autocast(device_type=self.device.type, enabled=True):
-                        # Use just inputs for our model (fixed model doesn't use coordinates)
+                if self.use_amp:
+                    # Mixed precision training
+                    with torch.amp.autocast(device_type=self.device.type):
                         outputs = self.model(inputs)
                         loss = self.criterion(outputs, targets)
                     
-                    # Skip batch if loss is NaN
-                    if not torch.isfinite(loss).item():
+                    # Skip batch if loss is not finite
+                    if not torch.isfinite(loss):
+                        logger.warning(f"Batch {batch_idx}: Non-finite loss, skipping")
                         continue
-                        
+                    
                     # Backward pass with gradient scaling
                     self.scaler.scale(loss).backward()
                     
-                    # Gradient clipping
                     if self.gradient_clip_val > 0:
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(
@@ -299,144 +387,128 @@ class ModelTrainer:
                             max_norm=self.gradient_clip_val
                         )
                     
-                    # Update weights with gradient rescaling
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                
                 else:
-                    # Standard precision training
-                    try:
-                        # Use just inputs for our model
-                        outputs = self.model(inputs)
-                        loss = self.criterion(outputs, targets)
-                        
-                        # Skip batch if loss is NaN
-                        if not torch.isfinite(loss).item():
-                            continue
-                            
-                        loss.backward()
-                        
-                        # Gradient clipping
-                        if self.gradient_clip_val > 0:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(),
-                                max_norm=self.gradient_clip_val
-                            )
-                        
-                        self.optimizer.step()
-                    except RuntimeError as e:
-                        logger.warning(f"RuntimeError in training: {str(e)}")
-                        # Clear CUDA cache if applicable
-                        if self.device.type == 'cuda' and torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        # Skip this batch
+                    # Standard training
+                    outputs = self.model(inputs)
+                    loss = self.criterion(outputs, targets)
+                    
+                    # Skip batch if loss is not finite
+                    if not torch.isfinite(loss):
+                        logger.warning(f"Batch {batch_idx}: Non-finite loss, skipping")
                         continue
+                    
+                    # Backward pass and optimization
+                    loss.backward()
+                    
+                    if self.gradient_clip_val > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            max_norm=self.gradient_clip_val
+                        )
+                    
+                    self.optimizer.step()
                 
+                # Accumulate statistics
                 total_loss += loss.item()
                 batch_count += 1
                 
             except Exception as e:
-                logger.warning(f"Error in batch processing: {str(e)}")
-                continue  # Skip this batch but continue training
-                    
+                logger.error(f"Error in batch {batch_idx}: {e}")
+                continue
+        
         # Return average loss
-        return total_loss / max(1, batch_count)
+        if batch_count == 0:
+            logger.error("No batches were successfully processed")
+            return float('inf')
+            
+        return total_loss / batch_count
 
     @torch.no_grad()
     def evaluate(self):
-        """Evaluate model on validation set."""
-        self.model.eval()
-        total_loss = 0.0
-        batch_count = 0
+        """
+        Evaluate model on validation set.
         
-        for batch_idx, batch in enumerate(self.val_loader):
-            try:
-                # Extract inputs and targets from batch (ignore coordinates for now)
-                if len(batch) == 3:
-                    inputs, targets, _ = batch
-                else:
-                    inputs, targets = batch
-                
-                # Move data to device
-                inputs = inputs.to(device=self.device, dtype=torch.float32)
-                targets = targets.to(device=self.device, dtype=torch.float32)
-                
-                try:
-                    # Forward pass
-                    if self.use_amp and self.device.type == 'cuda':
-                        with torch.amp.autocast(device_type=self.device.type, enabled=True):
-                            outputs = self.model(inputs)
-                            loss = self.criterion(outputs, targets)
-                    else:
-                        outputs = self.model(inputs)
-                        loss = self.criterion(outputs, targets)
-                    
-                    # Skip batch if loss is NaN
-                    if not torch.isfinite(loss).item():
-                        continue
-                        
-                    total_loss += loss.item()
-                    batch_count += 1
-                except RuntimeError as e:
-                    logger.warning(f"RuntimeError in evaluation: {str(e)}")
-                    if self.device.type == 'cuda' and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
-                
-            except Exception as e:
-                logger.warning(f"Exception in evaluation: {str(e)}")
-                continue
-        
-        # Return average loss
-        return total_loss / max(1, batch_count)
+        Returns
+        -------
+        float
+            Average validation loss
+        """
+        return self._evaluate_on_loader(self.val_loader, "validation")
 
     @torch.no_grad()
     def test(self):
-        """Evaluate model on test set."""
-        logger.info("Starting test evaluation")
+        """
+        Evaluate model on test set.
+        
+        Returns
+        -------
+        float
+            Average test loss
+        """
+        test_loss = self._evaluate_on_loader(self.test_loader, "test")
+        logger.info(f"Test Loss: {test_loss:.3e}")
+        return test_loss
+
+    @torch.no_grad()
+    def _evaluate_on_loader(self, data_loader, phase_name):
+        """
+        Evaluate model on the specified data loader.
+        
+        Parameters
+        ----------
+        data_loader : torch.utils.data.DataLoader
+            Data loader to evaluate on
+        phase_name : str
+            Name of evaluation phase for logging
+            
+        Returns
+        -------
+        float
+            Average loss
+        """
         self.model.eval()
         total_loss = 0.0
         batch_count = 0
         
-        for batch in self.test_loader:
+        for batch_idx, batch in enumerate(data_loader):
             try:
-                # Extract inputs and targets from batch (ignore coordinates for now)
-                if len(batch) == 3:
-                    inputs, targets, _ = batch
-                else:
-                    inputs, targets = batch
+                # Extract inputs and targets
+                inputs, targets = batch
                 
                 # Move data to device
-                inputs = inputs.to(device=self.device, dtype=torch.float32)
-                targets = targets.to(device=self.device, dtype=torch.float32)
+                if isinstance(inputs, dict):
+                    inputs = {k: v.to(self.device, dtype=torch.float32) for k, v in inputs.items()}
+                else:
+                    inputs = inputs.to(self.device, dtype=torch.float32)
                 
-                try:
-                    # Forward pass
-                    if self.use_amp and self.device.type == 'cuda':
-                        with torch.amp.autocast(device_type=self.device.type, enabled=True):
-                            outputs = self.model(inputs)
-                            loss = self.criterion(outputs, targets)
-                    else:
+                targets = targets.to(self.device, dtype=torch.float32)
+                
+                # Forward pass
+                if self.use_amp:
+                    with torch.amp.autocast(device_type=self.device.type):
                         outputs = self.model(inputs)
                         loss = self.criterion(outputs, targets)
-                    
-                    # Skip batch if loss is NaN
-                    if not torch.isfinite(loss).item():
-                        continue
-                        
-                    total_loss += loss.item()
-                    batch_count += 1
-                except RuntimeError as e:
-                    logger.warning(f"RuntimeError in testing: {str(e)}")
-                    if self.device.type == 'cuda' and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                else:
+                    outputs = self.model(inputs)
+                    loss = self.criterion(outputs, targets)
+                
+                # Skip batch if loss is not finite
+                if not torch.isfinite(loss):
                     continue
                     
+                # Accumulate statistics
+                total_loss += loss.item()
+                batch_count += 1
+                
             except Exception as e:
-                logger.warning(f"Exception in testing: {str(e)}")
+                logger.warning(f"{phase_name.capitalize()} error in batch {batch_idx}: {e}")
                 continue
         
-        # Return test loss
-        test_loss = total_loss / max(1, batch_count)
-        print(f"\nTest Loss: {test_loss:.3e}")
-        return test_loss
+        # Return average loss
+        if batch_count == 0:
+            logger.error(f"No valid batches in {phase_name} evaluation")
+            return float('inf')
+            
+        return total_loss / batch_count
