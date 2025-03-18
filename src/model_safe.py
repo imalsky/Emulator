@@ -343,13 +343,11 @@ class MultiSourceTransformer(nn.Module):
     def __init__(
         self,
         global_dim: int,
-        sequence_dims=None,  # Keep this for backward compatibility
-        sequence_dim=None,   # New parameter
+        sequence_dims: Dict[str, int],
         output_dim: int = None,
         d_model: int = 256,
         nhead: int = 8,
-        encoder_layers=None,  # Keep this for backward compatibility
-        num_encoder_layers: int = 4,  # New parameter
+        num_encoder_layers: Union[int, Dict[str, int]] = 4,
         dim_feedforward: int = 1024,
         dropout: float = 0.1,
         activation: str = "gelu",
@@ -369,70 +367,66 @@ class MultiSourceTransformer(nn.Module):
         self.batch_first = batch_first
         self.positional_encoding = positional_encoding.lower()
         
-        # Handle backward compatibility for sequence_dims
-        if sequence_dim is not None:
-            self.sequence_dim = sequence_dim
-        elif sequence_dims is not None:
-            # If sequence_dims is provided, extract the first sequence type's dimension
-            if len(sequence_dims) > 1:
-                logger.warning(f"Multiple sequence types found: {list(sequence_dims.keys())}. "
-                            f"Using only the first type. Other types will be ignored.")
+        if not sequence_dims:
+            raise ValueError("sequence_dims must be provided and contain at least one sequence type")
             
-            # Get the dimension of the first sequence type
-            seq_type = list(sequence_dims.keys())[0]
-            self.sequence_dim = sequence_dims[seq_type]
-            self.seq_type = seq_type  # Store the sequence type name for later use
-        else:
-            raise ValueError("Either sequence_dim or sequence_dims must be provided")
+        # Enforce only one sequence type
+        if len(sequence_dims) > 1:
+            raise ValueError(f"Only one sequence type is supported. Found {len(sequence_dims)}: {list(sequence_dims.keys())}")
+            
+        self.sequence_dims = sequence_dims
         
-        # Handle backward compatibility for encoder_layers
-        if encoder_layers is not None:
-            if isinstance(encoder_layers, dict):
-                # Use the layers for the first sequence type if it's a dict
-                if len(encoder_layers) > 0:
-                    seq_type = list(encoder_layers.keys())[0]
-                    self.num_encoder_layers = encoder_layers[seq_type]
-                else:
-                    self.num_encoder_layers = num_encoder_layers
-            else:
-                # If it's an int, use it directly
-                self.num_encoder_layers = encoder_layers
+        # Handle encoder layers - either a single value for all sequences or a dict
+        if isinstance(num_encoder_layers, int):
+            self.num_encoder_layers = {seq_type: num_encoder_layers for seq_type in sequence_dims.keys()}
         else:
             self.num_encoder_layers = num_encoder_layers
+            # Ensure all sequence types have an entry in num_encoder_layers
+            for seq_type in sequence_dims.keys():
+                if seq_type not in self.num_encoder_layers:
+                    self.num_encoder_layers[seq_type] = 4  # Default value
+                    logger.warning(f"No encoder layers specified for {seq_type}, using default of 4")
         
         logger.info(f"Using ENCODER-ONLY architecture with {positional_encoding} positional encoding")
         logger.info(f"Global features: {global_dim} dimension(s)")
-        logger.info(f"Sequence features: {self.sequence_dim} dimension(s)")
         
-        # Validate that the sequence has at least 1 feature
-        if self.sequence_dim < 1:
-            error_msg = f"Sequence must have at least 1 feature, but has {self.sequence_dim}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+        # Log sequence information
+        for seq_type, dim in sequence_dims.items():
+            logger.info(f"Sequence {seq_type}: {dim} dimension(s) with {self.num_encoder_layers[seq_type]} encoder layers")
+            
+            # Validate that each sequence has at least 1 feature
+            if dim < 1:
+                error_msg = f"Sequence {seq_type} must have at least 1 feature, but has {dim}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
         
         # Global features encoder
         self.has_global = global_dim > 0
         if self.has_global:
             self.global_encoder = GlobalEncoder(global_dim, d_model, dropout, activation)
         
-        # Sequence encoder
-        self.sequence_encoder = SequenceEncoder(
-            input_dim=self.sequence_dim,
-            d_model=d_model,
-            nhead=nhead,
-            num_layers=self.num_encoder_layers,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation=activation,
-            norm_first=norm_first,
-            max_seq_length=max_seq_length,
-            layer_scale=layer_scale,
-            positional_encoding=positional_encoding
-        )
+        # Sequence encoders - one for each sequence type
+        self.sequence_encoders = nn.ModuleDict()
+        for seq_type, dim in sequence_dims.items():
+            self.sequence_encoders[seq_type] = SequenceEncoder(
+                input_dim=dim,
+                d_model=d_model,
+                nhead=nhead,
+                num_layers=self.num_encoder_layers[seq_type],
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation=activation,
+                norm_first=norm_first,
+                max_seq_length=max_seq_length,
+                layer_scale=layer_scale,
+                positional_encoding=positional_encoding
+            )
         
         # Feature integration (if global features are present)
         if self.has_global:
-            self.feature_integration = EnhancedFeatureIntegration(d_model)
+            self.feature_integration = nn.ModuleDict()
+            for seq_type in sequence_dims.keys():
+                self.feature_integration[seq_type] = EnhancedFeatureIntegration(d_model)
         
         # Output head
         self.output_head = OutputHead(
@@ -458,11 +452,11 @@ class MultiSourceTransformer(nn.Module):
         
         # Initialize integration layers if present
         if self.has_global and hasattr(self, 'feature_integration'):
-            integration = self.feature_integration
-            nn.init.normal_(integration.gamma_proj.weight, mean=0.0, std=0.02)
-            nn.init.ones_(integration.gamma_proj.bias)
-            nn.init.normal_(integration.beta_proj.weight, mean=0.0, std=0.02)
-            nn.init.zeros_(integration.beta_proj.bias)
+            for seq_type, integration in self.feature_integration.items():
+                nn.init.normal_(integration.gamma_proj.weight, mean=0.0, std=0.02)
+                nn.init.ones_(integration.gamma_proj.bias)
+                nn.init.normal_(integration.beta_proj.weight, mean=0.0, std=0.02)
+                nn.init.zeros_(integration.beta_proj.bias)
         
         # Special initialization for output layer
         for m in self.output_head.modules():
@@ -477,40 +471,36 @@ class MultiSourceTransformer(nn.Module):
             raise ValueError("Inputs must be a dictionary with sequence type and optional 'global' keys")
         
         result = {}
+        valid_sequence_types = set(self.sequence_dims.keys())
         
-        # For backward compatibility, find the correct sequence key
-        if hasattr(self, 'seq_type') and self.seq_type in inputs:
-            # Use the stored sequence type name if available
-            seq_key = self.seq_type
-        else:
-            # Otherwise, use the first non-global key
-            sequence_keys = [k for k in inputs.keys() if k != "global"]
-            if not sequence_keys:
-                error_msg = "Input must contain at least one sequence type key"
+        # Validate sequence inputs
+        for seq_type in valid_sequence_types:
+            if seq_type not in inputs:
+                error_msg = f"Input missing required sequence type '{seq_type}'"
                 logger.error(error_msg)
                 raise ValueError(error_msg)
-            seq_key = sequence_keys[0]
-        
-        sequence = inputs[seq_key]
-        if not isinstance(sequence, torch.Tensor) or sequence.numel() == 0:
-            error_msg = f"Sequence input '{seq_key}' must be a non-empty tensor"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-        
-        # Validate sequence dimensions
-        if sequence.dim() == 3:  # [batch, seq_len, features]
-            if sequence.shape[2] != self.sequence_dim:
-                error_msg = f"Expected sequence with {self.sequence_dim} features, but got {sequence.shape[2]}"
+            
+            sequence = inputs[seq_type]
+            if not isinstance(sequence, torch.Tensor) or sequence.numel() == 0:
+                error_msg = f"Sequence input '{seq_type}' must be a non-empty tensor"
                 logger.error(error_msg)
                 raise ValueError(error_msg)
-        else:
-            error_msg = f"Expected 3D tensor for sequence input, got {sequence.dim()}D"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-        
-        # Clean data (replace NaN/Inf values)
-        sequence = torch.nan_to_num(sequence, nan=0.0, posinf=1e6, neginf=-1e6)
-        result[seq_key] = sequence
+            
+            # Validate sequence dimensions
+            if sequence.dim() == 3:  # [batch, seq_len, features]
+                if sequence.shape[2] != self.sequence_dims[seq_type]:
+                    error_msg = (f"Expected sequence '{seq_type}' with {self.sequence_dims[seq_type]} " 
+                                f"features, but got {sequence.shape[2]}")
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+            else:
+                error_msg = f"Expected 3D tensor for sequence input '{seq_type}', got {sequence.dim()}D"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            # Clean data (replace NaN/Inf values)
+            sequence = torch.nan_to_num(sequence, nan=0.0, posinf=1e6, neginf=-1e6)
+            result[seq_type] = sequence
         
         # Handle global input if present
         if self.has_global:
@@ -540,18 +530,19 @@ class MultiSourceTransformer(nn.Module):
         if self.has_global and 'global' in inputs:
             global_features = self.global_encoder(inputs['global'])
         
-        # Get the sequence key 
-        seq_key = [k for k in inputs.keys() if k != "global"][0]
+        # Process the single sequence type and apply feature integration if needed
+        # With the single sequence type constraint, we can simplify this logic
+        seq_type = list(self.sequence_encoders.keys())[0]  # There's only one
+        sequence_features = self.sequence_encoders[seq_type](inputs[seq_type])
         
-        # Process sequence features
-        sequence_features = self.sequence_encoder(inputs[seq_key])
-        
-        # Integrate global features with sequence if needed
+        # Apply feature integration if global features are present
         if global_features is not None:
-            sequence_features = self.feature_integration(sequence_features, global_features)
+            sequence_features = self.feature_integration[seq_type](sequence_features, global_features)
+        
+        primary_output = sequence_features
         
         # Generate output through the output head
-        output = self.output_head(sequence_features)
+        output = self.output_head(primary_output)
         
         return output
     

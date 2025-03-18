@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 model.py - Efficient transformer for atmospheric data prediction with:
-- RMSNorm normalization
+- LayerNorm normalization
 - Configurable positional encodings (rotary, sine, learned)
 - Enhanced feature integration with gating
 - Layer scaling for gradient flow
@@ -16,20 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-
-# ------------------------------------------------------------------------------
-# RMSNorm Implementation
-# ------------------------------------------------------------------------------
-class RMSNorm(nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-8):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d_model))
-    
-    def forward(self, x):
-        norm = x.norm(dim=-1, keepdim=True)
-        rms = norm / (x.size(-1) ** 0.5)
-        return self.weight * (x / (rms + self.eps))
 
 # ------------------------------------------------------------------------------
 # Rotary Position Embeddings (RoPE)
@@ -162,7 +148,7 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 # ------------------------------------------------------------------------------
-# Encoder Layer (using RMSNorm and Layer Scaling)
+# Encoder Layer (using LayerNorm and Layer Scaling)
 # ------------------------------------------------------------------------------
 class EncoderLayer(nn.Module):
     def __init__(
@@ -179,8 +165,8 @@ class EncoderLayer(nn.Module):
         super().__init__()
         self.self_attn = attention_layer if attention_layer is not None else MultiHeadAttention(d_model, nhead, dropout)
         self.feed_forward = FeedForward(d_model, dim_feedforward, dropout, activation)
-        self.norm1 = RMSNorm(d_model)
-        self.norm2 = RMSNorm(d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.norm_first = norm_first
@@ -207,7 +193,7 @@ class EncoderLayer(nn.Module):
         return src
 
 # ------------------------------------------------------------------------------
-# Sequence Encoder (using RMSNorm)
+# Sequence Encoder (using LayerNorm)
 # ------------------------------------------------------------------------------
 class SequenceEncoder(nn.Module):
     def __init__(
@@ -243,7 +229,7 @@ class SequenceEncoder(nn.Module):
                     attention_layer=attention
                 )
             )
-        self.norm = RMSNorm(d_model) if norm_first else None
+        self.norm = nn.LayerNorm(d_model) if norm_first else None
     
     def forward(self, x, mask=None):
         x = self.input_proj(x)
@@ -256,12 +242,12 @@ class SequenceEncoder(nn.Module):
         return x
 
 # ------------------------------------------------------------------------------
-# Global Encoder (using RMSNorm)
+# Global Encoder (using LayerNorm)
 # ------------------------------------------------------------------------------
 class GlobalEncoder(nn.Module):
     def __init__(self, input_dim: int, d_model: int, dropout: float = 0.1, activation: str = "gelu"):
         super().__init__()
-        # Simplified MLP with RMSNorm for global features
+        # Simplified MLP with LayerNorm for global features
         if activation == "relu":
             act_fn = nn.ReLU()
         elif activation in ["silu", "swish"]:
@@ -273,7 +259,7 @@ class GlobalEncoder(nn.Module):
             act_fn,
             nn.Dropout(dropout),
             nn.Linear(d_model * 2, d_model),
-            RMSNorm(d_model)
+            nn.LayerNorm(d_model)
         )
     
     def forward(self, x):

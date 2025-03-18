@@ -42,18 +42,20 @@ def normalize_data(config=None, data_dir="data"):
         default_method = norm_config.get("default_method", "iqr")
         clip_outliers = norm_config.get("clip_outliers_before_scaling", False)
         
+        # Extract symlog-specific parameters
+        symlog_percentile = norm_config.get("symlog_percentile", 0.5)
+        symlog_thresholds = norm_config.get("symlog_thresholds", {})
+        
         logger.info(f"Calculating global normalization statistics using {default_method} as default method...")
         stats = normalizer.calculate_global_stats(
             key_methods=key_methods,
             default_method=default_method,
             clip_outliers_before_scaling=clip_outliers,
+            symlog_percentile=symlog_percentile,
+            symlog_thresholds=symlog_thresholds
         )
         logger.info("Applying normalization to profiles...")
         normalizer.process_profiles(stats)
-        
-        stats_file = norm_dir / "normalization_stats.json"
-        if hasattr(normalizer, "save_stats"):
-            normalizer.save_stats(stats, stats_file)
         
         logger.info("Data normalization completed successfully")
         return True

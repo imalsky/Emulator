@@ -32,7 +32,7 @@
     "symlog_percentile": 0.1
   },
   "d_model": 512,
-  "nhead": 3,
+  "nhead": 2,
   "num_encoder_layers": 8,
   "dim_feedforward": 1024,
   "mlp_layers": 3,
