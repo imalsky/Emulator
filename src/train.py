@@ -140,15 +140,25 @@ class ModelTrainer:
         lr = self.config.get("learning_rate", 1e-4)
         weight_decay = self.config.get("weight_decay", 1e-5)
         
-        # Initialize optimizer
+        # Choose optimizer based on config; default to AdamW
         optimizer_name = self.config.get("optimizer", "adamw").lower()
         if optimizer_name == "adam":
             self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         elif optimizer_name == "sgd":
             self.optimizer = optim.SGD(self.model.parameters(), lr=lr, weight_decay=weight_decay, momentum=0.9)
         else:  # Default to AdamW
-            self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-
+            betas = tuple(self.config.get("adamw_betas", (0.9, 0.999)))
+            eps = self.config.get("adamw_eps", 1e-8)
+            amsgrad = self.config.get("adamw_amsgrad", False)
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=lr,
+                weight_decay=weight_decay,
+                betas=betas,
+                eps=eps,
+                amsgrad=amsgrad,
+            )
+        
         # Initialize loss function
         loss_type = self.config.get("loss_function", "mse").lower()
         if loss_type == "l1":
@@ -157,17 +167,19 @@ class ModelTrainer:
             self.criterion = nn.SmoothL1Loss()
         else:
             self.criterion = nn.MSELoss()
-
+            
         # Initialize learning rate scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min',
+            self.optimizer,
+            mode='min',
             factor=self.config.get("gamma", 0.5),
             patience=self.config.get("lr_patience", 5),
             min_lr=self.config.get("min_lr", 1e-7),
         )
         
-        # Gradient clipping value
+        # Set gradient clipping value
         self.gradient_clip_val = self.config.get("gradient_clip_val", 1.0)
+
 
     def _find_base_dataset(self, dataset):
         """Recursively find the base dataset through potentially multiple Subset layers."""
