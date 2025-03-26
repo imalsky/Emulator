@@ -32,7 +32,7 @@
   "mlp_layers": 3,
   "mlp_hidden_dim": 64,
   "norm_first": true,
-  "dropout": 0.05,
+  "dropout": 0.0,
   "max_sequence_length": 200,
   "positional_encoding": "sine",
   "activation": "gelu",
