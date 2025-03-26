@@ -15,7 +15,7 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader, random_split
 
-from utils import create_prediction_model
+from model import create_prediction_model
 from hardware import get_device_type, configure_dataloader_settings
 
 logger = logging.getLogger(__name__)

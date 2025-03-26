@@ -3,8 +3,8 @@
 main.py - Entry point for atmospheric profile prediction pipeline
 
 Provides command-line interface to normalize data, train models, and make predictions
-using a multi-source transformer architecture with separate encoders for different
-data types (global features, atmospheric profiles, and spectral sequences).
+using an encoder-only transformer with separate encoders for different
+data types (global features and sequence data).
 """
 
 import sys
@@ -14,10 +14,7 @@ from pathlib import Path
 import torch
 import numpy as np
 
-from utils import (
-    setup_logging, load_config, ensure_dirs, save_config, 
-    create_prediction_model
-)
+from utils import (setup_logging, load_config, ensure_dirs, save_config)
 from hardware import setup_device
 from normalizer import DataNormalizer
 from dataset import AtmosphericDataset, create_multi_source_collate_fn
@@ -75,20 +72,21 @@ def setup_dataset(config, data_dir="data"):
         if "input_variables" not in config or "target_variables" not in config:
             raise ValueError("Missing required input_variables or target_variables in config")
         
-        seq_types = config.get("sequence_types", {})
-        if not seq_types:
-            global_indices = config.get("global_feature_indices", [])
-            seq_types["profile"] = [i for i in range(len(config["input_variables"]))
-                                   if i not in global_indices]
-        
-        config["sequence_types"] = seq_types
+        # Ensure required fields exist in the config
+        if "global_variables" not in config:
+            logger.warning("No global_variables specified in config, using empty list")
+            config["global_variables"] = []
+            
+        if "sequence_types" not in config:
+            logger.warning("No sequence_types defined in config, will use defaults in dataset constructor")
+            config["sequence_types"] = {}
         
         full_dataset = AtmosphericDataset(
             data_folder=Path(data_dir) / "normalized_profiles",
             input_variables=config["input_variables"],
             target_variables=config["target_variables"],
-            global_indices=config.get("global_feature_indices", []),
-            sequence_types=seq_types,
+            global_variables=config["global_variables"],
+            sequence_types=config["sequence_types"],
             allow_variable_length=True
         )
         
@@ -118,7 +116,7 @@ def setup_dataset(config, data_dir="data"):
 
 def train_model(config, device, dataset, data_dir="data"):
     """
-    Train a prediction model with the multi-source architecture.
+    Train a prediction model with the encoder-only architecture.
     """
     try:
         if dataset is None:
@@ -237,6 +235,14 @@ def main():
     if not config:
         logger.error("Failed to load config file")
         return False
+    
+    # Remove legacy global_feature_indices if it exists
+    if "global_feature_indices" in config:
+        logger.warning("Deprecated 'global_feature_indices' found in config. Please use 'global_variables' instead.")
+        if "global_variables" not in config:
+            # We don't auto-convert since we want to completely remove indices
+            logger.warning("Config must specify 'global_variables' directly. Removing 'global_feature_indices'.")
+        config.pop("global_feature_indices")
     
     overall_success = True
     

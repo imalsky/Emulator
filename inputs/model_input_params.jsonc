@@ -9,42 +9,35 @@
     "reflected_net_flux"
   ],
   "sequence_types": {
-    "profile": [
-      0,
-      1
-    ]
+    "sequence1": ["pressure", "temperature", "thermal_net_flux", "reflected_net_flux"],
+    "sequence2": []
   },
-  "global_feature_indices": [
-    2
-  ],
+  "global_variables": ["orbital_sep"],
   "frac_of_data": 1.0,
   "normalization": {
     "key_methods": {
       "pressure": "log-min-max",
-      "temperature": "standard",
+     //"temperature": "log-min-max",
       "thermal_net_flux": "symlog",
-      "reflected_net_flux": "symlog",
-      "net_flux": "symlog",
-      "orbital_sep": "standard"
+      "reflected_net_flux": "symlog"
     },
     "default_method": "standard",
     "clip_outliers_before_scaling": false,
     "symlog_percentile": 0.1
   },
-  "d_model": 512,
-  "nhead": 3,
+  "d_model": 256,
+  "nhead": 4,
   "num_encoder_layers": 8,
   "dim_feedforward": 1024,
   "mlp_layers": 3,
   "mlp_hidden_dim": 64,
   "norm_first": true,
-  "dropout": 0.0,
-  "max_sequence_length": 100,
+  "dropout": 0.05,
+  "max_sequence_length": 200,
   "positional_encoding": "sine",
   "activation": "gelu",
-  "layer_scale": 0.0,
   "use_torch_compile": true,
-  "batch_size": 32,
+  "batch_size": 16,
   "epochs": 100,
   "num_workers": 4,
   "loss_function": "mse",
@@ -52,7 +45,6 @@
   "optimizer": "adamw",
   "learning_rate": 1e-4,
   "min_lr": 1e-08,
-  "weight_decay": 0,
   "gamma": 0.5,
   "lr_patience": 3,
   "early_stopping_patience": 10,

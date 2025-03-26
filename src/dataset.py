@@ -3,7 +3,7 @@
 dataset.py - Atmospheric profile dataset for multi-source transformer model
 
 Handles atmospheric profile data with support for:
-- Separate processing of different data types (global, profile, spectral)
+- Separate processing of different data types (global, sequence)
 - Variable-length sequences without excessive padding
 - Automatic detection of feature types
 - Efficient data caching
@@ -28,7 +28,7 @@ class AtmosphericDataset(Dataset):
     """
     Dataset for atmospheric profile data with support for multiple data sources.
     
-    Separates data into different types (global, profile, spectral) to allow
+    Separates data into different types (global, sequence) to allow
     efficient processing by specialized encoders without excessive padding.
     """
 
@@ -37,7 +37,7 @@ class AtmosphericDataset(Dataset):
         data_folder,
         input_variables=None,
         target_variables=None,
-        global_indices=None,
+        global_variables=None,
         sequence_types=None,
         cache_size=1024,
         allow_variable_length=True
@@ -53,10 +53,10 @@ class AtmosphericDataset(Dataset):
             Names of input variables to use
         target_variables : list of str, optional
             Names of target variables to predict
-        global_indices : list of int, optional
-            Indices of global (non-sequential) features
+        global_variables : list of str, optional
+            Names of global (non-sequential) features
         sequence_types : dict, optional
-            Mapping of sequence type names to feature indices
+            Mapping of sequence type names to lists of variable names
         cache_size : int, optional
             Maximum number of profiles to cache in memory
         allow_variable_length : bool, optional
@@ -74,13 +74,17 @@ class AtmosphericDataset(Dataset):
         self.required_keys = set(self.all_variables)
 
         # Variable classification
-        self.global_indices = global_indices or []
+        self.global_variables = global_variables or []
         self.sequence_types = sequence_types or {}
 
         # If sequence types not specified, create a default structure
         if not self.sequence_types:
-            seq_indices = [i for i in range(len(self.input_variables)) if i not in self.global_indices]
-            self.sequence_types = {"profile": seq_indices}
+            # Assign all non-global variables to a default sequence type
+            seq_vars = [var for var in self.input_variables if var not in self.global_variables]
+            self.sequence_types = {"sequence1": seq_vars}
+
+        # Validate that all input variables are assigned
+        self._validate_variable_assignments()
 
         # Tracking sequence lengths for each type
         self.sequence_lengths = defaultdict(int)
@@ -94,19 +98,36 @@ class AtmosphericDataset(Dataset):
         self._initialize_dataset()
         self._log_initialization_info()
 
+    def _validate_variable_assignments(self):
+        """
+        Validate that all input and target variables are assigned to a sequence type or global.
+        """
+        # Collect all assigned variables
+        assigned_vars = set(self.global_variables)
+        for seq_vars in self.sequence_types.values():
+            assigned_vars.update(seq_vars)
+        
+        # Check for unassigned input variables
+        unassigned_inputs = set(self.input_variables) - assigned_vars
+        if unassigned_inputs:
+            raise ValueError(f"The following input variables are not assigned to any sequence type or global: {unassigned_inputs}")
+        
+        # Check for unassigned target variables
+        unassigned_targets = set(self.target_variables) - assigned_vars
+        if unassigned_targets:
+            raise ValueError(f"The following target variables are not assigned to any sequence type: {unassigned_targets}")
+
     def _log_initialization_info(self):
         """Log information about the initialized dataset."""
         logger.info(f"Initialized dataset with {len(self.valid_files)} valid profiles")
         logger.info(f"Input variables: {self.input_variables}")
         logger.info(f"Target variables: {self.target_variables}")
         
-        if self.global_indices:
-            global_vars = [self.input_variables[i] for i in self.global_indices]
-            logger.info(f"Global variables: {global_vars}")
+        if self.global_variables:
+            logger.info(f"Global variables: {self.global_variables}")
         
-        for seq_type, indices in self.sequence_types.items():
-            seq_vars = [self.input_variables[i] for i in indices]
-            logger.info(f"Sequence type '{seq_type}': {seq_vars}")
+        for seq_type, var_list in self.sequence_types.items():
+            logger.info(f"Sequence type '{seq_type}': {var_list}")
             logger.info(f"  - Sequence length: {self.sequence_lengths[seq_type]}")
         
         for var in self.target_variables:
@@ -144,10 +165,10 @@ class AtmosphericDataset(Dataset):
                     continue
                     
                 # Check each sequence type
-                for seq_type, indices in self.sequence_types.items():
+                for seq_type, var_list in self.sequence_types.items():
                     # Get typical length from the first variable in this sequence type
-                    if indices:
-                        var_name = self.input_variables[indices[0]]
+                    if var_list:
+                        var_name = var_list[0]
                         if var_name in profile and isinstance(profile[var_name], list):
                             seq_length_stats[seq_type].append(len(profile[var_name]))
                 
@@ -187,9 +208,9 @@ class AtmosphericDataset(Dataset):
                     
                     # Collect sequence lengths for this file
                     seq_lengths = {}
-                    for seq_type, indices in self.sequence_types.items():
-                        if indices:
-                            var_name = self.input_variables[indices[0]]
+                    for seq_type, var_list in self.sequence_types.items():
+                        if var_list:
+                            var_name = var_list[0]
                             if isinstance(profile.get(var_name), list):
                                 seq_lengths[seq_type] = len(profile[var_name])
                     
@@ -324,13 +345,13 @@ class AtmosphericDataset(Dataset):
         except Exception as e:
             logger.error(f"Error loading {file_path.name}: {e}")
             # Return empty data on error
-            global_features = torch.zeros(len(self.global_indices), dtype=torch.float32)
-            inputs = {"global": global_features} if self.global_indices else {}
-            for seq_type, indices in self.sequence_types.items():
-                if indices:
+            global_features = torch.zeros(len(self.global_variables), dtype=torch.float32)
+            inputs = {"global": global_features} if self.global_variables else {}
+            for seq_type, var_list in self.sequence_types.items():
+                if var_list:
                     inputs[seq_type] = torch.zeros(
                         self.sequence_lengths.get(seq_type, 1), 
-                        len(indices), 
+                        len(var_list), 
                         dtype=torch.float32
                     )
             targets = torch.zeros(
@@ -341,10 +362,10 @@ class AtmosphericDataset(Dataset):
             return (inputs, targets)
         
         # Process global features
-        if self.global_indices:
+        if self.global_variables:
             global_features = torch.stack([
-                self._process_variable(profile, self.input_variables[i]) 
-                for i in self.global_indices
+                self._process_variable(profile, var_name) 
+                for var_name in self.global_variables
             ], dim=0).squeeze(1)  # Remove singleton dimension for scalar globals
             
             inputs = {"global": global_features}
@@ -352,8 +373,8 @@ class AtmosphericDataset(Dataset):
             inputs = {}
         
         # Process each sequence type
-        for seq_type, indices in self.sequence_types.items():
-            if not indices:
+        for seq_type, var_list in self.sequence_types.items():
+            if not var_list:
                 continue
                 
             # Determine sequence length for this type
@@ -366,8 +387,7 @@ class AtmosphericDataset(Dataset):
             
             # Create a tensor for each variable in this sequence type
             seq_features = []
-            for i in indices:
-                var_name = self.input_variables[i]
+            for var_name in var_list:
                 tensor = self._process_variable(profile, var_name, seq_length)
                 seq_features.append(tensor)
             
@@ -438,7 +458,7 @@ class MultiSourceCollate:
     """
     Collates samples with separate handling for different data types.
     
-    Each data type (global, profile, spectral) is processed separately
+    Each data type (global, sequence) is processed separately
     and padded only within its group, avoiding excessive padding of
     short sequences to match long ones.
     """
