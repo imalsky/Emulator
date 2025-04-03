@@ -2,7 +2,7 @@
 """
 normalizer.py
 
-Data normalization utilities for atmospheric profiles using log base 10.
+Data normalization
 
 This module provides a DataNormalizer class that:
 1. Computes global normalization statistics from raw JSON profile files
@@ -20,14 +20,13 @@ Supported normalization methods:
 - "symlog": Symmetric logarithmic (base‑10) transformation with tunable threshold
 """
 
-import os
 import json
 import math
 import torch
 import logging
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Union, Callable, Tuple
+from typing import Dict, Any, Optional, List, Union
 
 logger = logging.getLogger(__name__)
 

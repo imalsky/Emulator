@@ -6,5 +6,10 @@ data/*
 figures/*
 !figures/.gitkeep
 
+plots/*
+!plots/.gitkeep
+
 # Exclude older code that I want to keep just in case
 old_code/
+
+tuning_results/

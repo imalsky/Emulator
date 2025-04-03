@@ -106,7 +106,9 @@ def train_model_for_tuning(config, device, dataset, data_dir, trial):
     float
         The best validation metric achieved.
     """
-    from train import ModelTrainer  # Import here to avoid circular imports.
+    # Avoid circular imports
+    from train import ModelTrainer
+
     model_dir = Path(data_dir) / "model"
     model_dir.mkdir(parents=True, exist_ok=True)
     
@@ -189,8 +191,6 @@ def run_hyperparameter_search(base_config, param_grid_config, data_dir, output_d
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # We'll store the total number of trials in a local variable.
-    # This is because Study objects in recent Optuna versions don't have a public n_trials attribute.
     max_trials = num_trials
 
     def progress_callback(study, trial):

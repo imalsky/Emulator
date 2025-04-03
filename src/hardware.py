@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hardware.py - Hardware detection and configuration for deep learning models
+hardware.py - Hardware detection and configuration
 
 Centralizes device detection and configuration to ensure consistent behavior
 across different hardware platforms (CPU, NVIDIA GPU, Apple Silicon).
@@ -60,7 +60,7 @@ def get_device_properties():
     device_type = get_device_type()
     properties = {
         "type": device_type,
-        "supports_amp": device_type == "cuda",  # Only CUDA supports AMP currently
+        "supports_amp": device_type == "cuda",
     }
     
     if device_type == "cuda":

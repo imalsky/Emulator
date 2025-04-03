@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py - Entry point for atmospheric profile prediction pipeline
+main.py - Entry point for emulator
 
 Provides command-line interface to normalize data, train models, and make predictions
 using an encoder-only transformer with separate encoders for different
@@ -17,12 +17,11 @@ import numpy as np
 from utils import (setup_logging, load_config, ensure_dirs, save_config)
 from hardware import setup_device
 from normalizer import DataNormalizer
-from dataset import AtmosphericDataset, create_multi_source_collate_fn
+from dataset import AtmosphericDataset, MultiSourceCollate
 from train import ModelTrainer
 from hyperparams import run_hyperparameter_search
 
 logger = logging.getLogger(__name__)
-
 
 def normalize_data(config=None, data_dir="data"):
     """
@@ -86,8 +85,8 @@ def setup_dataset(config, data_dir="data"):
             input_variables=config["input_variables"],
             target_variables=config["target_variables"],
             global_variables=config["global_variables"],
-            sequence_types=config["sequence_types"],
-            allow_variable_length=True
+            sequence_types=config["sequence_types"]
+            # Removed allow_variable_length parameter
         )
         
         if hasattr(full_dataset, "sequence_lengths"):
@@ -97,7 +96,8 @@ def setup_dataset(config, data_dir="data"):
                     raise ValueError(f"Sequence length for {seq_type} is {length}, exceeding maximum allowed 10000")
             logger.info(f"Detected sequence lengths: {config['sequence_lengths']}")
         
-        config["collate_fn"] = create_multi_source_collate_fn()
+        # Use the MultiSourceCollate class directly instead of function
+        config["collate_fn"] = MultiSourceCollate()
         
         if config.get("frac_of_data", 1.0) < 1.0:
             dataset_size = len(full_dataset)
@@ -235,14 +235,6 @@ def main():
     if not config:
         logger.error("Failed to load config file")
         return False
-    
-    # Remove legacy global_feature_indices if it exists
-    if "global_feature_indices" in config:
-        logger.warning("Deprecated 'global_feature_indices' found in config. Please use 'global_variables' instead.")
-        if "global_variables" not in config:
-            # We don't auto-convert since we want to completely remove indices
-            logger.warning("Config must specify 'global_variables' directly. Removing 'global_feature_indices'.")
-        config.pop("global_feature_indices")
     
     overall_success = True
     
