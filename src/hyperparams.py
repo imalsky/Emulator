@@ -1,243 +1,191 @@
 #!/usr/bin/env python3
 """
-hyperparams.py - Hyperparameter tuning for atmospheric profile prediction
+hyperparams.py – Hyperparameter tuning using Optuna for atmospheric-transformer models.
 
-This version uses Optuna for efficient hyperparameter sampling with pruning.
-It defines an objective function that samples hyperparameters, sets up the device and dataset,
-and trains the model while reporting intermediate validation metrics for early stopping.
-
-Intended to be used with main.py, which calls:
-    from hyperparams import run_hyperparameter_search
+Defines:
+- objective(): samples hyperparameters, trains model, returns validation loss
+- run_hyperparameter_search(): orchestrates an Optuna study with progress and best-config saving
 """
+from __future__ import annotations
 
 import copy
 import json
 import logging
-import inspect
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable, Dict, Optional
 
 import optuna
-import optuna.exceptions
+from optuna import Trial, Study
+
+# Assuming utils.py contains save_json
+# Import necessary functions if they are in utils or elsewhere
+# from utils import save_json # Example import
 
 logger = logging.getLogger(__name__)
 
-def objective(trial, base_config, data_dir, train_model_func, setup_dataset_func, setup_device_func):
-    """
-    Objective function for Optuna hyperparameter tuning with pruning.
 
-    Parameters
-    ----------
-    trial : optuna.trial.Trial
-        An Optuna trial object.
-    base_config : dict
-        Base configuration dictionary.
-    data_dir : str
-        Base data directory.
-    train_model_func : callable
-        Function to train the model. It should ideally accept a "trial" keyword argument
-        to report intermediate metrics; if not, a wrapper will be used.
-    setup_dataset_func : callable
-        Function to set up the dataset.
-    setup_device_func : callable
-        Function to set up the device.
-
-    Returns
-    -------
-    float
-        The best validation metric achieved during training.
+def objective(
+    trial: Trial,
+    base_config: Dict[str, Any],
+    data_dir: Path,
+    setup_dataset_func: Callable[[Dict[str, Any], Path], tuple],
+    train_model_func: Callable[[Dict[str, Any], Any, Any, Any, Path], float],
+    setup_device_func: Callable[[], Any],
+) -> float:
     """
+    Optuna objective: sample hyperparameters, train, and return best validation loss.
+    """
+    # Copy base config to avoid mutation during trial
     config = copy.deepcopy(base_config)
 
-    # Sample hyperparameters using Optuna's suggestion methods.
-    config["d_model"] = trial.suggest_categorical("d_model", [256, 512])
-    config["nhead"] = trial.suggest_categorical("nhead", [4, 8, 16])
-    config["num_encoder_layers"] = trial.suggest_categorical("num_encoder_layers", [4, 8, 16])
-    config["dim_feedforward"] = trial.suggest_categorical("dim_feedforward", [1024, 2048])
-    config["dropout"] = trial.suggest_categorical("dropout", [0.0, 0.05, 0.1])
-    config["layer_scale"] = trial.suggest_categorical("layer_scale", [0, 0.05, 0.1])
-    config["mlp_layers"] = trial.suggest_categorical("mlp_layers", [2, 4, 8])
-    config["mlp_hidden_dim"] = trial.suggest_categorical("mlp_hidden_dim", [32, 64, 128])
-    #config["activation"] = trial.suggest_categorical("activation", ["gelu", "relu"])
-    config["positional_encoding"] = trial.suggest_categorical("positional_encoding", ["rotary", "sine", "learned"])
-    #config["batch_size"] = trial.suggest_categorical("batch_size", [32])
-    #config["learning_rate"] = trial.suggest_categorica("learning_rate", [1e-4])
-    #config["weight_decay"] = trial.suggest_categorical("weight_decay", [0, 1e-6, 1e-4])
-    #config["optimizer"] = trial.suggest_categorical("optimizer", ["adamw"])
-    #config["early_stopping_patience"] = trial.suggest_categorical("early_stopping_patience", [10])
+    # --- Sample hyperparameters relevant to the simpler model ---
+    config.update({
+        "d_model": trial.suggest_categorical("d_model", [256, 512]),
+        "nhead": trial.suggest_categorical("nhead", [4, 8, 16]), # Ensure d_model is divisible
+        "num_encoder_layers": trial.suggest_int("num_encoder_layers", 2, 8), # Adjusted range for simpler model
+        "dim_feedforward": trial.suggest_categorical("dim_feedforward", [1024, 2048]), # Adjusted options
+        "dropout": trial.suggest_float("dropout", 0.0, 0.2), # Slightly wider range common
+        # "mlp_layers" and "mlp_hidden_dim" might be relevant if your GlobalEncoder or Head uses them
+        # Add sampling here if they are configurable and you want to tune them, e.g.:
+        # "global_encoder_layers": trial.suggest_int("global_encoder_layers", 1, 3),
+        # "head_mlp_layers": trial.suggest_int("head_mlp_layers", 1, 3),
+    })
 
-    device = setup_device_func()
-    dataset = setup_dataset_func(config, data_dir)
-    if dataset is None:
-        raise ValueError("Dataset initialization failed")
-
-    sig = inspect.signature(train_model_func)
-    if "trial" in sig.parameters:
-        best_metric = train_model_func(config, device, dataset, data_dir, trial=trial)
-    else:
-        best_metric = train_model_for_tuning(config, device, dataset, data_dir, trial)
-
-    return best_metric
-
-def train_model_for_tuning(config, device, dataset, data_dir, trial):
-    """
-    Wrapper training function to support per-epoch reporting for pruning.
-    
-    This function creates a ModelTrainer instance and runs a training loop
-    that reports intermediate validation metrics to Optuna via `trial.report`.
-    It checks if the trainer has a `train_one_epoch` method, and if not, falls back
-    to using the `_train_epoch` method.
-    
-    Parameters
-    ----------
-    config : dict
-        Configuration dictionary.
-    device : torch.device or similar
-        Device to train on.
-    dataset : torch.utils.data.Dataset
-        Dataset to train on.
-    data_dir : str
-        Base data directory.
-    trial : optuna.trial.Trial
-        An Optuna trial object.
-        
-    Returns
-    -------
-    float
-        The best validation metric achieved.
-    """
-    # Avoid circular imports
-    from train import ModelTrainer
-
-    model_dir = Path(data_dir) / "model"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    
-    trainer = ModelTrainer(
-        config=config,
-        device=device,
-        save_path=model_dir,
-        dataset=dataset,
-        collate_fn=config.get("collate_fn")
-    )
-    
-    # Choose the per-epoch training method.
-    if hasattr(trainer, "train_one_epoch"):
-        epoch_fn = trainer.train_one_epoch
-    elif hasattr(trainer, "_train_epoch"):
-        epoch_fn = trainer._train_epoch
-    else:
-        raise AttributeError("No per-epoch training method found on ModelTrainer")
-    
-    epochs = config.get("epochs", 100)
-    patience = config.get("early_stopping_patience", 15)
-    best_metric = float("inf")
-    best_epoch = 0
-
-    for epoch in range(epochs):
-        sig = inspect.signature(epoch_fn)
-        if len(sig.parameters) == 0:
-            current_metric = epoch_fn()
-        else:
-            current_metric = epoch_fn(epoch)
-        
-        trial.report(current_metric, epoch)
-        if trial.should_prune():
-            raise optuna.exceptions.TrialPruned()
-        
-        if current_metric < best_metric:
-            best_metric = current_metric
-            best_epoch = epoch
-        
-        if epoch - best_epoch >= patience:
-            break
-
-    return best_metric
-
-def run_hyperparameter_search(base_config, param_grid_config, data_dir, output_dir,
-                              setup_dataset_func, train_model_func, setup_device_func,
-                              ensure_dirs_func, save_config_func, num_trials=10):
-    """
-    Run hyperparameter search using Optuna with early stopping (pruning).
-    The current best configuration is saved after each trial via a callback.
-    
-    Parameters
-    ----------
-    base_config : dict
-        Base configuration dictionary.
-    param_grid_config : dict
-        Parameter grid configuration dictionary (unused in this version).
-    data_dir : str
-        Base data directory.
-    output_dir : str
-        Directory to store tuning results.
-    setup_dataset_func : callable
-        Function to set up the dataset.
-    train_model_func : callable
-        Function to train the model (ideally supports a 'trial' parameter).
-    setup_device_func : callable
-        Function to set up the device.
-    ensure_dirs_func : callable
-        Function to ensure necessary directories exist.
-    save_config_func : callable
-        Function to save a configuration (should accept (config, file_path)).
-    num_trials : int, optional
-        Number of trials to run (default is 10).
-    
-    Returns
-    -------
-    dict
-        Best configuration based on the validation metric.
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    max_trials = num_trials
-
-    def progress_callback(study, trial):
-        """Logs progress after each trial completes."""
-        completed_trials = len(study.trials)
-        logger.info(f"Trial {trial.number} finished with value: {trial.value:.3e}")
-        logger.info(
-            f"Completed {completed_trials} / {max_trials} trials. "
-            f"Best value so far: {study.best_value:.3e}"
+    # Ensure d_model is divisible by nhead after sampling
+    if config["d_model"] % config["nhead"] != 0:
+        # Prune trial if constraints are violated - Optuna handles this
+        raise optuna.exceptions.TrialPruned(
+            f"d_model ({config['d_model']}) is not divisible by nhead ({config['nhead']}). Pruning trial."
         )
 
-    def save_best_callback(study, trial):
-        """Saves current best configuration after each trial completes."""
-        current_best = copy.deepcopy(base_config)
-        for key, value in study.best_trial.params.items():
-            current_best[key] = value
-        current_best_path = output_path / "best_config_current.json"
-        save_config_func(current_best, str(current_best_path))
-        logger.info(f"Updated current best configuration at trial {trial.number} saved to {current_best_path}")
+    # Ensure PE is 'sine' as per config/validation
+    config["positional_encoding"] = "sine"
+    # Remove sampling for features not present in the simple model
+    # config["layerdrop"] = ...
+    # config["token_dropout"] = ...
+    # --- End Sampling ---
 
-    # Create the study and optimize with callbacks for progress and saving.
+
+    # Setup device and dataset
+    device = setup_device_func()
+    try:
+        # setup_dataset_func should return (dataset, collate_fn) or similar
+        dataset, collate_fn = setup_dataset_func(config, data_dir)
+        if dataset is None:
+            logger.warning(f"Dataset setup failed for trial {trial.number}. Pruning.")
+            raise optuna.exceptions.TrialPruned()
+    except Exception as e:
+        logger.warning(f"Exception during dataset setup for trial {trial.number}: {e}. Pruning.")
+        raise optuna.exceptions.TrialPruned()
+
+
+    # Train the model using the provided function
+    # train_model_func is expected to return the best validation loss (float)
+    try:
+        # Pass only necessary arguments expected by train_model function signature
+        # Note: Assumes train_model_func matches signature (config, device, dataset, collate_fn, data_dir) -> float
+        #       Adjust if the signature is different.
+        best_val = train_model_func(config, device, dataset, collate_fn, data_dir)
+        if not isinstance(best_val, float):
+             logger.error(f"train_model_func did not return float, got {type(best_val)}. Pruning.")
+             raise optuna.exceptions.TrialPruned()
+        return best_val
+    except Exception as e:
+         logger.error(f"Training failed for trial {trial.number}: {e}", exc_info=True)
+         raise optuna.exceptions.TrialPruned() # Prune if training crashes
+
+
+def run_hyperparameter_search(
+    base_config: Dict[str, Any],
+    data_dir: str,
+    output_dir: str,
+    setup_dataset_func: Callable[[Dict[str, Any], Path], tuple],
+    train_model_func: Callable[[Dict[str, Any], Any, Any, Any, Path], float],
+    setup_device_func: Callable[[], Any],
+    save_config_func: Callable[[Dict[str, Any], str], bool], # Assumes save_json signature
+    num_trials: int = 10,
+) -> Optional[Dict[str, Any]]: # Return Optional[Dict] to indicate possible failure
+    """
+    Run an Optuna study to minimize validation loss, saving best configs along the way.
+    Returns the best configuration dict found, or None if the study fails.
+    """
+    data_path = Path(data_dir)
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True) # Ensure output dir exists
+
+    # Callback to save the current best configuration after each trial
+    def _save_current_best(study: Study, trial: Trial) -> None:
+        # Check if the current trial is the best one so far or if it's the first trial
+        if trial.state == optuna.trial.TrialState.COMPLETE and (study.best_trial is None or trial.number == study.best_trial.number):
+            best_cfg = copy.deepcopy(base_config)
+            best_cfg.update(study.best_params) # Use study.best_params directly
+            curr_path = out_path / "best_config_current.json"
+            if save_config_func(best_cfg, str(curr_path)): # Check if save was successful
+                 logger.info(
+                     f"Trial {trial.number} finished. Current best value={study.best_value:.4e}. "
+                     f"Saved current best config to {curr_path}"
+                 )
+            else:
+                 logger.warning(f"Failed to save current best config at trial {trial.number}")
+        elif trial.state != optuna.trial.TrialState.COMPLETE:
+             logger.info(f"Trial {trial.number} finished with state: {trial.state}")
+
+
+    # Create study and optimize
     study = optuna.create_study(direction="minimize")
-    study.optimize(
-        lambda t: objective(t, base_config, data_dir, train_model_func,
-                            setup_dataset_func, setup_device_func),
-        n_trials=num_trials,
-        callbacks=[save_best_callback, progress_callback]
-    )
+    try:
+        study.optimize(
+            lambda trial: objective( # Pass trial object correctly
+                trial,
+                base_config,
+                data_path,
+                setup_dataset_func,
+                train_model_func,
+                setup_device_func,
+            ),
+            n_trials=num_trials,
+            callbacks=[_save_current_best],
+            catch=(Exception,), # Catch exceptions to allow pruning
+        )
+    except Exception as e:
+         logger.error(f"Optuna study optimization failed: {e}", exc_info=True)
+         return None # Indicate failure
 
-    # Build the final best configuration after all trials finish.
-    best_config = copy.deepcopy(base_config)
-    for key, value in study.best_trial.params.items():
-        best_config[key] = value
+
+    # Check if any trials completed successfully
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not completed_trials:
+         logger.error("No trials completed successfully in the Optuna study.")
+         return None
+
+
+    # Finalize and save the best configuration found
+    best_cfg = copy.deepcopy(base_config)
+    best_cfg.update(study.best_params) # study.best_params holds the best hyperparameters
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    best_config_path = output_path / f"best_config_{timestamp}.json"
-    save_config_func(best_config, str(best_config_path))
+    best_path = out_path / f"best_config_{timestamp}.json"
+    if save_config_func(best_cfg, str(best_path)):
+        logger.info(f"Best configuration overall (value={study.best_value:.6e}) saved to {best_path}")
+    else:
+         logger.error(f"Failed to save final best configuration to {best_path}")
+         # Still return the config, but log the error
 
-    # Save the study object if joblib is installed (for full trial history).
-    study_path = output_path / f"study_{timestamp}.pkl"
+
+    # Optionally save full study object using joblib
     try:
         import joblib
+        study_path = out_path / f"study_{timestamp}.pkl"
         joblib.dump(study, study_path)
+        logger.info(f"Full Optuna study object saved to {study_path}")
     except ImportError:
-        logger.warning("joblib is not installed; study object will not be saved.")
+        logger.info("joblib not installed; skipping study object serialization.")
+    except Exception as e:
+        logger.warning(f"Failed to save Optuna study object: {e}")
 
-    logger.info(f"Best configuration saved to {best_config_path}")
-    logger.info(f"Best validation metric: {study.best_value:.6e}")
 
-    return best_config
+    return best_cfg
+
+
+__all__ = ["run_hyperparameter_search"]

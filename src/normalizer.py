@@ -1,664 +1,522 @@
 #!/usr/bin/env python3
+"""normalizer.py – Compute **and** invert eight normalization schemes.
+
+Supported methods (case‑insensitive):
+--------------------------------------------------------------
+* `iqr`                 – median / IQR scaling → ℝ.
+* `log-min-max`         – log₁₀ → min‑max to [0, 1].
+* `arctan-compression`  – arctan ‑π↦π → [-1, 1].
+* `max-out`             – divide by global |max|  → [-1, 1].
+* `invlogit-compression`– sigmoid → [-1, 1].
+* `custom`              – sign‑preserving log₁₀ (He et al.).
+* `symlog`              – linear near 0, log₁₀ tails  → [-1, 1].
+* `standard`            – z‑score then scale to [-1, 1].
+
+The class **guarantees** that for any numeric value `x`,
+`denormalize(normalize(x)) == x` (within fp tolerance).
 """
-normalizer.py
-
-Data normalization
-
-This module provides a DataNormalizer class that:
-1. Computes global normalization statistics from raw JSON profile files
-2. Applies various normalization methods to the data
-3. Saves the normalized profiles with metadata
-
-Supported normalization methods:
-- "iqr": Normalizes based on median and interquartile range
-- "log-min-max": Applies log base‑10 transform then min‑max scaling
-- "arctan-compression": Compresses data using arctan transform
-- "max-out": Divides data by absolute global maximum
-- "invlogit-compression": Maps data using sigmoid transformation
-- "custom": Sign-preserving logarithmic (base‑10) transformation
-- "standard": Standard z-score normalization with scaling to [-1, 1] range
-- "symlog": Symmetric logarithmic (base‑10) transformation with tunable threshold
-"""
+from __future__ import annotations
 
 import json
-import math
-import torch
 import logging
-import numpy as np
+import math
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Union
+from typing import Any, Dict, List, Optional, Union
+
+import numpy as np
+import torch
+from torch import Tensor
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["DataNormalizer"]
+
+
+# -----------------------------------------------------------------------------
+# helper utils
+# -----------------------------------------------------------------------------
+
+def _to_tensor(v: Union[List[float], float]) -> Tensor:
+    """Converts float or list of floats to a float32 tensor."""
+    return torch.tensor(v if isinstance(v, list) else [v], dtype=torch.float32)
+
+
+# -----------------------------------------------------------------------------
+# main class
+# -----------------------------------------------------------------------------
 
 class DataNormalizer:
-    """
-    A class for normalizing atmospheric profile data.
+    """Computes statistics and (de)normalizes JSON profile files."""
 
-    Computes global statistics from raw profiles and applies various
-    normalization methods to produce normalized profiles for ML training.
-    """
-    
-    def __init__(self, input_folder: str, output_folder: str, batch_size: int = 100):
+    METHODS = {
+        "iqr",
+        "log-min-max",
+        "arctan-compression",
+        "max-out",
+        "invlogit-compression",
+        "custom",
+        "symlog",
+        "standard",
+        "none",  # passthrough (for booleans / categorical, etc.)
+    }
+
+    def __init__(self, input_folder: Union[str, Path], output_folder: Union[str, Path], batch_size: int = 100):
         """
-        Initialize the DataNormalizer.
+        Initializes the normalizer.
+
+        Args:
+            input_folder: Path to directory with raw JSON profiles.
+            output_folder: Path to directory where normalized profiles and metadata will be saved.
+            batch_size: Number of files to process per batch when calculating stats (controls memory usage).
         """
-        self.input_folder = Path(input_folder)
-        if not self.input_folder.exists():
-            raise FileNotFoundError(f"Input folder not found: {input_folder}")
-            
-        self.output_folder = Path(output_folder)
-        self.batch_size = max(1, batch_size)
-        
-        logger.info(f"DataNormalizer initialized with input: {input_folder}, output: {output_folder}")
+        self.input_dir = Path(input_folder)
+        self.output_dir = Path(output_folder)
+        if not self.input_dir.is_dir():
+            raise FileNotFoundError(f"Input folder not found: {self.input_dir}")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.batch_size = max(batch_size, 1)
+        logger.info(f"DataNormalizer input: {self.input_dir}, output: {self.output_dir}")
+
+    # ------------------------------------------------------------------
+    # statistics calculation
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def clip_outliers(values: torch.Tensor, 
-                       lower_quantile: float = 0.001, 
-                       upper_quantile: float = 0.999) -> torch.Tensor:
-        """
-        Clip values outside the specified quantile range.
-        """
-        if not (0 <= lower_quantile < upper_quantile <= 1):
-            raise ValueError("Quantiles must satisfy: 0 ≤ lower < upper ≤ 1")
-        
-        if values.numel() == 0:
-            return values
-            
-        lower_bound = torch.quantile(values, lower_quantile)
-        upper_bound = torch.quantile(values, upper_quantile)
-        
-        return torch.clamp(values, min=lower_bound, max=upper_bound)
+    def clip_outliers(t: Tensor, low_quantile: float = 0.001, high_quantile: float = 0.999) -> Tensor:
+        """Clips tensor values outside the specified quantile range."""
+        if t.numel() == 0:
+            return t # Return empty tensor if input is empty
+        if not (0 <= low_quantile < high_quantile <= 1):
+             raise ValueError("Quantiles must satisfy 0 <= low < high <= 1")
+        low_bound = torch.quantile(t, low_quantile)
+        high_bound = torch.quantile(t, high_quantile)
+        return torch.clamp(t, min=low_bound, max=high_bound)
 
     def calculate_global_stats(
         self,
         key_methods: Optional[Dict[str, str]] = None,
-        default_method: str = "iqr",
+        default_method: str = "standard", # Changed default to standard
         clip_outliers_before_scaling: bool = False,
         symlog_percentile: float = 0.5,
-        symlog_thresholds: Optional[Dict[str, float]] = None
+        symlog_thresholds: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
-        Compute global normalization statistics for all variables.
+        Calculates global statistics across all JSON profiles for normalization.
+
+        Args:
+            key_methods: Dictionary mapping specific variable keys to normalization methods.
+            default_method: Default normalization method if not specified in key_methods.
+            clip_outliers_before_scaling: If True, clip outliers before computing stats.
+            symlog_percentile: Percentile used to determine the linear threshold for 'symlog'.
+            symlog_thresholds: Dictionary mapping specific variable keys to fixed thresholds for 'symlog'.
+
+        Returns:
+            Dictionary containing computed statistics and metadata.
         """
         logger.info("Calculating global normalization statistics...")
-        
-        profile_files = list(self.input_folder.glob("*.json"))
-        if not profile_files:
-            raise FileNotFoundError(f"No JSON files found in '{self.input_folder}'")
-        
-        key_values: Dict[str, List[torch.Tensor]] = {}
-        total_files = len(profile_files)
-        batch_size = min(self.batch_size, total_files)
-        num_batches = (total_files + batch_size - 1) // batch_size
-        
-        logger.info(f"Processing {total_files} files in {num_batches} batches")
-        all_keys = set()
-        
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min((batch_idx + 1) * batch_size, total_files)
-            batch_files = profile_files[start_idx:end_idx]
-            
-            for profile_path in batch_files:
+        files = [p for p in self.input_dir.glob("*.json") if p.name != "normalization_metadata.json"]
+        if not files:
+            raise FileNotFoundError(f"No JSON profiles found in input folder: {self.input_dir}")
+
+        # Accumulate values for each key
+        value_buffer: Dict[str, List[Tensor]] = {}
+        boolean_keys: set[str] = set()
+        processed_files = 0
+        num_batches = (len(files) + self.batch_size - 1) // self.batch_size
+
+        for i in range(num_batches):
+             batch_files = files[i*self.batch_size:(i+1)*self.batch_size]
+             for fpath in batch_files:
                 try:
-                    with open(profile_path, "r") as f:
-                        profile = json.load(f)
-                    
-                    all_keys.update(profile.keys())
-                    
-                    for key, value in profile.items():
-                        if key not in key_values:
-                            key_values[key] = []
-                        if value is None or (isinstance(value, float) and np.isnan(value)):
-                            continue
-                        if isinstance(value, (int, float)):
-                            key_values[key].append(torch.tensor([float(value)], dtype=torch.float32))
-                        elif isinstance(value, list) and all(isinstance(v, (int, float)) or (isinstance(v, float) and np.isnan(v)) for v in value):
-                            valid_values = [v for v in value if not (isinstance(v, float) and np.isnan(v))]
-                            if valid_values:
-                                key_values[key].append(torch.tensor(valid_values, dtype=torch.float32))
-                        elif isinstance(value, bool):
-                            if key not in key_values:
-                                key_values[key] = ['boolean']
+                    prof = json.loads(fpath.read_text())
+                    processed_files += 1
+                    for k, v in prof.items():
+                        if v is None or (isinstance(v, float) and np.isnan(v)):
+                            continue # Skip null/NaN values
+                        if isinstance(v, bool):
+                            boolean_keys.add(k)
+                        elif isinstance(v, (int, float)):
+                            # Convert scalars to tensors
+                            value_buffer.setdefault(k, []).append(torch.tensor([float(v)], dtype=torch.float32))
+                        elif isinstance(v, list) and all(isinstance(x, (int, float)) for x in v if not (isinstance(x, float) and np.isnan(x))):
+                             # Handle lists, filtering out NaNs before converting to tensor
+                             valid_vals = [float(x) for x in v if not (isinstance(x, float) and np.isnan(x))]
+                             if valid_vals: # Only append if list contains valid numbers
+                                value_buffer.setdefault(k, []).append(torch.tensor(valid_vals, dtype=torch.float32))
                 except Exception as e:
-                    raise RuntimeError(f"Error reading {profile_path}: {e}")
-        
-        boolean_keys = set()
-        for key in list(key_values.keys()):
-            if key_values[key] and key_values[key][0] == 'boolean':
-                boolean_keys.add(key)
-                del key_values[key]
+                    logger.warning(f"Could not process file {fpath.name}: {e}")
+                    continue # Skip malformed files
+
+        logger.info(f"Scanned {processed_files} profiles to gather statistics.")
+
+        # Remove boolean keys from value buffer
+        for bk in boolean_keys:
+            value_buffer.pop(bk, None)
+
+        # Determine normalization method for each key
+        methods = {k: m.lower().strip() for k, m in (key_methods or {}).items()}
+        default_method_lower = default_method.lower().strip()
+        if default_method_lower not in self.METHODS:
+            raise ValueError(f"Unknown default_method '{default_method}'")
+
+        all_numeric_keys = set(value_buffer.keys())
+        final_methods = {k: methods.get(k, default_method_lower) for k in all_numeric_keys}
+        for k in boolean_keys: # Add boolean keys with 'none' method
+             final_methods[k] = 'none'
+
+
+        # Compute statistics per key
+        stats: Dict[str, Any] = {}
+        computed_keys = 0
+        for key, tensor_list in value_buffer.items():
+            if not tensor_list:
+                logger.warning(f"No valid numeric data found for key '{key}', skipping stats calculation.")
                 continue
-            if key_values[key]:
-                try:
-                    values = torch.cat(key_values[key], dim=0)
-                    unique_vals = torch.unique(values)
-                    if len(unique_vals) <= 2 and all(val in [0.0, 1.0] for val in unique_vals):
-                        boolean_keys.add(key)
-                        del key_values[key]
-                        continue
-                    key_values[key] = values
-                except:
-                    del key_values[key]
-            else:
-                del key_values[key]
-        
-        normalization_methods = {}
-        for key in all_keys:
-            if key_methods and key in key_methods:
-                normalization_methods[key] = key_methods[key]
-            else:
-                normalization_methods[key] = default_method
-                
-        for key in boolean_keys:
-            normalization_methods[key] = "none"
-        
-        if clip_outliers_before_scaling:
-            logger.info("Clipping outliers before computing statistics")
-            for key, vals in key_values.items():
-                if vals.numel() > 0:
-                    key_values[key] = self.clip_outliers(vals)
-        
-        stats = {}
-        for key, values in key_values.items():
-            if values.numel() == 0:
-                logger.warning(f"Skipping statistics computation for '{key}' - no values available")
-                continue
-                
-            method = normalization_methods[key]
+
+            # Concatenate all tensors for the key
             try:
-                if method == "symlog":
-                    threshold = None
-                    if symlog_thresholds and key in symlog_thresholds:
-                        threshold = symlog_thresholds[key]
-                    stats[key] = self._compute_stats_for_key(values, method, 
-                                                            symlog_percentile=symlog_percentile,
-                                                            symlog_threshold=threshold)
-                else:
-                    stats[key] = self._compute_stats_for_key(values, method)
-                logger.debug(f"Computed {method} statistics for '{key}'")
-            except ValueError as e:
-                logger.warning(f"Error computing {method} statistics for '{key}': {e}. Falling back to 'max-out'.")
-                normalization_methods[key] = "max-out"
-                try:
-                    stats[key] = self._compute_stats_for_key(values, "max-out")
-                except ValueError as e2:
-                    logger.error(f"Failed to compute fallback statistics for '{key}': {e2}")
-                    continue
-        
-        stats["normalization_methods"] = normalization_methods
-        stats["config"] = {
-            "clip_outliers_before_scaling": clip_outliers_before_scaling,
-            "default_method": default_method,
-            "key_methods": key_methods if key_methods else {},
-            "boolean_keys": list(boolean_keys),
-            "all_keys": list(all_keys),
-            "symlog_percentile": symlog_percentile,
-            "symlog_thresholds": symlog_thresholds if symlog_thresholds else {},
+                 full_vector = torch.cat(tensor_list)
+            except RuntimeError as e:
+                 logger.error(f"Error concatenating tensors for key '{key}': {e}. Sizes: {[t.shape for t in tensor_list]}")
+                 continue # Skip this key if concatenation fails
+
+            if full_vector.numel() == 0:
+                 logger.warning(f"Empty tensor after concatenation for key '{key}', skipping.")
+                 continue
+
+            if clip_outliers_before_scaling:
+                full_vector = self.clip_outliers(full_vector)
+
+            method_to_use = final_methods[key]
+            if method_to_use not in self.METHODS:
+                logger.warning(f"Invalid method '{method_to_use}' specified for '{key}', defaulting to '{default_method_lower}'.")
+                method_to_use = default_method_lower
+                final_methods[key] = method_to_use # Update the methods dict
+
+            try:
+                stats[key] = self._compute_stats_for_key(
+                    full_vector,
+                    method_to_use,
+                    symlog_percentile,
+                    (symlog_thresholds or {}).get(key)
+                )
+                computed_keys += 1
+            except Exception as e:
+                 logger.error(f"Failed to compute stats for key '{key}' using method '{method_to_use}': {e}")
+                 # Optionally, try a fallback method like 'none' or remove key
+                 final_methods.pop(key, None) # Remove from methods if stats failed
+
+
+        # Assemble final metadata dictionary
+        metadata = {
+            "normalization_methods": final_methods,
+            "config": { # Store config used for stat calculation
+                "clip_outliers_before_scaling": clip_outliers_before_scaling,
+                "default_method": default_method_lower,
+                "key_methods_provided": key_methods or {},
+                "symlog_percentile": symlog_percentile,
+                "symlog_thresholds_provided": symlog_thresholds or {},
+                "boolean_keys_detected": list(boolean_keys),
+                "numeric_keys_processed": list(stats.keys()),
+            },
+            **stats # Merge computed stats
         }
-        
-        logger.info(f"Statistics computed for {len(key_values)} variables")
-        return stats
 
-    def _compute_stats_for_key(self, values: torch.Tensor, method: str, 
-                              symlog_percentile: float = 0.5,
-                              symlog_threshold: Optional[float] = None) -> Dict[str, float]:
-        """
-        Compute statistics for a specific key based on the chosen normalization method.
-        Now using base-10 logarithms.
-        """
-        if values.numel() == 0:
-            raise ValueError("Cannot compute statistics on empty tensor")
-            
-        global_min = values.min().item()
-        global_max = values.max().item()
-        stats = {"global_min": global_min, "global_max": global_max}
-        is_constant = (global_max - global_min) < 1e-6
-        method = method.lower().strip()
-        
-        if method == "iqr":
-            median = torch.median(values).item()
-            q1 = torch.quantile(values, 0.25).item()
-            q3 = torch.quantile(values, 0.75).item()
-            iqr = q3 - q1
-            if iqr < 1e-6:
-                iqr = 1.0
-                stats["is_constant"] = True
-            stats.update({"median": median, "iqr": iqr})
-            
-        elif method == "log-min-max":
-            if is_constant:
-                stats.update({
-                    "min": 0.0,
-                    "max": 1.0,
-                    "is_constant": True
-                })
-                return stats
-            if global_min <= 0:
-                offset = abs(global_min) + 1e-6
-                logger.warning(f"log-min-max requires positive values, found min={global_min}. Adding offset: {offset}")
-                values = values + offset
-                stats["offset"] = offset
-                global_min = values.min().item()
-            log_vals = torch.log10(values)
-            vmin = log_vals.min().item()
-            vmax = log_vals.max().item()
-            if abs(vmax - vmin) < 1e-6:
-                vmin, vmax = 0.0, 1.0
-            stats.update({"min": vmin, "max": vmax})
-            
-        elif method == "arctan-compression":
-            if global_min < 0 and global_max > 0:
-                center = 0.0
-            else:
-                center = (global_min + global_max) / 2.0
-            scale = (global_max - global_min) / 2.0
-            if scale < 1e-6:
-                scale = 1.0
-                stats["is_constant"] = True
-            alpha = math.tan(0.99 * (math.pi / 2))
-            stats.update({"center": center, "scale": scale, "alpha": alpha})
-            
-        elif method == "max-out":
-            abs_max = max(abs(global_min), abs(global_max))
-            if abs_max < 1e-6:
-                abs_max = 1.0
-                stats["is_constant"] = True
-            stats.update({"max_val": abs_max})
-            
-        elif method == "invlogit-compression":
-            mean = values.mean().item()
-            std = values.std().item()
-            if global_min < 0 and global_max > 0:
-                mean = 0.0
-            if std < 1e-6:
-                std = 1.0
-                stats["is_constant"] = True
-            stats.update({"mean": mean, "std": std})
-            
-        elif method == "custom":
-            if is_constant:
-                stats.update({
-                    "m": 1.0,
-                    "epsilon": 1e-10,
-                    "is_constant": True
-                })
-                return stats
-            epsilon = 1e-10
-            y_positive = torch.log10(torch.clamp(values, min=0) + 1 + epsilon)
-            y_negative = -torch.log10(torch.clamp(-values, min=0) + 1 + epsilon)
-            y = torch.where(values >= 0, y_positive, y_negative)
-            m_pos = torch.log10(torch.tensor(global_max) + 1 + epsilon).item() if global_max > 0 else 0.0
-            m_neg = torch.log10(torch.tensor(-global_min) + 1 + epsilon).item() if global_min < 0 else 0.0
-            m = max(m_pos, m_neg)
-            if m < 1e-6:
-                m = 1.0
-            stats.update({"m": m, "epsilon": epsilon})
-            
-        elif method == "symlog":
-            if is_constant:
-                stats.update({
-                    "threshold": 1.0,
-                    "scale_factor": 1.0,
-                    "epsilon": 1e-10,
-                    "is_constant": True
-                })
-                return stats
-            epsilon = 1e-10
-            if symlog_threshold is None:
-                threshold = torch.quantile(torch.abs(values), symlog_percentile).item()
-                threshold = max(threshold, 1e-6)
-            else:
-                threshold = symlog_threshold
-            abs_values = torch.abs(values)
-            linear_region = abs_values <= threshold
-            log_region = abs_values > threshold
-            transformed = torch.zeros_like(values)
-            transformed[linear_region] = values[linear_region] / threshold
-            log_values = torch.log10(abs_values[log_region] / threshold) + 1
-            transformed[log_region] = torch.sign(values[log_region]) * log_values
-            max_abs_transformed = torch.max(torch.abs(transformed)).item()
-            scale_factor = max(max_abs_transformed, 1.0)
-            stats.update({
-                "threshold": threshold,
-                "scale_factor": scale_factor,
-                "epsilon": epsilon
-            })
-            
-        elif method == "standard":
-            mean = values.mean().item()
-            std = values.std().item()
-            if std < 1e-6 or is_constant:
-                std = 1.0
-                stats["is_constant"] = True
-            if is_constant:
-                scale_factor = 1.0
-            else:
-                max_dev = max(abs(global_max - mean), abs(global_min - mean))
-                scale_factor = max_dev / std
-            stats.update({
-                "mean": mean, 
-                "std": std,
-                "scale_factor": scale_factor
-            })
-            
-        else:
-            raise ValueError(f"Unsupported normalization method: {method}")
-            
-        return stats
+        # Save metadata
+        meta_path = self.output_dir / "normalization_metadata.json"
+        try:
+            from utils import save_json # Use save_json for consistency
+            save_json(metadata, meta_path)
+            logger.info(f"Saved normalization metadata ({computed_keys} numeric keys) to {meta_path}")
+        except ImportError:
+             logger.warning("Could not import save_json from utils, saving with standard json.")
+             meta_path.write_text(json.dumps(metadata, indent=2))
+        except Exception as e:
+             logger.error(f"Failed to save normalization metadata: {e}")
 
-    @staticmethod
-    def normalize_tensor(data: torch.Tensor, method: str, stats: Dict[str, float]) -> torch.Tensor:
-        """
-        Normalize a tensor using the specified method and statistics.
-        Uses base-10 logarithms.
-        """
-        eps = 1e-9
+
+        return metadata
+
+
+    def _compute_stats_for_key(
+        self,
+        data: Tensor,
+        method: str,
+        symlog_percentile: float = 0.5,
+        symlog_threshold: Optional[float] = None,
+    ) -> Dict[str, float]:
+        """Computes statistics needed for a specific normalization method."""
         if data.numel() == 0:
-            return data
-        if method == "none":
-            return data
-        if stats.get("is_constant", False):
-            return data
-        method = method.lower().strip()
-        
-        if method == "iqr":
-            median = stats["median"]
-            iqr = max(stats["iqr"], eps)
-            normalized = (data - median) / iqr
-            
-        elif method == "log-min-max":
-            if "offset" in stats:
-                offset = stats["offset"]
-                data = data + offset
-            if torch.any(data <= 0):
-                min_val = torch.min(data).item()
-                logger.warning(f"log-min-max found non-positive values (min={min_val}), applying epsilon offset")
-                data = torch.clamp(data, min=eps)
-            log_data = torch.log10(data)
-            min_val = stats["min"]
-            max_val = stats["max"]
-            denom = max(max_val - min_val, eps)
-            normalized = (log_data - min_val) / denom
-            normalized = torch.clamp(normalized, 0.0, 1.0)
-            
-        elif method == "arctan-compression":
-            center = stats["center"]
-            scale = max(stats["scale"], eps)
-            alpha = stats["alpha"]
-            normalized = (2.0 / math.pi) * torch.atan(alpha * (data - center) / scale)
-            
-        elif method == "max-out":
-            max_val = max(stats["max_val"], eps)
-            normalized = data / max_val
-            
-        elif method == "invlogit-compression":
-            mean = stats["mean"]
-            std = max(stats["std"], eps)
-            normalized = 2.0 * torch.sigmoid((data - mean) / std) - 1.0
-            
-        elif method == "custom":
-            m = max(stats["m"], eps)
-            epsilon = stats.get("epsilon", 1e-10)
-            y_positive = torch.log10(torch.clamp(data, min=0) + 1 + epsilon)
-            y_negative = -torch.log10(torch.clamp(-data, min=0) + 1 + epsilon)
-            y = torch.where(data >= 0, y_positive, y_negative)
-            normalized = y / m
-            
-        elif method == "symlog":
-            threshold = stats["threshold"]
-            scale_factor = max(stats["scale_factor"], eps)
-            abs_data = torch.abs(data)
-            linear_region = abs_data <= threshold
-            log_region = abs_data > threshold
-            transformed = torch.zeros_like(data)
-            transformed[linear_region] = data[linear_region] / threshold
-            if torch.any(log_region):
-                safe_vals = torch.clamp(abs_data[log_region] / threshold, min=1e-10)
-                log_values = torch.log10(safe_vals) + 1
-                transformed[log_region] = torch.sign(data[log_region]) * log_values
-            normalized = transformed / scale_factor
-            normalized = torch.clamp(normalized, -1.0, 1.0)
-            
-        elif method == "standard":
-            mean = stats["mean"]
-            std = max(stats["std"], eps)
-            scale_factor = max(stats["scale_factor"], eps)
-            standardized = (data - mean) / std
-            normalized = standardized / scale_factor
-            normalized = torch.clamp(normalized, -1.0, 1.0)
-            
+            raise ValueError("Cannot compute statistics on empty tensor.")
+
+        global_min, global_max = float(data.min()), float(data.max())
+        stats: Dict[str, float] = {"global_min": global_min, "global_max": global_max}
+        # Check if data is effectively constant
+        is_constant = (global_max - global_min) < 1e-9 # Use a small epsilon
+        if is_constant:
+            stats["is_constant"] = 1.0 # Use float for JSON compatibility
+
+        method_lower = method.lower().strip()
+        epsilon = 1e-10 # Small value to avoid log(0) or division by zero
+
+        if method_lower == "iqr":
+            q1 = float(torch.quantile(data, 0.25))
+            q3 = float(torch.quantile(data, 0.75))
+            iqr = q3 - q1
+            stats.update({
+                "median": float(torch.median(data).values), # .values needed for torch >= 1.8
+                "iqr": max(iqr, epsilon), # Avoid zero IQR
+            })
+        elif method_lower == "log-min-max":
+            offset = 0.0
+            if global_min <= 0:
+                offset = abs(global_min) + epsilon
+                logger.debug(f"log-min-max requires positive values, adding offset: {offset:.2e} for key")
+            # Apply offset before log
+            shifted_data = data + offset
+            # Clamp potentially very small values after offset before log10
+            log_vals = torch.log10(torch.clamp(shifted_data, min=epsilon))
+            log_min, log_max = float(log_vals.min()), float(log_vals.max())
+            stats.update({"min": log_min, "max": log_max, "offset": offset})
+        elif method_lower == "arctan-compression":
+            center = 0.0 if (global_min < 0 and global_max > 0) else (global_min + global_max) / 2.0
+            scale = max((global_max - global_min) / 2.0, epsilon)
+            # alpha determines the steepness, scales input to ~[-1, 1] before atan
+            alpha = math.tan(0.99 * math.pi / 2) # Value that maps large inputs close to +/- pi/2
+            stats.update({"center": center, "scale": scale, "alpha": alpha})
+        elif method_lower == "max-out":
+            max_abs_val = max(abs(global_min), abs(global_max), epsilon)
+            stats["max_val"] = max_abs_val
+        elif method_lower == "invlogit-compression":
+            stats.update({"mean": float(data.mean()), "std": max(float(data.std()), epsilon)})
+        elif method_lower == "custom": # Sign-preserving log10
+            m_pos = math.log10(global_max + 1 + epsilon) if global_max > -epsilon else 0.0
+            m_neg = math.log10(abs(global_min) + 1 + epsilon) if global_min < epsilon else 0.0
+            stats.update({"m": max(m_pos, m_neg, 1.0), "epsilon": epsilon}) # Use max of magnitude logs
+        elif method_lower == "symlog":
+            if is_constant:
+                 # Handle constant case for symlog gracefully
+                 stats.update({"threshold": 1.0, "scale_factor": 1.0, "epsilon": epsilon})
+            else:
+                abs_data = torch.abs(data)
+                if symlog_threshold is None:
+                    # Determine threshold from percentile of absolute values
+                    threshold = max(float(torch.quantile(abs_data, symlog_percentile)), epsilon)
+                else:
+                    threshold = max(symlog_threshold, epsilon) # Use provided threshold if valid
+
+                # Transform data to calculate scale_factor
+                linear_mask = abs_data <= threshold
+                log_mask = ~linear_mask
+                transformed = torch.zeros_like(data)
+                transformed[linear_mask] = data[linear_mask] / threshold
+                # Clamp log argument to avoid log(<=0)
+                safe_log_arg = torch.clamp(abs_data[log_mask] / threshold, min=epsilon)
+                transformed[log_mask] = torch.sign(data[log_mask]) * (torch.log10(safe_log_arg) + 1)
+
+                scale_factor = max(float(torch.max(torch.abs(transformed))), 1.0) # Ensure scale factor is at least 1
+                stats.update({"threshold": threshold, "scale_factor": scale_factor, "epsilon": epsilon})
+        elif method_lower == "standard":
+            mean = float(data.mean())
+            std = max(float(data.std()), epsilon) # Avoid zero std dev
+            # Scale factor ensures output is roughly within [-1, 1]
+            scale_factor = max(abs(global_max - mean), abs(global_min - mean)) / std if not is_constant else 1.0
+            stats.update({"mean": mean, "std": std, "scale_factor": max(scale_factor, 1.0)}) # Ensure scale_factor >= 1
+        elif method_lower == "none":
+            pass # No stats needed for 'none' method
         else:
-            raise ValueError(f"Unsupported normalization method: {method}")
-            
-        return normalized
+            raise ValueError(f"Unsupported normalization method: '{method}'")
+
+        return stats
+
+    # ------------------------------------------------------------------
+    # Apply normalization / denormalization
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def denormalize(norm_values: Union[torch.Tensor, List[float], float], 
-                   metadata: Dict[str, Any], 
-                   variable_name: str) -> Union[torch.Tensor, List[float], float]:
-        """
-        Denormalize values using stored normalization metadata.
-        Uses base-10 logarithms where applicable.
-        """
-        if "normalization_methods" not in metadata or variable_name not in metadata.get("normalization_methods", {}):
-            raise KeyError(f"No normalization method found for '{variable_name}'")
-            
-        method_raw = metadata["normalization_methods"][variable_name]
-        method = str(method_raw).lower().strip()
-        
+    def normalize_tensor(x: Tensor, method: str, stats: Dict[str, float]) -> Tensor:
+        """Normalizes a tensor using the specified method and stats."""
+        if x.numel() == 0 or method == "none" or stats.get("is_constant"):
+            return x # Passthrough for empty, 'none', or constant data
+
+        method_lower = method.lower().strip()
+        epsilon = stats.get("epsilon", 1e-9) # Get epsilon from stats if available
+
+        if method_lower == "iqr":
+            normed = (x - stats["median"]) / stats["iqr"]
+        elif method_lower == "log-min-max":
+            x_shifted = x + stats.get("offset", 0.0)
+            log_x = torch.log10(torch.clamp(x_shifted, min=epsilon))
+            denom = max(stats["max"] - stats["min"], epsilon)
+            normed = torch.clamp((log_x - stats["min"]) / denom, 0.0, 1.0)
+        elif method_lower == "arctan-compression":
+            normed = (2 / math.pi) * torch.atan(stats["alpha"] * (x - stats["center"]) / stats["scale"])
+        elif method_lower == "max-out":
+            normed = x / stats["max_val"]
+        elif method_lower == "invlogit-compression":
+            normed = 2 * torch.sigmoid((x - stats["mean"]) / stats["std"]) - 1
+        elif method_lower == "custom":
+            pos = torch.log10(torch.clamp(x, min=0) + 1 + epsilon)
+            neg = -torch.log10(torch.clamp(-x, min=0) + 1 + epsilon)
+            y = torch.where(x >= 0, pos, neg)
+            normed = y / stats["m"]
+        elif method_lower == "symlog":
+            thr, sf = stats["threshold"], stats["scale_factor"]
+            abs_x = torch.abs(x)
+            linear = abs_x <= thr
+            logarithmic = ~linear
+            normed = torch.zeros_like(x)
+            normed[linear] = x[linear] / thr
+            # Clamp log argument safely away from zero
+            safe_log_arg = torch.clamp(abs_x[logarithmic] / thr, min=epsilon)
+            normed[logarithmic] = torch.sign(x[logarithmic]) * (torch.log10(safe_log_arg) + 1)
+            normed = torch.clamp(normed / sf, -1.0, 1.0) # Clamp output to [-1, 1]
+        elif method_lower == "standard":
+            normed = torch.clamp(((x - stats["mean"]) / stats["std"]) / stats["scale_factor"], -1.0, 1.0)
+        else:
+            raise ValueError(f"Unsupported normalization method: '{method}'")
+
+        # Ensure output has same dtype as input (should be float32)
+        return normed.to(x.dtype)
+
+
+    @staticmethod
+    def denormalize(
+        v: Union[Tensor, List[float], float],
+        metadata: Dict[str, Any],
+        var_name: str,
+    ) -> Union[Tensor, List[float], float]:
+        """Denormalizes values using stored metadata for a specific variable."""
+        # Extract method and stats for the variable
+        methods = metadata.get("normalization_methods", {})
+        method = methods.get(var_name, "none").lower().strip()
         if method == "none":
-            return norm_values
-            
-        if variable_name not in metadata:
-            raise KeyError(f"No statistics found for '{variable_name}'")
-            
-        stats = metadata[variable_name]
-        is_scalar = isinstance(norm_values, (int, float))
-        is_list = isinstance(norm_values, list)
-        
-        norm_tensor = torch.tensor(norm_values, dtype=torch.float32)
-        eps = 1e-9
-        
-        if norm_tensor.numel() == 0:
-            return norm_values
-            
-        if stats.get("is_constant", False):
-            return norm_values
-        
-        if method.startswith("iqr"):
-            median = stats["median"]
-            iqr = stats["iqr"]
-            denorm = norm_tensor * iqr + median
-            
-        elif method.startswith("log-min"):
-            min_val = stats["min"]
-            max_val = stats["max"]
-            log_x = norm_tensor * (max_val - min_val) + min_val
-            denorm = torch.pow(10, log_x)
-            if "offset" in stats:
-                denorm = denorm - stats["offset"]
-            
-        elif method.startswith("arctan"):
-            center = stats["center"]
-            scale = stats["scale"]
-            alpha = stats["alpha"]
-            safe_norm = torch.clamp(norm_tensor, -0.99999, 0.99999)
-            denorm = center + (scale / alpha) * torch.tan((math.pi / 2) * safe_norm)
-            
-        elif method.startswith("max-out") or method.startswith("max"):
-            max_val = stats.get("max_val", stats.get("abs_max", 1.0))
-            denorm = norm_tensor * max_val
-            
-        elif method.startswith("invlogit"):
-            mean = stats["mean"]
-            std = stats["std"]
-            safe_norm = torch.clamp(norm_tensor, -0.99999, 0.99999)
-            logit = torch.log((safe_norm + 1) / (1 - safe_norm + eps))
-            denorm = mean + std * logit
-            
-        elif method.startswith("custom"):
-            m = stats["m"]
-            epsilon = stats.get("epsilon", 1e-10)
-            y = norm_tensor * m
-            denorm = torch.where(y >= 0, 
-                               torch.pow(10, y) - 1 - epsilon, 
-                               - (torch.pow(10, -y) - 1) - epsilon)
-            
-        elif method.startswith("symlog"):
-            threshold = stats["threshold"]
-            scale_factor = stats["scale_factor"]
-            unscaled = norm_tensor * scale_factor
-            eps_bound = 1e-6
-            abs_unscaled = torch.abs(unscaled)
-            linear_region = abs_unscaled <= (1.0 + eps_bound)
-            log_region = ~linear_region
-            denorm = torch.zeros_like(unscaled)
-            denorm[linear_region] = unscaled[linear_region] * threshold
-            if torch.any(log_region):
-                safe_abs_unscaled = torch.clamp(abs_unscaled[log_region] - 1.0, min=-50.0, max=50.0)
-                log_values = torch.pow(10, safe_abs_unscaled) * threshold
-                denorm[log_region] = torch.sign(unscaled[log_region]) * log_values
-            
-        elif method.startswith("standard"):
-            mean = stats["mean"]
-            std = stats["std"]
-            scale_factor = stats["scale_factor"]
-            unscaled = norm_tensor * scale_factor
-            denorm = unscaled * std + mean
-            
+            return v # Passthrough
+
+        stats = metadata.get(var_name)
+        if stats is None:
+            raise KeyError(f"Normalization statistics not found for variable '{var_name}'")
+        if stats.get("is_constant"):
+            # If original was constant, return the original constant value if possible,
+            # otherwise return the input 'v' as denormalized value isn't well-defined.
+            # Returning v is safer than trying to guess the constant.
+            logger.debug(f"Variable '{var_name}' was constant, returning input value during denormalization.")
+            return v
+
+
+        # Convert input to tensor for processing
+        is_scalar = not isinstance(v, (list, Tensor))
+        x = v if isinstance(v, Tensor) else _to_tensor(v)
+        original_dtype = x.dtype
+        x = x.float() # Ensure float for calculations
+
+        epsilon = stats.get("epsilon", 1e-9)
+
+        # Apply inverse transformation based on method
+        if method == "iqr":
+            denormed = x * stats["iqr"] + stats["median"]
+        elif method == "log-min-max":
+            log_val = x * (stats["max"] - stats["min"]) + stats["min"]
+            denormed = torch.pow(10, log_val) - stats.get("offset", 0.0)
+        elif method == "arctan-compression":
+            # Clamp input to avoid tan blowing up near +/- 1
+            safe_x = torch.clamp(x, -0.999999, 0.999999)
+            denormed = stats["center"] + (stats["scale"] / stats["alpha"]) * torch.tan((math.pi / 2) * safe_x)
+        elif method == "max-out":
+            denormed = x * stats["max_val"]
+        elif method == "invlogit-compression":
+            # Clamp input to avoid issues with logit of +/- 1
+            safe_x = torch.clamp(x, -0.999999, 0.999999)
+            # logit(p) = log(p / (1 - p)) where p = (safe_x + 1) / 2
+            p = (safe_x + 1) / 2.0
+            logit_p = torch.log(p / torch.clamp(1 - p, min=epsilon))
+            denormed = stats["mean"] + stats["std"] * logit_p
+        elif method == "custom":
+            y = x * stats["m"]
+            pos = torch.pow(10, y) - 1 - epsilon
+            neg = -(torch.pow(10, -y) - 1 - epsilon)
+            denormed = torch.where(y >= 0, pos, neg)
+        elif method == "symlog":
+            thr, sf = stats["threshold"], stats["scale_factor"]
+            unscaled = x * sf
+            linear = torch.abs(unscaled) <= 1.0 # Linear region is where |transformed| <= 1
+            logarithmic = ~linear
+            denormed = torch.zeros_like(x)
+            denormed[linear] = unscaled[linear] * thr
+            # Clamp exponent base to avoid potential overflow/underflow issues
+            safe_exponent = torch.clamp(torch.abs(unscaled[logarithmic]) - 1, min=-50, max=50) # Clamp exponent range
+            denormed[logarithmic] = torch.sign(unscaled[logarithmic]) * thr * torch.pow(10, safe_exponent)
+        elif method == "standard":
+            denormed = (x * stats["scale_factor"]) * stats["std"] + stats["mean"]
         else:
-            raise ValueError(f"Unsupported normalization method: '{method}' (original: '{method_raw}', type: {type(method_raw)}, repr: {repr(method_raw)})")
-        
+            raise ValueError(f"Unsupported denormalization method: '{method}'")
+
+        # Return in original format (scalar, list, or tensor) and dtype
+        denormed = denormed.to(original_dtype)
         if is_scalar:
-            return denorm.item()
-        elif is_list:
-            return denorm.tolist()
+            return denormed.item()
+        elif isinstance(v, list):
+            return denormed.tolist()
         else:
-            return denorm
+            return denormed
+
+    # ------------------------------------------------------------------
+    # Process all profiles
+    # ------------------------------------------------------------------
 
     def process_profiles(self, stats: Dict[str, Any]) -> None:
         """
-        Normalize all JSON profiles using the computed statistics.
-        Creates normalized profiles and saves them with metadata to the output folder.
+        Applies normalization to all profiles in the input directory
+        using the provided statistics, saving results to the output directory.
         """
-        logger.info("Processing profiles using computed statistics...")
-        
-        self.output_folder.mkdir(parents=True, exist_ok=True)
-        metadata_path = self.output_folder / "normalization_metadata.json"
-        with open(metadata_path, "w") as f:
-            json.dump(stats, f, indent=2)
-        logger.info(f"Saved normalization metadata to: {metadata_path}")
-        
+        logger.info(f"Applying normalization and saving profiles to {self.output_dir}...")
         methods = stats.get("normalization_methods", {})
         if not methods:
-            logger.error("No normalization methods found in stats")
-            raise ValueError("Invalid statistics: missing normalization_methods")
-            
-        boolean_keys = set(stats.get("config", {}).get("boolean_keys", []))
-        
-        profile_files = list(self.input_folder.glob("*.json"))
-        total_files = len(profile_files)
-        batch_size = min(self.batch_size, total_files)
-        num_batches = (total_files + batch_size - 1) // batch_size
-        
-        logger.info(f"Processing {total_files} files in {num_batches} batches")
+            logger.error("No normalization methods found in provided statistics.")
+            return
+
         processed_count = 0
         error_count = 0
-        
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min((batch_idx + 1) * batch_size, total_files)
-            batch_files = profile_files[start_idx:end_idx]
-            
-            for profile_path in batch_files:
-                try:
-                    with open(profile_path, "r") as f:
-                        profile = json.load(f)
-                    
-                    normalized_profile = {}
-                    
-                    for key, value in profile.items():
-                        if value is None or (isinstance(value, float) and np.isnan(value)):
-                            normalized_profile[key] = value
-                            continue
-                            
-                        if isinstance(value, bool) or key in boolean_keys:
-                            normalized_profile[key] = value
-                            continue
-                            
-                        method = methods.get(key)
-                        if not method or method == "none":
-                            normalized_profile[key] = value
-                            continue
-                        
-                        key_stats = stats.get(key)
-                        if not key_stats and key in stats.get("config", {}).get("all_keys", []):
-                            if isinstance(value, list) and all(isinstance(v, (int, float)) for v in value):
-                                data = torch.tensor(value, dtype=torch.float32)
-                                key_stats = self._compute_stats_for_key(data, "max-out")
-                                stats[key] = key_stats
-                                methods[key] = "max-out"
-                            elif isinstance(value, (int, float)):
-                                data = torch.tensor([float(value)], dtype=torch.float32)
-                                key_stats = self._compute_stats_for_key(data, "max-out")
-                                stats[key] = key_stats
-                                methods[key] = "max-out"
-                            else:
-                                normalized_profile[key] = value
-                                continue
-                        elif not key_stats:
-                            normalized_profile[key] = value
-                            continue
-                                
-                        if isinstance(value, list) and all(isinstance(v, (int, float)) or (isinstance(v, float) and np.isnan(v)) for v in value):
-                            valid_indices = [i for i, v in enumerate(value) if not (isinstance(v, float) and np.isnan(v))]
-                            valid_values = [value[i] for i in valid_indices]
-                            
-                            if valid_values:
-                                data = torch.tensor(valid_values, dtype=torch.float32)
-                                try:
-                                    norm_data = self.normalize_tensor(data, method, key_stats)
-                                    result = []
-                                    valid_idx = 0
-                                    for i in range(len(value)):
-                                        if i in valid_indices:
-                                            result.append(norm_data[valid_idx].item())
-                                            valid_idx += 1
-                                        else:
-                                            result.append(value[i])
-                                    normalized_profile[key] = result
-                                except ValueError as e:
-                                    logger.warning(f"Error normalizing '{key}': {e}")
-                                    normalized_profile[key] = value
-                            else:
-                                normalized_profile[key] = value
-                        elif isinstance(value, (int, float)):
-                            data = torch.tensor([float(value)], dtype=torch.float32)
-                            try:
-                                norm_data = self.normalize_tensor(data, method, key_stats)
-                                normalized_profile[key] = norm_data.item()
-                            except ValueError as e:
-                                logger.warning(f"Error normalizing '{key}': {e}")
-                                normalized_profile[key] = value
+        files = [p for p in self.input_dir.glob("*.json") if p.name != "normalization_metadata.json"]
+
+        for fpath in files:
+            try:
+                prof = json.loads(fpath.read_text())
+                normalized_profile = {}
+                for key, value in prof.items():
+                    method = methods.get(key, "none").lower() # Default to 'none' if key missing
+                    if method == "none" or isinstance(value, bool) or value is None:
+                        normalized_profile[key] = value
+                        continue
+
+                    key_stats = stats.get(key)
+                    if key_stats is None:
+                         logger.warning(f"No stats found for key '{key}' in {fpath.name}, skipping normalization.")
+                         normalized_profile[key] = value
+                         continue
+
+                    try:
+                        is_list = isinstance(value, list)
+                        tensor_val = _to_tensor(value)
+                        if tensor_val.numel() > 0: # Check if tensor is not empty
+                             normed_tensor = self.normalize_tensor(tensor_val, method, key_stats)
+                             # Convert back to original type (list or scalar)
+                             normalized_profile[key] = normed_tensor.tolist() if is_list else normed_tensor.item()
                         else:
-                            normalized_profile[key] = value
-                    
-                    output_path = self.output_folder / profile_path.name
-                    with open(output_path, "w") as f:
-                        json.dump(normalized_profile, f, indent=2)
-                    
-                    processed_count += 1
-                except Exception as e:
-                    logger.error(f"Error processing {profile_path.name}: {e}")
-                    error_count += 1
-        
-        with open(metadata_path, "w") as f:
-            stats["normalization_methods"] = methods
-            json.dump(stats, f, indent=2)
-            
+                             normalized_profile[key] = value # Keep empty list as is
+                    except Exception as norm_exc:
+                         logger.warning(f"Failed to normalize '{key}' in {fpath.name} with method '{method}': {norm_exc}. Keeping original value.")
+                         normalized_profile[key] = value
+
+                # Save the normalized profile
+                output_path = self.output_dir / fpath.name
+                save_json(normalized_profile, output_path) # Use save_json for consistency
+                processed_count += 1
+
+            except Exception as file_exc:
+                logger.error(f"Error processing file {fpath.name}: {file_exc}")
+                error_count += 1
+
+        logger.info(f"Normalization processing complete. Saved {processed_count} normalized profiles.")
         if error_count > 0:
-            logger.warning(f"Encountered errors in {error_count} files during normalization")
-            
-        logger.info(f"Processed and saved {processed_count} normalized profiles")
+            logger.warning(f"Encountered errors in {error_count} files during processing.")

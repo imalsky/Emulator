@@ -1,277 +1,275 @@
 #!/usr/bin/env python3
 """
-main.py - Entry point for emulator
+main.py — Streamlined entry-point for the atmospheric profile prediction pipeline.
 
-Provides command-line interface to normalize data, train models, and make predictions
-using an encoder-only transformer with separate encoders for different
-data types (global features and sequence data).
+Handles command-line arguments, configuration loading/validation, and orchestrates
+the normalization, training, and hyperparameter tuning processes.
 """
+from __future__ import annotations
 
-import sys
 import argparse
 import logging
+import sys
 from pathlib import Path
-import torch
-import numpy as np
+from typing import Tuple, Dict, Any, Optional # Added Optional
 
-from utils import (setup_logging, load_config, ensure_dirs, save_config)
+import torch
+import numpy as np # Needed for seeding
+
+# Import necessary components from other modules
 from hardware import setup_device
 from normalizer import DataNormalizer
-from dataset import AtmosphericDataset, MultiSourceCollate
+from dataset import AtmosphericDataset, create_multi_source_collate_fn
 from train import ModelTrainer
 from hyperparams import run_hyperparameter_search
+from utils import (
+    ensure_dirs,
+    load_config,
+    setup_logging,
+    validate_config, # Use the strict validation
+    save_json,       # For saving tuning results
+    seed_everything # For reproducibility
+)
+
 
 logger = logging.getLogger(__name__)
 
-def normalize_data(config=None, data_dir="data"):
-    """
-    Normalize raw profile data using global statistics.
-    """
-    try:
-        logger.info("Starting data normalization...")
-        raw_dir = Path(data_dir) / "profiles"
-        norm_dir = Path(data_dir) / "normalized_profiles"
-        
-        normalizer = DataNormalizer(raw_dir, norm_dir)
-        norm_config = config.get("normalization", {}) if config is not None else {}
-        key_methods = norm_config.get("key_methods", {})
-        default_method = norm_config.get("default_method", "iqr")
-        clip_outliers = norm_config.get("clip_outliers_before_scaling", False)
-        
-        # Extract symlog-specific parameters
-        symlog_percentile = norm_config.get("symlog_percentile", 0.5)
-        symlog_thresholds = norm_config.get("symlog_thresholds", {})
-        
-        logger.info(f"Calculating global normalization statistics using {default_method} as default method...")
-        stats = normalizer.calculate_global_stats(
-            key_methods=key_methods,
-            default_method=default_method,
-            clip_outliers_before_scaling=clip_outliers,
-            symlog_percentile=symlog_percentile,
-            symlog_thresholds=symlog_thresholds
-        )
-        logger.info("Applying normalization to profiles...")
-        normalizer.process_profiles(stats)
-        
-        logger.info("Data normalization completed successfully")
-        return True
+# -----------------------------------------------------------------------------
+# Helper Functions (Orchestration Logic)
+# -----------------------------------------------------------------------------
 
+def _normalize(cfg: dict, data_root: Path) -> bool:
+    """Run data normalization; returns True on success."""
+    raw_dir = data_root / "profiles"
+    out_dir = data_root / "normalized_profiles"
+
+    try:
+        logger.info("Normalising %s → %s", raw_dir, out_dir)
+        # Pass normalization sub-config or empty dict
+        norm_cfg = cfg.get("normalization", {})
+        normalizer = DataNormalizer(raw_dir, out_dir)
+        stats = normalizer.calculate_global_stats(
+            key_methods=norm_cfg.get("key_methods"),
+            default_method=norm_cfg.get("default_method", "standard"), # Match default in config if exists
+            clip_outliers_before_scaling=norm_cfg.get("clip_outliers_before_scaling", False),
+            symlog_percentile=norm_cfg.get("symlog_percentile", 0.5),
+            symlog_thresholds=norm_cfg.get("symlog_thresholds")
+        )
+        if not stats:
+             raise RuntimeError("Normalization statistics calculation failed.")
+        normalizer.process_profiles(stats)
+        logger.info("Normalisation finished successfully.")
+        return True
     except Exception as e:
-        logger.error(f"Data normalization failed: {e}", exc_info=True)
+        logger.exception("Normalisation failed: %s", e)
         return False
 
 
-def setup_dataset(config, data_dir="data"):
+def _setup_dataset(config: dict, data_dir: Path) -> Optional[Tuple[AtmosphericDataset, Callable]]:
     """
-    Initialize dataset with separation of data types.
+    Initialize the dataset using parameters from config.
+    Returns (dataset, collate_fn) tuple or (None, None) on failure.
     """
     try:
-        logger.info("Initializing dataset with data type separation...")
-        
-        if "input_variables" not in config or "target_variables" not in config:
-            raise ValueError("Missing required input_variables or target_variables in config")
-        
-        # Ensure required fields exist in the config
-        if "global_variables" not in config:
-            logger.warning("No global_variables specified in config, using empty list")
-            config["global_variables"] = []
-            
-        if "sequence_types" not in config:
-            logger.warning("No sequence_types defined in config, will use defaults in dataset constructor")
-            config["sequence_types"] = {}
-        
-        full_dataset = AtmosphericDataset(
-            data_folder=Path(data_dir) / "normalized_profiles",
+        logger.info("Initializing dataset (strict lengths from config)...")
+        norm_dir = data_dir / "normalized_profiles"
+        if not norm_dir.exists():
+             logger.error(f"Normalized data directory not found: {norm_dir}")
+             logger.error("Please run with --normalize first.")
+             return None, None
+
+        # --- Crucial validation moved to utils.validate_config ---
+        # Ensure required keys for dataset exist (checked by validate_config)
+        sequence_lengths = config["sequence_lengths"]
+        output_seq_type = config["output_seq_type"]
+        # ---
+
+        ds = AtmosphericDataset(
+            data_folder=str(norm_dir),
             input_variables=config["input_variables"],
             target_variables=config["target_variables"],
-            global_variables=config["global_variables"],
-            sequence_types=config["sequence_types"]
-            # Removed allow_variable_length parameter
+            global_variables=config.get("global_variables", []),
+            sequence_types=config["sequence_types"],
+            sequence_lengths=sequence_lengths, # Pass dict from config
+            output_seq_type=output_seq_type, # Pass key from config
+            cache_size=config.get("dataset_cache_size", 1024) # Optional cache size
         )
-        
-        if hasattr(full_dataset, "sequence_lengths"):
-            config["sequence_lengths"] = dict(full_dataset.sequence_lengths)
-            for seq_type, length in config["sequence_lengths"].items():
-                if length > 10000:
-                    raise ValueError(f"Sequence length for {seq_type} is {length}, exceeding maximum allowed 10000")
-            logger.info(f"Detected sequence lengths: {config['sequence_lengths']}")
-        
-        # Use the MultiSourceCollate class directly instead of function
-        config["collate_fn"] = MultiSourceCollate()
-        
-        if config.get("frac_of_data", 1.0) < 1.0:
-            dataset_size = len(full_dataset)
-            subset_size = int(dataset_size * config["frac_of_data"])
-            indices = torch.randperm(dataset_size, generator=torch.Generator().manual_seed(42))[:subset_size]
-            dataset = torch.utils.data.Subset(full_dataset, indices.tolist())
-            logger.info(f"Using {subset_size}/{dataset_size} samples ({config['frac_of_data']:.1%})")
-        else:
-            dataset = full_dataset
-        
-        return dataset
+        logger.info("Dataset loaded: %d profiles.", len(ds))
+        collate_fn = create_multi_source_collate_fn()
+        return ds, collate_fn
+    except KeyError as e:
+         logger.error(f"Dataset setup failed: Missing required configuration key: {e}")
+         return None, None
     except Exception as e:
-        logger.error(f"Dataset initialization failed: {e}", exc_info=True)
-        return None
+        logger.exception("Dataset setup failed: %s", e)
+        return None, None
 
 
-def train_model(config, device, dataset, data_dir="data"):
-    """
-    Train a prediction model with the encoder-only architecture.
-    """
+def _train(cfg: dict, data_dir: Path) -> bool:
+    """Run model training; returns True on success."""
+    logger.info("Starting model training...")
+    device = setup_device()
+    seed_everything(cfg.get("random_seed", 42)) # Seed before dataset/model init
+
+    dataset, collate_fn = _setup_dataset(cfg, data_dir)
+    if dataset is None:
+        return False # Error logged in _setup_dataset
+
     try:
-        if dataset is None:
-            logger.error("Cannot train model: dataset is None")
-            return False
-        
-        model_dir = Path(data_dir) / "model"
-        model_dir.mkdir(parents=True, exist_ok=True)
-        
-        if config.get("use_amp", False):
-            logger.info("Enabling automatic mixed precision")
-        
         trainer = ModelTrainer(
-            config=config,
+            config=cfg,
             device=device,
-            save_path=model_dir,
+            save_dir=data_dir / "model",
             dataset=dataset,
-            collate_fn=config.get("collate_fn")
+            collate_fn=collate_fn,
         )
-        
-        epochs = config.get("epochs", 100)
-        patience = config.get("early_stopping_patience", 15)
-        final_model_path = trainer.train(num_epochs=epochs, early_stopping_patience=patience)
-        
-        if final_model_path:
-            test_metrics = trainer.test()
-            logger.info(f"Test metrics: {test_metrics:.3e}")
-            
-            best_val_metric = trainer.best_val_loss if hasattr(trainer, "best_val_loss") else None
-            if best_val_metric is not None:
-                metric_path = model_dir / "best_val_metric.txt"
-                with open(metric_path, 'w') as f:
-                    f.write(f"{best_val_metric:.10e}")
-            
+        # train() method now returns best validation loss
+        best_loss = trainer.train()
+        logger.info("Training complete (Best Val Loss = %.4e)", best_loss)
+        # Save final metrics including best loss
+        save_json({"best_val_loss": best_loss}, data_dir / "model" / "metrics.json")
+        return True
+    except Exception as e:
+         logger.exception("Model training failed: %s", e)
+         return False
+
+
+def _tune(cfg: dict, data_dir: Path, num_trials: int) -> bool:
+    """Run hyperparameter tuning; returns True on success."""
+    logger.info("Starting hyper-parameter search (%d trials)...", num_trials)
+    seed_everything(cfg.get("random_seed", 42)) # Seed for reproducibility in Optuna
+
+    try:
+        # This is the function Optuna will call for each trial's training run
+        # It needs to return the metric to minimize (best validation loss)
+        def _train_for_tuning(
+             trial_cfg: dict, device: torch.device, ds, collate, data_root: Path
+        ) -> float:
+            # Use a temporary directory for trial artifacts to avoid conflicts
+            trial_save_dir = data_root / f"tuning_trial_{trial_cfg.get('optuna_trial_number', 0)}"
+            trainer = ModelTrainer(
+                config=trial_cfg,
+                device=device,
+                save_dir=trial_save_dir, # Save trial models separately
+                dataset=ds,
+                collate_fn=collate,
+            )
+            best_loss = trainer.train() # Returns best validation loss
+            # Clean up trial directory? Optional.
+            # import shutil
+            # shutil.rmtree(trial_save_dir, ignore_errors=True)
+            return best_loss
+
+        # Run the search
+        best_config = run_hyperparameter_search(
+            base_config=cfg,
+            data_dir=str(data_dir),
+            output_dir=str(data_dir / "tuning_results"),
+            # Pass _setup_dataset directly
+            setup_dataset_func=_setup_dataset,
+            # Pass the wrapper function that returns the float metric
+            train_model_func=_train_for_tuning,
+            setup_device_func=setup_device,
+            # Pass the save_json utility
+            save_config_func=save_json,
+            num_trials=num_trials,
+        )
+        if best_config:
+            logger.info("Tuning finished. Best configuration saved.")
             return True
         else:
-            logger.warning("Training did not produce a final model")
+            logger.error("Tuning finished but no best configuration was determined (all trials may have failed).")
             return False
     except Exception as e:
-        logger.error(f"Model training failed: {e}", exc_info=True)
-        return False
+         logger.exception("Hyperparameter tuning failed: %s", e)
+         return False
 
+# -----------------------------------------------------------------------------
+# Command-Line Interface Setup
+# -----------------------------------------------------------------------------
 
-def run_hyperparameter_tuning(base_config, data_dir, output_dir, num_trials=100):
-    """
-    Run hyperparameter tuning with a limited number of trials.
-    """
-    try:
-        logger.info(f"Starting hyperparameter search with {num_trials} trials")
-        
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        import random
-        random.seed(42)
-        
-        # Pass an empty dict for the param grid (unused in the new version)
-        best_config = run_hyperparameter_search(
-            base_config=base_config,
-            param_grid_config={},
-            data_dir=data_dir,
-            output_dir=output_dir,
-            setup_dataset_func=setup_dataset,
-            train_model_func=train_model,
-            setup_device_func=setup_device,
-            ensure_dirs_func=ensure_dirs,
-            save_config_func=save_config,
-            num_trials=num_trials
-        )
-        
-        if best_config:
-            logger.info("Hyperparameter tuning complete. Best configuration saved.")
-            logger.info(f"To use the best configuration for training, run:")
-            logger.info(f"python main.py --train --config {output_dir}/best_config.json")
-        
-        return best_config is not None
-    except Exception as e:
-        logger.error(f"Hyperparameter tuning failed: {e}", exc_info=True)
-        return False
-
-
-def parse_arguments():
-    """Parse command line arguments."""
+def _parse_args() -> argparse.Namespace:
+    """Defines and parses command-line arguments."""
     parser = argparse.ArgumentParser(description="Atmospheric profile prediction pipeline")
-    parser.add_argument("--normalize", action="store_true", help="Normalize data")
-    parser.add_argument("--train", action="store_true", help="Train model")
-    parser.add_argument("--tune", action="store_true", help="Run hyperparameter tuning")
-    parser.add_argument("--trials", type=int, default=100, help="Number of trials for hyperparameter tuning")
-    parser.add_argument("--config", type=str, default="inputs/model_input_params.jsonc", help="Configuration file path")
-    parser.add_argument("--data-dir", type=str, default="data", help="Base data directory")
+    # Actions (mutually exclusive)
+    action_group = parser.add_mutually_exclusive_group(required=True)
+    action_group.add_argument("--normalize", action="store_true", help="Run data normalization only")
+    action_group.add_argument("--train", action="store_true", help="Train the model using config")
+    action_group.add_argument("--tune", action="store_true", help="Run hyper-parameter search (Optuna)")
+
+    # Common arguments
+    parser.add_argument("--config", type=Path, default=Path("inputs/model_input_params.jsonc"),
+                        help="Path to configuration file (JSON/JSONC)")
+    parser.add_argument("--data-dir", type=Path, default=Path("data"),
+                        help="Base directory for data (profiles, normalized_profiles, model)")
+
+    # Tuning specific arguments
+    parser.add_argument("--trials", type=int, default=25,
+                        help="Number of trials for hyper-parameter tuning (used with --tune)")
     return parser.parse_args()
 
 
-def main():
-    """Main entry point for the atmospheric prediction pipeline."""
-    args = parse_arguments()
-    setup_logging()
-    
-    if not (args.normalize or args.train or args.tune):
-        logger.error("No action specified. Use --normalize, --train, or --tune")
-        return False
-    
-    data_dir = args.data_dir
+# -----------------------------------------------------------------------------
+# Main Execution Logic
+# -----------------------------------------------------------------------------
+
+def main() -> int:
+    """Parses arguments and runs the requested pipeline steps."""
+    args = _parse_args()
+    setup_logging() # Setup logging first
+
+    # --- Load and Validate Configuration ---
+    logger.info(f"Loading configuration from: {args.config}")
+    config = load_config(args.config)
+    if config is None:
+        # Error logged in load_config
+        return 1 # Exit code 1 for failure
+    logger.info("Validating configuration...")
+    if not validate_config(config):
+        # Error logged in validate_config
+        return 1 # Exit code 1 for failure
+    logger.info("Configuration loaded and validated successfully.")
+    # --- End Config Handling ---
+
+    # Ensure base directories exist
     ensure_dirs(
-        Path(data_dir) / "profiles", 
-        Path(data_dir) / "normalized_profiles", 
-        Path(data_dir) / "model"
+        args.data_dir / "profiles",
+        args.data_dir / "normalized_profiles",
+        args.data_dir / "model",
+        args.data_dir / "tuning_results" # Also ensure tuning results dir
     )
-    
-    config_path = Path(args.config)
-    if not config_path.exists():
-        logger.error(f"Config file not found: {config_path}")
-        return False
-    
-    config = load_config(str(config_path))
-    if not config:
-        logger.error("Failed to load config file")
-        return False
-    
-    overall_success = True
-    
+
+    exit_code = 0 # Default to success
+
+    # --- Execute Actions ---
     if args.normalize:
-        normalize_success = normalize_data(config, data_dir)
-        overall_success = overall_success and normalize_success
-    
-    if (args.train or args.tune) and overall_success:
-        device = setup_device()
-        random_seed = config.get("random_seed", 42)
-        torch.manual_seed(random_seed)
-        np.random.seed(random_seed)
-        if device.type == "cuda":
-            torch.cuda.manual_seed_all(random_seed)
-        
-        if args.train:
-            dataset = setup_dataset(config, data_dir)
-            if dataset is None:
-                logger.error("Failed to setup dataset")
-                return False
-            train_success = train_model(config, device, dataset, data_dir)
-            overall_success = overall_success and train_success
-        
-        if args.tune:
-            output_dir = "tuning_results"
-            tune_success = run_hyperparameter_tuning(config, data_dir, output_dir, args.trials)
-            overall_success = overall_success and tune_success
-    
-    return overall_success
+        if not _normalize(config, args.data_dir):
+            exit_code = 1 # Normalization failed
+    elif args.train:
+        if not _train(config, args.data_dir):
+            exit_code = 1 # Training failed
+    elif args.tune:
+        if not _tune(config, args.data_dir, args.trials):
+             exit_code = 1 # Tuning failed
+    # --- End Actions ---
+
+    if exit_code == 0:
+        logger.info("Pipeline finished successfully.")
+    else:
+        logger.error("Pipeline finished with errors.")
+
+    return exit_code
 
 
 if __name__ == "__main__":
+    # Set matmul precision (useful for TF32 on Ampere GPUs)
+    # torch.set_float32_matmul_precision("medium") # Or 'high'
     try:
-        success = main()
-        sys.exit(0 if success else 1)
+        sys.exit(main())
     except KeyboardInterrupt:
-        sys.exit(130)
+        logger.warning("Execution interrupted by user (Ctrl+C).")
+        sys.exit(130) # Standard exit code for Ctrl+C
     except Exception as e:
-        logger.error(f"Unhandled error: {e}", exc_info=True)
-        sys.exit(1)
+         # Catch any unexpected errors at the top level
+         logger.exception("An unexpected error occurred: %s", e)
+         sys.exit(1) # General error exit code

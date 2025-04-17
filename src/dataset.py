@@ -1,402 +1,243 @@
 #!/usr/bin/env python3
 """
-dataset.py - Handles data processing for the atmospheric emulator
+dataset.py – Atmospheric profile dataset with strict fixed sequence lengths.
 
-Loads atmospheric profile data from JSON files with strict sequence length enforcement.
-Supports organizing data into global features and sequence types.
+Enforces that sequence lengths in profiles exactly match those provided
+in the 'sequence_lengths' dictionary during initialization.
 """
+from __future__ import annotations
 
 import json
 import logging
 from pathlib import Path
 from collections import OrderedDict
+from typing import Any, Dict, List, Tuple, Union
+
+import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-from hardware import configure_dataloader_settings
+from torch import Tensor
+from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
-class AtmosphericDataset(Dataset):
-    """Dataset for atmospheric profile data with strict sequence length enforcement."""
 
+class AtmosphericDataset(Dataset):
+    """
+    Dataset of atmospheric profiles, requiring sequence lengths specified during init.
+    """
     def __init__(
         self,
-        data_folder,
-        input_variables,
-        target_variables,
-        global_variables=None,
-        sequence_types=None,
-        cache_size=1024
-    ):
+        data_folder: Union[str, Path],
+        input_variables: List[str],
+        target_variables: List[str],
+        global_variables: List[str],
+        sequence_types: Dict[str, List[str]],
+        sequence_lengths: Dict[str, int], # Expects lengths from config
+        output_seq_type: str, # Expects type key from config
+        cache_size: int = 1024,
+    ) -> None:
         """
-        Initialize dataset with strict sequence length validation.
-        
+        Initialize dataset with strict sequence length validation based on config.
+
         Parameters:
-            data_folder: Path to JSON profile files
-            input_variables: Names of input variables 
-            target_variables: Names of target variables
-            global_variables: Names of global (non-sequence) features
-            sequence_types: Mapping of sequence type names to variable lists
-            cache_size: Maximum number of profiles to cache
+        ----------
+            data_folder : Path to normalized JSON profile files.
+            input_variables : Names of input variables.
+            target_variables : Names of target variables.
+            global_variables : Names of global (scalar) features.
+            sequence_types : Mapping of sequence type names to variable lists.
+            sequence_lengths : Dict mapping sequence type keys to required lengths.
+            output_seq_type : Key indicating which sequence determines target length.
+            cache_size : Max number of profiles to cache in memory.
         """
-        super().__init__()
         self.data_folder = Path(data_folder)
-        if not self.data_folder.exists():
+        if not self.data_folder.is_dir():
             raise FileNotFoundError(f"Data folder not found: {data_folder}")
 
-        # Store variable configurations
+        # Store config
         self.input_variables = input_variables
         self.target_variables = target_variables
-        self.all_variables = list(set(input_variables + target_variables))
-        self.global_variables = global_variables or []
-        self.sequence_types = sequence_types or {}
-        
-        # If no sequence types provided throw an error
-        if not self.sequence_types:
-            raise ValueError("Sequence types must be provided. Please provide a sequence_types dictionary.")
+        self.global_variables = global_variables
+        self.sequence_types = {k: v for k, v in sequence_types.items() if v} # Filter empty
+        self.sequence_lengths = sequence_lengths
+        self.output_seq_type = output_seq_type
 
-        # Verify all variables are assigned
-        self._validate_variable_assignments()
+        # --- Validation based on provided lengths ---
+        # Ensure all defined sequence types have a length provided
+        missing_seq_lens = set(self.sequence_types.keys()) - set(self.sequence_lengths.keys())
+        if missing_seq_lens:
+            raise ValueError(f"Missing sequence_lengths entries for: {missing_seq_lens}")
 
-        # File caching and tracking
-        self.cache_size = cache_size
-        self.cache = OrderedDict()
-        self.valid_files = []
-        self.invalid_files = []
-        self.sequence_lengths = {}
-        
-        # Process files and build dataset
-        self._initialize_dataset()
-        
-        # Log initialization details
-        logger.info(f"Dataset initialized with {len(self.valid_files)} valid profiles")
-        logger.info(f"Input variables: {self.input_variables}")
-        logger.info(f"Target variables: {self.target_variables}")
-        
-        if self.global_variables:
-            logger.info(f"Global variables: {self.global_variables}")
-        
-        for seq_type, var_list in self.sequence_types.items():
-            seq_length = self.sequence_lengths.get(seq_type, 0)
-            logger.info(f"Sequence type '{seq_type}': {var_list} (length: {seq_length})")
+        # Ensure output_seq_type is valid and has a length
+        if self.output_seq_type not in self.sequence_lengths:
+            raise ValueError(f"output_seq_type '{self.output_seq_type}' not found in sequence_lengths keys")
+        self.target_length = self.sequence_lengths[self.output_seq_type]
+        # --- End Validation ---
 
-    def _validate_variable_assignments(self):
-        """Ensure all variables are assigned to a sequence type or global."""
-        # Collect all assigned variables
-        assigned_vars = set(self.global_variables)
-        for seq_vars in self.sequence_types.values():
-            assigned_vars.update(seq_vars)
-        
-        # Check for unassigned variables
-        unassigned_inputs = set(self.input_variables) - assigned_vars
-        if unassigned_inputs:
-            raise ValueError(f"Unassigned input variables: {unassigned_inputs}")
-        
-        unassigned_targets = set(self.target_variables) - assigned_vars
-        if unassigned_targets:
-            raise ValueError(f"Unassigned target variables: {unassigned_targets}")
+        # Find and validate profile files
+        all_files = sorted(self.data_folder.glob("*.json"))
+        candidate_files = [p for p in all_files if p.name != "normalization_metadata.json"]
+        if not candidate_files:
+            raise FileNotFoundError(f"No JSON profiles found in {self.data_folder}")
 
-    def _initialize_dataset(self):
-        """Process JSON files and build the dataset with strict validation."""
-        # Get all JSON files except metadata
-        json_files = [f for f in self.data_folder.glob("*.json") if f.name != "normalization_metadata.json"]
-        
-        if not json_files:
-            raise FileNotFoundError(f"No JSON files found in {self.data_folder}")
-
-        # First determine sequence lengths from first valid file
-        for file_path in json_files:
+        self.valid_files: List[Path] = []
+        invalid_count = 0
+        for fpath in candidate_files:
             try:
-                # Load profile
-                with open(file_path, "r") as f:
-                    profile = json.load(f)
-                
-                # Skip if profile doesn't have all required variables
-                if not set(self.all_variables).issubset(profile.keys()):
+                prof = self._load_json(fpath)
+                if prof is None: # Skip files that fail to load
+                    invalid_count += 1
                     continue
-                
-                # Get sequence lengths for each type
-                for seq_type, var_list in self.sequence_types.items():
-                    if not var_list:
-                        continue
-                    
-                    # Get length from first variable
-                    first_var = var_list[0]
-                    if not isinstance(profile[first_var], list):
-                        continue
-                        
-                    first_length = len(profile[first_var])
-                    self.sequence_lengths[seq_type] = first_length
-                    
-                    # Verify all variables in this type have the same length
-                    for var_name in var_list:
-                        if not isinstance(profile[var_name], list):
-                            continue
-                            
-                        if len(profile[var_name]) != first_length:
-                            raise ValueError(
-                                f"Inconsistent sequence lengths in {file_path.name}: "
-                                f"variable '{var_name}' has length {len(profile[var_name])}, "
-                                f"expected {first_length}"
-                            )
-                
-                # If we found sequence lengths, we can stop
-                if self.sequence_lengths:
-                    logger.info(f"Sequence lengths determined from {file_path.name}: {self.sequence_lengths}")
-                    break
-                    
+                self._validate_profile(prof, fpath.name) # Raises ValueError on failure
+                self.valid_files.append(fpath)
+            except ValueError as e:
+                logger.debug(f"Skipping invalid profile {fpath.name}: {e}")
+                invalid_count += 1
             except Exception as e:
-                logger.warning(f"Error analyzing {file_path.name}: {e}")
-                continue
-        
-        # Validate all files against determined sequence lengths
-        for file_path in json_files:
-            try:
-                # Load profile
-                try:
-                    with open(file_path, "r") as f:
-                        profile = json.load(f)
-                except Exception as e:
-                    self.invalid_files.append((file_path.name, f"Failed to load: {e}"))
-                    continue
-                
-                # Check if profile has all required variables
-                if not set(self.all_variables).issubset(profile.keys()):
-                    missing = set(self.all_variables) - set(profile.keys())
-                    self.invalid_files.append((file_path.name, f"Missing variables: {missing}"))
-                    continue
-                
-                # Validate all variables
-                valid = True
-                error_reason = ""
-                
-                for var in self.all_variables:
-                    val = profile[var]
-                    
-                    # Validate global variables
-                    if var in self.global_variables:
-                        if not isinstance(val, (int, float)):
-                            valid = False
-                            error_reason = f"Global variable '{var}' is not numeric"
-                            break
-                        if not torch.isfinite(torch.tensor(float(val))):
-                            valid = False
-                            error_reason = f"Global variable '{var}' is not finite"
-                            break
-                    
-                    # Validate sequence variables
-                    else:
-                        # Find which sequence type this variable belongs to
-                        for seq_type, var_list in self.sequence_types.items():
-                            if var in var_list:
-                                if not isinstance(val, list):
-                                    valid = False
-                                    error_reason = f"Sequence variable '{var}' is not a list"
-                                    break
-                                
-                                if not all(isinstance(x, (int, float)) for x in val):
-                                    valid = False
-                                    error_reason = f"Non-numeric values in '{var}'"
-                                    break
-                                
-                                if not all(torch.isfinite(torch.tensor(float(x))) for x in val):
-                                    valid = False
-                                    error_reason = f"Non-finite values in '{var}'"
-                                    break
-                                
-                                # Check sequence length if determined
-                                expected_length = self.sequence_lengths.get(seq_type)
-                                if expected_length is not None and len(val) != expected_length:
-                                    valid = False
-                                    error_reason = f"'{var}' has length {len(val)}, expected {expected_length}"
-                                    break
-                
-                if valid:
-                    self.valid_files.append(file_path)
-                else:
-                    self.invalid_files.append((file_path.name, error_reason))
-                    
-            except Exception as e:
-                self.invalid_files.append((file_path.name, f"Error: {str(e)}"))
-        
+                 logger.error(f"Unexpected error processing {fpath.name}: {e}", exc_info=True)
+                 invalid_count +=1
+
+
         if not self.valid_files:
-            if self.invalid_files:
-                # Log some examples of why files were rejected
-                examples = self.invalid_files[:5]
-                error_msg = "\n".join([f"  - {name}: {reason}" for name, reason in examples])
-                raise ValueError(f"No valid profiles found. Examples of rejected files:\n{error_msg}")
-            else:
-                raise ValueError(f"No valid profiles found in {self.data_folder}")
-        
-        logger.info(f"Found {len(self.valid_files)} valid profiles and {len(self.invalid_files)} invalid profiles")
+            raise ValueError("No valid profiles found after validation")
 
-    def __len__(self):
-        """Return the number of valid profiles."""
+        logger.info(f"Loaded {len(self.valid_files)} valid profiles "
+                    f"(skipped {invalid_count} invalid/mismatched) from {self.data_folder}")
+        logger.info(f"Strict lengths required: {self.sequence_lengths} (Targets match '{self.output_seq_type}')")
+
+
+        # Simple LRU cache
+        self.cache_size = max(1, cache_size)
+        self._cache: OrderedDict[int, Tuple[Dict[str, Tensor], Tensor]] = OrderedDict()
+
+
+    def _load_json(self, path: Path) -> Optional[Dict]:
+        """Loads a single JSON file, returning None on error."""
+        try:
+            return json.loads(path.read_text())
+        except Exception as e:
+            logger.warning(f"Failed to load JSON {path.name}: {e}")
+            return None
+
+    def _validate_profile(self, prof: Dict, name: str) -> None:
+        """Ensure profile matches required keys and exact lengths."""
+        # Check global scalars
+        for gv in self.global_variables:
+            if gv not in prof or not isinstance(prof[gv], (int, float)):
+                raise ValueError(f"Global var '{gv}' missing or not scalar")
+
+        # Check each sequence type
+        for seq_key, vars_list in self.sequence_types.items():
+            expected_len = self.sequence_lengths[seq_key]
+            for var in vars_list:
+                val = prof.get(var)
+                if not isinstance(val, list):
+                    raise ValueError(f"Sequence var '{var}' not list in '{seq_key}'")
+                if len(val) != expected_len:
+                    raise ValueError(
+                        f"Sequence '{seq_key}' var '{var}' length {len(val)} "
+                        f"!= expected {expected_len}"
+                    )
+
+        # Check targets match the specified target_length
+        for tv in self.target_variables:
+            val = prof.get(tv)
+            if not isinstance(val, list):
+                raise ValueError(f"Target var '{tv}' not list")
+            if len(val) != self.target_length:
+                raise ValueError(
+                    f"Target '{tv}' length {len(val)} != expected {self.target_length} "
+                    f"(from output_seq_type '{self.output_seq_type}')"
+                )
+
+    def __len__(self) -> int:
         return len(self.valid_files)
 
-    def __getitem__(self, idx):
-        """Return inputs and targets for the given profile index."""
-        # Check cache first
-        if idx in self.cache:
-            self.cache.move_to_end(idx)
-            return self.cache[idx]
-            
-        # Validate index
-        if idx < 0 or idx >= len(self.valid_files):
-            raise IndexError(f"Index {idx} out of range")
-            
-        file_path = self.valid_files[idx]
-        
-        # Load profile
-        with open(file_path, "r") as f:
-            profile = json.load(f)
-        
-        # Process global features
-        inputs = {}
+    def __getitem__(self, idx: int) -> Tuple[Dict[str, Tensor], Tensor]:
+        # Return from cache if available
+        if idx in self._cache:
+            # Move to end for LRU
+            self._cache.move_to_end(idx)
+            return self._cache[idx]
+
+        if not 0 <= idx < len(self.valid_files):
+             raise IndexError("Dataset index out of range")
+
+        fpath = self.valid_files[idx]
+        prof = self._load_json(fpath)
+        if prof is None:
+            # Should not happen after initial validation, but handle defensively
+            raise RuntimeError(f"Failed to load previously validated file: {fpath.name}")
+
+
+        # Build inputs dictionary
+        inputs: Dict[str, Tensor] = {}
+
+        # Global features tensor [num_globals]
         if self.global_variables:
-            global_features = torch.tensor(
-                [float(profile[var]) for var in self.global_variables], 
-                dtype=torch.float32
-            )
-            inputs["global"] = global_features
-        
-        # Process each sequence type
-        for seq_type, var_list in self.sequence_types.items():
-            if not var_list:
-                continue
-                
-            # Create tensor for each variable in this sequence type
-            seq_tensors = []
-            for var_name in var_list:
-                tensor = torch.tensor(profile[var_name], dtype=torch.float32)
-                seq_tensors.append(tensor)
-            
-            # Stack tensors (seq_length, num_variables)
-            inputs[seq_type] = torch.stack(seq_tensors, dim=1)
-        
-        # Process target variables
-        target_tensors = []
-        for var_name in self.target_variables:
-            val = profile[var_name]
-            
-            # Handle both scalar and sequence targets
-            if isinstance(val, list):
-                tensor = torch.tensor(val, dtype=torch.float32)
-            else:
-                tensor = torch.tensor([float(val)], dtype=torch.float32)
-                
-            target_tensors.append(tensor)
-        
-        # Stack target tensors
-        targets = torch.stack(target_tensors, dim=1)
-        
-        # Cache result
-        result = (inputs, targets)
-        self.cache[idx] = result
-        
-        # Manage cache size
-        if len(self.cache) > self.cache_size:
-            self.cache.popitem(last=False)
-        
-        return result
+            gv_vals = [float(prof[v]) for v in self.global_variables]
+            inputs['global'] = torch.tensor(gv_vals, dtype=torch.float32)
 
-    def clear_cache(self):
-        """Clear the file cache."""
-        self.cache.clear()
+        # Sequence features: each [seq_len, num_vars_in_seq]
+        for seq_key, vars_list in self.sequence_types.items():
+            # Stack each variable's list into a column tensor
+            cols = [torch.tensor(prof[v], dtype=torch.float32) for v in vars_list]
+            # cols is list of [seq_len], stack to [seq_len, num_vars_in_seq]
+            inputs[seq_key] = torch.stack(cols, dim=1)
 
-    def get_invalid_files(self):
-        """Return list of invalid files with reasons."""
-        return self.invalid_files
+        # Targets: [tgt_len, num_targets]
+        tgt_cols = [
+            torch.tensor(prof[tv], dtype=torch.float32)
+            for tv in self.target_variables
+        ]
+        targets = torch.stack(tgt_cols, dim=1)
+
+        # Cache and maybe evict oldest
+        self._cache[idx] = (inputs, targets)
+        if len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False) # pop oldest
+
+        return inputs, targets
 
 
-class MultiSourceCollate:
-    """Collates samples with separate handling for different data types."""
-    
-    def __call__(self, batch):
-        """Collate a batch of samples into structured batch data."""
+class StrictCollate:
+    """
+    Pickle‑able collate for strict‑length multi‑source batches.
+    Stacks each key along a new 0th (batch) dimension.
+    """
+    def __call__(
+        self, batch: List[Tuple[Dict[str, Tensor], Tensor]]
+    ) -> Tuple[Dict[str, Tensor], Tensor]:
         if not batch:
-            return {}, torch.tensor([])
-            
-        # Initialize containers
-        inputs_by_type = {}
-        targets_list = []
-        
-        # Collect inputs by type and targets
-        for inputs, targets in batch:
-            # Process inputs
-            for key, value in inputs.items():
-                if key not in inputs_by_type:
-                    inputs_by_type[key] = []
-                inputs_by_type[key].append(value)
-            
-            # Process targets
-            targets_list.append(targets)
-        
-        # Collate inputs by type
-        collated_inputs = {}
-        
-        # Process global features - simple stack
-        if "global" in inputs_by_type:
-            collated_inputs["global"] = torch.stack(inputs_by_type["global"])
-        
-        # Process sequence types - stack along batch dimension
-        for seq_type, tensors in inputs_by_type.items():
-            if seq_type == "global":
-                continue
-                
-            # Verify all sequences have same length
-            seq_lengths = [t.size(0) for t in tensors]
-            if not all(length == seq_lengths[0] for length in seq_lengths):
-                raise ValueError(f"Inconsistent sequence lengths in batch for {seq_type}")
-                
-            collated_inputs[seq_type] = torch.stack(tensors)
-        
-        # Collate targets
-        if targets_list:
-            # Verify all target sequences have same length
-            target_lengths = [t.size(0) for t in targets_list]
-            if not all(length == target_lengths[0] for length in target_lengths):
-                raise ValueError(f"Inconsistent target lengths in batch")
-                
-            collated_targets = torch.stack(targets_list)
-        else:
-            collated_targets = torch.tensor([])
-        
-        return collated_inputs, collated_targets
+            return {}, torch.empty(0)
+
+        # Assumes all items in batch have the same dict keys for inputs
+        # and consistent tensor shapes (guaranteed by AtmosphericDataset)
+        batched_inputs: Dict[str, List[Tensor]] = {}
+        batched_targets: List[Tensor] = []
+
+        # Gather tensors for each key
+        for inp_dict, tgt_tensor in batch:
+            for key, tensor in inp_dict.items():
+                batched_inputs.setdefault(key, []).append(tensor)
+            batched_targets.append(tgt_tensor)
+
+        # Stack tensors along new batch dimension (dim=0)
+        final_inputs = {key: torch.stack(tensors) for key, tensors in batched_inputs.items()}
+        final_targets = torch.stack(batched_targets)
+
+        return final_inputs, final_targets
 
 
-def create_dataloader(dataset, batch_size, shuffle=True, num_workers=None,
-                      pin_memory=None, drop_last=False, persistent_workers=None, 
-                      collate_fn=None):
-    """Create an optimized DataLoader for the atmospheric dataset."""
-    if len(dataset) == 0:
-        raise ValueError("Dataset is empty")
-    
-    # Get hardware-specific dataloader settings
-    hardware_settings = configure_dataloader_settings()
-    
-    # Use provided values or fall back to hardware-specific defaults
-    if num_workers is None:
-        num_workers = hardware_settings["num_workers"]
-    if pin_memory is None:
-        pin_memory = hardware_settings["pin_memory"]
-    if persistent_workers is None:
-        persistent_workers = hardware_settings["persistent_workers"] and num_workers > 0
-        
-    # If no collate function provided, use MultiSourceCollate
-    if collate_fn is None:
-        collate_fn = MultiSourceCollate()
-            
-    logger.info(f"Creating DataLoader with batch_size={batch_size}, num_workers={num_workers}")
-    
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=2 if num_workers > 0 else None,
-        drop_last=drop_last,
-        collate_fn=collate_fn
-    )
+def create_multi_source_collate_fn() -> StrictCollate:
+    """
+    Factory returning a StrictCollate instance (needed for pickling).
+    """
+    return StrictCollate()
+
+
+__all__ = [
+    "AtmosphericDataset",
+    "StrictCollate",
+    "create_multi_source_collate_fn",
+]
