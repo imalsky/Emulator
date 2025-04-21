@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-main.py — Streamlined entry-point for the atmospheric profile prediction pipeline.
+main.py — Command-line entry point for pipeline.
 
-Handles command-line arguments, configuration loading/validation, and orchestrates
-the normalization, training, and hyperparameter tuning processes.
+Handles command-line arguments, configuration loading/validation, and
+orchestrates the normalization, training, and hyperparameter tuning processes
+via helper functions.
 """
+
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Tuple, Dict, Any, Optional # Added Optional
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
-import numpy as np # Needed for seeding
+from optuna.exceptions import TrialPruned
 
 # Import necessary components from other modules
 from hardware import setup_device
@@ -24,65 +26,91 @@ from train import ModelTrainer
 from hyperparams import run_hyperparameter_search
 from utils import (
     ensure_dirs,
-    load_config,
+    load_config,  # Handles internal validation
     setup_logging,
-    validate_config, # Use the strict validation
-    save_json,       # For saving tuning results
-    seed_everything # For reproducibility
+    save_json,  # For saving tuning results
+    seed_everything,  # For reproducibility
 )
-
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Helper Functions (Orchestration Logic)
-# -----------------------------------------------------------------------------
+# =============================================================================
 
-def _normalize(cfg: dict, data_root: Path) -> bool:
-    """Run data normalization; returns True on success."""
+
+def _normalize(cfg: Dict[str, Any], data_root: Path) -> bool:
+    """
+    Runs the data normalization process using DataNormalizer.
+
+    Args:
+        cfg: The main configuration dictionary.
+        data_root: The base data directory path.
+
+    Returns:
+        True if normalization completes successfully, False otherwise.
+    """
     raw_dir = data_root / "profiles"
     out_dir = data_root / "normalized_profiles"
+    ensure_dirs(raw_dir, out_dir)
 
     try:
-        logger.info("Normalising %s → %s", raw_dir, out_dir)
-        # Pass normalization sub-config or empty dict
+        logger.info(
+            "Starting normalization: profiles from %s to %s",
+            raw_dir.name,
+            out_dir.name,
+        )
         norm_cfg = cfg.get("normalization", {})
         normalizer = DataNormalizer(raw_dir, out_dir)
+
         stats = normalizer.calculate_global_stats(
             key_methods=norm_cfg.get("key_methods"),
-            default_method=norm_cfg.get("default_method", "standard"), # Match default in config if exists
-            clip_outliers_before_scaling=norm_cfg.get("clip_outliers_before_scaling", False),
+            default_method=norm_cfg.get("default_method", "standard"),
+            clip_outliers_before_scaling=norm_cfg.get(
+                "clip_outliers_before_scaling", False
+            ),
             symlog_percentile=norm_cfg.get("symlog_percentile", 0.5),
-            symlog_thresholds=norm_cfg.get("symlog_thresholds")
+            symlog_thresholds=norm_cfg.get("symlog_thresholds"),
         )
-        if not stats:
-             raise RuntimeError("Normalization statistics calculation failed.")
+
+        if stats is None:
+            raise RuntimeError("Normalization statistics calculation failed.")
+
         normalizer.process_profiles(stats)
-        logger.info("Normalisation finished successfully.")
+        logger.info("Normalization finished successfully.")
         return True
+
     except Exception as e:
-        logger.exception("Normalisation failed: %s", e)
+        logger.exception("Normalization failed: %s", e)
         return False
 
 
-def _setup_dataset(config: dict, data_dir: Path) -> Optional[Tuple[AtmosphericDataset, Callable]]:
+def _setup_dataset(
+    config: Dict[str, Any], data_dir: Path
+) -> Optional[Tuple[AtmosphericDataset, Callable]]:
     """
-    Initialize the dataset using parameters from config.
-    Returns (dataset, collate_fn) tuple or (None, None) on failure.
-    """
-    try:
-        logger.info("Initializing dataset (strict lengths from config)...")
-        norm_dir = data_dir / "normalized_profiles"
-        if not norm_dir.exists():
-             logger.error(f"Normalized data directory not found: {norm_dir}")
-             logger.error("Please run with --normalize first.")
-             return None, None
+    Initializes the AtmosphericDataset using parameters from the configuration.
 
-        # --- Crucial validation moved to utils.validate_config ---
-        # Ensure required keys for dataset exist (checked by validate_config)
+    Performs strict length validation based on `sequence_lengths` in the config.
+
+    Args:
+        config: The main configuration dictionary.
+        data_dir: The base data directory path.
+
+    Returns:
+        A tuple (dataset, collate_fn) on success, or None on failure. Returns
+        None if the dataset setup fails.
+    """
+    logger.info("Initializing dataset (strict lengths from config)...")
+    norm_dir = data_dir / "normalized_profiles"
+    if not norm_dir.exists():
+        logger.error("Normalized data directory not found: %s", norm_dir)
+        logger.error("Please run with --normalize first.")
+        return None
+
+    try:
         sequence_lengths = config["sequence_lengths"]
         output_seq_type = config["output_seq_type"]
-        # ---
 
         ds = AtmosphericDataset(
             data_folder=str(norm_dir),
@@ -90,168 +118,269 @@ def _setup_dataset(config: dict, data_dir: Path) -> Optional[Tuple[AtmosphericDa
             target_variables=config["target_variables"],
             global_variables=config.get("global_variables", []),
             sequence_types=config["sequence_types"],
-            sequence_lengths=sequence_lengths, # Pass dict from config
-            output_seq_type=output_seq_type, # Pass key from config
-            cache_size=config.get("dataset_cache_size", 1024) # Optional cache size
+            sequence_lengths=sequence_lengths,
+            output_seq_type=output_seq_type,
+            cache_size=config.get("dataset_cache_size", 1024),
         )
+
         logger.info("Dataset loaded: %d profiles.", len(ds))
         collate_fn = create_multi_source_collate_fn()
         return ds, collate_fn
-    except KeyError as e:
-         logger.error(f"Dataset setup failed: Missing required configuration key: {e}")
-         return None, None
+
+    except (KeyError, ValueError, FileNotFoundError) as e:
+        logger.error("Dataset setup failed: %s", e)
+        return None
     except Exception as e:
-        logger.exception("Dataset setup failed: %s", e)
-        return None, None
+        logger.exception(
+            "Dataset setup failed with an unexpected error: %s", e
+        )
+        return None
 
 
-def _train(cfg: dict, data_dir: Path) -> bool:
-    """Run model training; returns True on success."""
-    logger.info("Starting model training...")
-    device = setup_device()
-    seed_everything(cfg.get("random_seed", 42)) # Seed before dataset/model init
+def train_model(
+    config: Dict[str, Any],
+    device: torch.device,
+    dataset: AtmosphericDataset,
+    collate_fn: Callable,
+    save_dir: Path,
+) -> float:
+    """
+    Initializes and runs the ModelTrainer for a single training run.
 
-    dataset, collate_fn = _setup_dataset(cfg, data_dir)
-    if dataset is None:
-        return False # Error logged in _setup_dataset
+    Args:
+        config: The configuration dictionary for this run.
+        device: The torch device to train on.
+        dataset: The initialized dataset instance.
+        collate_fn: The collate function for the DataLoader.
+        save_dir: The directory to save model artifacts (checkpoints, logs).
+
+    Returns:
+        The best validation loss achieved during training (float). Returns
+        float('inf') on failure.
+
+    Raises:
+        RuntimeError: If training encounters an unrecoverable error.
+    """
+    logger.info("Starting model training run...")
+    ensure_dirs(save_dir)
 
     try:
         trainer = ModelTrainer(
-            config=cfg,
+            config=config,
             device=device,
-            save_dir=data_dir / "model",
+            save_dir=save_dir,
             dataset=dataset,
             collate_fn=collate_fn,
         )
-        # train() method now returns best validation loss
         best_loss = trainer.train()
-        logger.info("Training complete (Best Val Loss = %.4e)", best_loss)
-        # Save final metrics including best loss
-        save_json({"best_val_loss": best_loss}, data_dir / "model" / "metrics.json")
-        return True
+
+        if not isinstance(best_loss, float):
+            logger.error("Trainer did not return a float validation loss!")
+            return float("inf")
+
+        logger.info("Training run complete (Best Val Loss = %.4e)", best_loss)
+        return best_loss
+
     except Exception as e:
-         logger.exception("Model training failed: %s", e)
-         return False
+        logger.exception("Model training failed: %s", e)
+        raise RuntimeError(f"Training failed: {e}") from e
 
 
-def _tune(cfg: dict, data_dir: Path, num_trials: int) -> bool:
-    """Run hyperparameter tuning; returns True on success."""
+def _run_tuning(cfg: Dict[str, Any], data_dir: Path, num_trials: int) -> bool:
+    """
+    Runs hyperparameter tuning using Optuna.
+
+    Args:
+        cfg: The base configuration dictionary.
+        data_dir: The base data directory path.
+        num_trials: The number of trials to run.
+
+    Returns:
+        True if tuning completes and finds a best config, False otherwise.
+    """
     logger.info("Starting hyper-parameter search (%d trials)...", num_trials)
-    seed_everything(cfg.get("random_seed", 42)) # Seed for reproducibility in Optuna
+    seed_everything(cfg.get("random_seed", 42))
+
+    tuning_output_dir = data_dir / "tuning_results"
+    ensure_dirs(tuning_output_dir)
 
     try:
-        # This is the function Optuna will call for each trial's training run
-        # It needs to return the metric to minimize (best validation loss)
-        def _train_for_tuning(
-             trial_cfg: dict, device: torch.device, ds, collate, data_root: Path
+        def _train_objective_wrapper(
+            trial_cfg: Dict[str, Any],
+            device: torch.device,
+            ds: AtmosphericDataset,
+            collate: Callable,
+            data_root: Path,
         ) -> float:
-            # Use a temporary directory for trial artifacts to avoid conflicts
-            trial_save_dir = data_root / f"tuning_trial_{trial_cfg.get('optuna_trial_number', 0)}"
-            trainer = ModelTrainer(
-                config=trial_cfg,
-                device=device,
-                save_dir=trial_save_dir, # Save trial models separately
-                dataset=ds,
-                collate_fn=collate,
-            )
-            best_loss = trainer.train() # Returns best validation loss
-            # Clean up trial directory? Optional.
-            # import shutil
-            # shutil.rmtree(trial_save_dir, ignore_errors=True)
-            return best_loss
+            trial_num = trial_cfg.get("optuna_trial_number", "N/A")
+            trial_save_dir = data_root / "tuning_trials" / f"trial_{trial_num}"
+            try:
+                best_loss = train_model(
+                    config=trial_cfg,
+                    device=device,
+                    dataset=ds,
+                    collate_fn=collate,
+                    save_dir=trial_save_dir,
+                )
+                return best_loss
+            except Exception as trial_exc:
+                logger.error(
+                    f"Trial {trial_num} training function failed: {trial_exc}"
+                )
+                raise TrialPruned(f"Training failed: {trial_exc}") from trial_exc
 
-        # Run the search
-        best_config = run_hyperparameter_search(
+        best_config_found = run_hyperparameter_search(
             base_config=cfg,
             data_dir=str(data_dir),
-            output_dir=str(data_dir / "tuning_results"),
-            # Pass _setup_dataset directly
+            output_dir=str(tuning_output_dir),
             setup_dataset_func=_setup_dataset,
-            # Pass the wrapper function that returns the float metric
-            train_model_func=_train_for_tuning,
+            train_model_func=_train_objective_wrapper,
             setup_device_func=setup_device,
-            # Pass the save_json utility
             save_config_func=save_json,
             num_trials=num_trials,
         )
-        if best_config:
-            logger.info("Tuning finished. Best configuration saved.")
+
+        if best_config_found:
+            logger.info(
+                "Tuning finished. Best configuration saved in %s.",
+                tuning_output_dir,
+            )
             return True
         else:
-            logger.error("Tuning finished but no best configuration was determined (all trials may have failed).")
+            logger.error(
+                "Tuning finished but no best configuration was determined."
+            )
             return False
-    except Exception as e:
-         logger.exception("Hyperparameter tuning failed: %s", e)
-         return False
 
-# -----------------------------------------------------------------------------
+    except Exception as e:
+        logger.exception(
+            "Hyperparameter tuning failed unexpectedly: %s", e
+        )
+        return False
+
+
+# =============================================================================
 # Command-Line Interface Setup
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 
 def _parse_args() -> argparse.Namespace:
-    """Defines and parses command-line arguments."""
-    parser = argparse.ArgumentParser(description="Atmospheric profile prediction pipeline")
-    # Actions (mutually exclusive)
+    """Defines and parses command-line arguments for the pipeline."""
+    parser = argparse.ArgumentParser(
+        description="Atmospheric profile prediction pipeline"
+    )
+
     action_group = parser.add_mutually_exclusive_group(required=True)
-    action_group.add_argument("--normalize", action="store_true", help="Run data normalization only")
-    action_group.add_argument("--train", action="store_true", help="Train the model using config")
-    action_group.add_argument("--tune", action="store_true", help="Run hyper-parameter search (Optuna)")
+    action_group.add_argument(
+        "--normalize", action="store_true", help="Run data normalization only."
+    )
+    action_group.add_argument(
+        "--train",
+        action="store_true",
+        help="Train the model using the specified configuration.",
+    )
+    action_group.add_argument(
+        "--tune",
+        action="store_true",
+        help="Run hyper-parameter search using Optuna.",
+    )
 
-    # Common arguments
-    parser.add_argument("--config", type=Path, default=Path("inputs/model_input_params.jsonc"),
-                        help="Path to configuration file (JSON/JSONC)")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"),
-                        help="Base directory for data (profiles, normalized_profiles, model)")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("inputs/model_input_params.jsonc"),
+        help="Path to the config file (JSON or JSONC format).",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+        help="Base directory for data and model artifacts.",
+    )
 
-    # Tuning specific arguments
-    parser.add_argument("--trials", type=int, default=25,
-                        help="Number of trials for hyper-parameter tuning (used with --tune)")
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=25,
+        help="Number of trials for tuning (used with --tune).",
+    )
+
     return parser.parse_args()
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Main Execution Logic
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 
 def main() -> int:
-    """Parses arguments and runs the requested pipeline steps."""
-    args = _parse_args()
-    setup_logging() # Setup logging first
+    """
+    Parses command-line arguments and executes the requested pipeline steps.
 
-    # --- Load and Validate Configuration ---
-    logger.info(f"Loading configuration from: {args.config}")
+    Returns:
+        0 on success, 1 on failure.
+    """
+    args = _parse_args()
+    setup_logging()
+
+    logger.info("Loading configuration from: %s", args.config)
     config = load_config(args.config)
     if config is None:
-        # Error logged in load_config
-        return 1 # Exit code 1 for failure
-    logger.info("Validating configuration...")
-    if not validate_config(config):
-        # Error logged in validate_config
-        return 1 # Exit code 1 for failure
+        logger.error("Failed to load or validate configuration. Aborting.")
+        return 1
     logger.info("Configuration loaded and validated successfully.")
-    # --- End Config Handling ---
 
-    # Ensure base directories exist
     ensure_dirs(
         args.data_dir / "profiles",
         args.data_dir / "normalized_profiles",
         args.data_dir / "model",
-        args.data_dir / "tuning_results" # Also ensure tuning results dir
+        args.data_dir / "tuning_results",
     )
 
-    exit_code = 0 # Default to success
+    seed = config.get("random_seed", 42)
+    seed_everything(seed)
 
-    # --- Execute Actions ---
+    exit_code = 0
+    action_performed = False
+
     if args.normalize:
+        action_performed = True
         if not _normalize(config, args.data_dir):
-            exit_code = 1 # Normalization failed
-    elif args.train:
-        if not _train(config, args.data_dir):
-            exit_code = 1 # Training failed
-    elif args.tune:
-        if not _tune(config, args.data_dir, args.trials):
-             exit_code = 1 # Tuning failed
-    # --- End Actions ---
+            exit_code = 1
+            logger.error("Normalization step failed.")
+
+    if args.train and exit_code == 0:
+        action_performed = True
+        logger.info("--- Starting Training ---")
+        device = setup_device()
+        dataset_info = _setup_dataset(config, args.data_dir)
+        if dataset_info is None:
+            exit_code = 1
+            logger.error("Training step failed due to dataset setup error.")
+        else:
+            dataset, collate_fn = dataset_info
+            try:
+                train_model(
+                    config=config,
+                    device=device,
+                    dataset=dataset,
+                    collate_fn=collate_fn,
+                    save_dir=(args.data_dir / "model"),
+                )
+            except Exception:
+                exit_code = 1
+                logger.error("Training step failed.")
+
+    if args.tune and exit_code == 0:
+        action_performed = True
+        logger.info("--- Starting Hyperparameter Tuning ---")
+        if not _run_tuning(config, args.data_dir, args.trials):
+            exit_code = 1
+            logger.error("Tuning step failed.")
+
+    if not action_performed:
+        logger.error("No action (--normalize, --train, --tune) was performed.")
+        exit_code = 1
 
     if exit_code == 0:
         logger.info("Pipeline finished successfully.")
@@ -262,14 +391,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    # Set matmul precision (useful for TF32 on Ampere GPUs)
-    # torch.set_float32_matmul_precision("medium") # Or 'high'
     try:
-        sys.exit(main())
+        exit_status = main()
+        sys.exit(exit_status)
     except KeyboardInterrupt:
         logger.warning("Execution interrupted by user (Ctrl+C).")
-        sys.exit(130) # Standard exit code for Ctrl+C
+        sys.exit(130)
     except Exception as e:
-         # Catch any unexpected errors at the top level
-         logger.exception("An unexpected error occurred: %s", e)
-         sys.exit(1) # General error exit code
+        logger.exception("An unexpected error occurred at the top level: %s", e)
+        sys.exit(1)

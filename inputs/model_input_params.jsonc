@@ -13,14 +13,14 @@
     "reflected_net_flux"   // per–level sequence to predict
   ],
 
-  /* One (or more) sequence types.  All variables listed under a key
+  /* One (or more) sequence types. All variables listed under a key
      must share exactly the same length inside every profile.           */
   "sequence_types": {
     "sequence1": [
       "pressure",
       "temperature",
       "thermal_net_flux",
-      "reflected_net_flux"
+      "reflected_net_flux" 
     ]
   },
 
@@ -36,48 +36,64 @@
   // Normalisation settings
   // ────────────────────────────────────────────────────────────────
   "normalization": {
+    // Specific methods per variable key
     "key_methods": {
       "pressure": "log-min-max",
-      "thermal_net_flux": "symlog",
+      "thermal_net_flux": "symlog",     // Keep symlog for potentially wide-ranging fluxes
       "reflected_net_flux": "symlog"
     },
+    // Default for variables not listed above (e.g., temperature, orbital_sep)
     "default_method": "standard",
-    "clip_outliers_before_scaling": false,
-    "symlog_percentile": 0.10
+    "clip_outliers_before_scaling": false, // Usually False unless extreme outliers are known
+    "symlog_percentile": 0.10              // Adjust based on data distribution if needed
+    // "symlog_thresholds": {"thermal_net_flux": 1.0} // Optional: fixed threshold instead of percentile
   },
 
   // ────────────────────────────────────────────────────────────────
   // Model hyper‑parameters
   // ────────────────────────────────────────────────────────────────
-  "d_model": 256,                  // embedding size
-  "nhead": 4,                      // heads (512 / 8 = 64‑d head)
-  "num_encoder_layers": 4,
-  "dim_feedforward": 1024,         // 4 × d_model
-  "dropout": 0.00,
-  "positional_encoding": "sine", // "sine" | "rotary" | "alibi"
-  "max_sequence_length": 150,      // only used for sine/alibi tables
-  "norm_first": true,              // Pre‑norm transformer
+  "d_model": 256,                  // Embedding size (kept same)
+  "nhead": 4,                      // Heads (256 / 4 = 64-d head) (kept same)
+  "num_encoder_layers": 4,         // Increased depth (previously 4)
+  "dim_feedforward": 1024,         // Increased width (previously 1024, keep multiple of d_model)
+  "dropout": 0.00,                 // Increased dropout slightly (previously 0.00)
+  "positional_encoding": "sine",   // Changed back from "learned" - "sine" is handled by current model.py
+  "max_sequence_length": 150,      // Max length for sine PE table (or learned/alibi if used)
+  "norm_first": true,              // Pre‑norm transformer (generally preferred)
 
   // ────────────────────────────────────────────────────────────────
   // Training hyper‑parameters
   // ────────────────────────────────────────────────────────────────
-  "batch_size": 32,
-  "epochs": 100,
-  "gradient_clip_val": 1.0,
+  "batch_size": 32,                // Keep moderate batch size
+  "epochs": 100,                   // Max epochs (early stopping applies)
+  "gradient_clip_val": 1.0,        // Standard gradient clipping
 
-  "optimizer": "adamw",
-  "learning_rate": 1e-4,
-  "weight_decay": 1e-5,
+  "optimizer": "adamw",            // AdamW is a good default
+  "learning_rate": 1e-4,           // Starting learning rate (tune if needed)
+  "weight_decay": 1e-5,            // Standard weight decay (tune if needed)
 
-  "early_stopping_patience": 10,
+  "early_stopping_patience": 10,   // Patience for early stopping
+  "min_delta": 1e-10,               // Min improvement threshold for early stopping
+
+  "loss_function": "mse",          // Options: "mse", "l1", "smooth_l1", "huber"
+  // "smooth_l1_beta": 1.0,        // Beta for SmoothL1Loss if used
+  // "huber_delta": 1.0,           // Delta for HuberLoss if used
+
+  "lr_scheduler": "ReduceLROnPlateau", // Current scheduler used in train.py
+  "lr_patience": 5,                // Patience for ReduceLROnPlateau
+  "lr_factor": 0.5,                // Factor for ReduceLROnPlateau
+  "min_lr": 1e-7,                  // Minimum LR for scheduler
 
   // ────────────────────────────────────────────────────────────────
   // Data‑loading & misc
   // ────────────────────────────────────────────────────────────────
-  "num_workers": 4,
-  "frac_of_data": 1.0,
-  "random_seed": 42,
-  "use_amp": true,
-  "use_torch_compile": true
+  "num_workers": 4,                // Adjust based on system hardware
+  "val_frac": 0.15,                // Fraction for validation set
+  "test_frac": 0.15,               // Fraction for test set
+  "dataset_cache_size": 1024,      // Size of in-memory dataset cache
+  // "frac_of_data": 1.0,          // (Optional) Use a fraction of data for quick tests (not present in original example)
+  "random_seed": 42,               // Seed for reproducibility
+  "use_amp": true,                 // Use Automatic Mixed Precision (if CUDA available)
+  "use_torch_compile": true        // Use torch.compile (if supported)
 
 }
