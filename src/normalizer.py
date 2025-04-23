@@ -4,7 +4,7 @@
 Supported methods (case-insensitive):
 --------------------------------------------------------------
 * `iqr`                 – median / IQR scaling -> R.
-* `log-min-max`         – log10 -> min-max to [0, 1].
+* `log-min-max`         – log10 -> min-max to [0, 1]. **Requires strictly positive data.**
 * `arctan-compression`  – arctan -pi maps to pi -> [-1, 1].
 * `max-out`             – divide by global |max|  -> [-1, 1].
 * `invlogit-compression`– sigmoid -> [-1, 1].
@@ -26,6 +26,14 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import torch
 from torch import Tensor
+
+# Assuming utils.py is available for save_json
+try:
+    from utils import save_json
+except ImportError:
+    logger = logging.getLogger(__name__)
+    logger.warning("Could not import save_json from utils, saving metadata with standard json.")
+    save_json = None # Define a fallback or handle absence
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +83,9 @@ class DataNormalizer:
             input_folder: Path to directory with raw JSON profiles.
             output_folder: Path to directory where normalized profiles and metadata will be saved.
             batch_size: Number of files to process per batch when calculating stats.
+
+        Raises:
+            FileNotFoundError: If the input folder does not exist.
         """
         self.input_dir = Path(input_folder)
         self.output_dir = Path(output_folder)
@@ -125,6 +136,12 @@ class DataNormalizer:
 
         Returns:
             Dictionary containing computed statistics and metadata.
+
+        Raises:
+            FileNotFoundError: If no JSON profiles are found in the input directory.
+            ValueError: If an invalid normalization method is specified, or if 'log-min-max'
+                        is applied to non-positive data.
+            RuntimeError: If statistics calculation fails for other reasons.
         """
         logger.info("Calculating global normalization statistics...")
         files = [
@@ -146,7 +163,8 @@ class DataNormalizer:
             batch_files = files[i * self.batch_size : (i + 1) * self.batch_size]
             for fpath in batch_files:
                 try:
-                    prof = json.loads(fpath.read_text(encoding='utf-8'))
+                    # Use utf-8-sig to handle potential BOM (Byte Order Mark)
+                    prof = json.loads(fpath.read_text(encoding='utf-8-sig'))
                     processed_files += 1
                     for k, v in prof.items():
                         if v is None or (
@@ -173,9 +191,12 @@ class DataNormalizer:
                                 value_buffer.setdefault(k, []).append(
                                     torch.tensor(valid_vals, dtype=torch.float32)
                                 )
+                except json.JSONDecodeError as e:
+                     logger.error(f"JSON decode error in file {fpath.name}: {e}. Stopping normalization.")
+                     raise RuntimeError(f"Failed to decode JSON in {fpath.name}") from e
                 except Exception as e:
                     logger.warning(f"Could not process file {fpath.name}: {e}")
-                    continue
+                    continue # Allow skipping minor processing errors, but decode errors are fatal
 
         logger.info(f"Scanned {processed_files} profiles to gather statistics.")
 
@@ -218,7 +239,6 @@ class DataNormalizer:
                 continue
 
             if clip_outliers_before_scaling:
-                # Use static method call
                 full_vector = DataNormalizer.clip_outliers(full_vector)
 
             method_to_use = final_methods[key]
@@ -230,18 +250,24 @@ class DataNormalizer:
                 final_methods[key] = method_to_use
 
             try:
-                stats[key] = self._compute_stats_for_key(
+                # Compute stats, potentially raising ValueError for log-min-max
+                key_stats = self._compute_stats_for_key(
                     full_vector,
                     method_to_use,
                     symlog_percentile,
                     (symlog_thresholds or {}).get(key),
                 )
+                stats[key] = key_stats
                 computed_keys += 1
+            except ValueError as ve:
+                # Specifically catch ValueErrors from _compute_stats_for_key (e.g., log-min-max)
+                logger.error(f"Stats calculation failed for key '{key}' with method '{method_to_use}': {ve}")
+                raise # Re-raise to stop the normalization process
             except Exception as e:
                 logger.error(
-                    f"Failed to compute stats for key '{key}' using method '{method_to_use}': {e}"
+                    f"Unexpected error computing stats for key '{key}' using method '{method_to_use}': {e}"
                 )
-                # Set method to 'none' if stats fail, instead of removing key
+                # Set method to 'none' if stats fail for other reasons, but log-min-max error is fatal
                 final_methods[key] = "none"
                 stats[key] = {} # Add empty stats dict for consistency
 
@@ -262,19 +288,22 @@ class DataNormalizer:
 
         meta_path = self.output_dir / "normalization_metadata.json"
         try:
-            from utils import save_json
+            if save_json:
+                 save_success = save_json(metadata, meta_path)
+                 if not save_success:
+                     logger.error("Failed to save normalization metadata using utils.save_json.")
+                     # Optionally raise an error here if saving metadata is critical
+            else:
+                 # Fallback to standard json saving
+                 meta_path.write_text(json.dumps(metadata, indent=2))
+                 logger.info("Saved normalization metadata using standard json.")
 
-            save_json(metadata, meta_path)
             logger.info(
                 f"Saved normalization metadata ({computed_keys} numeric keys) to {meta_path}"
             )
-        except ImportError:
-            logger.warning(
-                "Could not import save_json from utils, saving with standard json."
-            )
-            meta_path.write_text(json.dumps(metadata, indent=2))
         except Exception as e:
             logger.error(f"Failed to save normalization metadata: {e}")
+            # Optionally raise an error here
 
         return metadata
 
@@ -285,7 +314,12 @@ class DataNormalizer:
         symlog_percentile: float = 0.5,
         symlog_threshold: Optional[float] = None,
     ) -> Dict[str, float]:
-        """Computes statistics needed for a specific normalization method."""
+        """
+        Computes statistics needed for a specific normalization method.
+
+        Raises:
+            ValueError: If data is empty, or if 'log-min-max' is applied to non-positive data.
+        """
         if data.numel() == 0:
             raise ValueError("Cannot compute statistics on empty tensor.")
 
@@ -314,16 +348,16 @@ class DataNormalizer:
                 }
             )
         elif method_lower == "log-min-max":
-            offset = 0.0
+            # --- Strict Positive Check ---
             if global_min <= 0:
-                offset = abs(global_min) + epsilon
-                logger.debug(
-                    f"log-min-max requires positive values, adding offset: {offset:.2e} for key"
+                raise ValueError(
+                    f"Method 'log-min-max' requires strictly positive data, but found minimum value: {global_min:.4e}. "
+                    f"Consider using 'symlog' or check the data source."
                 )
-            shifted_data = data + offset
-            log_vals = torch.log10(torch.clamp(shifted_data, min=epsilon))
+            # --- Removed Offset Logic ---
+            log_vals = torch.log10(data) # No clamp needed due to check above
             log_min, log_max = float(log_vals.min()), float(log_vals.max())
-            stats.update({"min": log_min, "max": log_max, "offset": offset})
+            stats.update({"min": log_min, "max": log_max}) # Removed offset from stats
         elif method_lower == "arctan-compression":
             center = (
                 0.0
@@ -393,7 +427,8 @@ class DataNormalizer:
             std = max(float(data.std()), epsilon)
             # Calculate scale factor based on z-scores' max absolute deviation
             z_scores = (data - mean) / std if not is_constant else torch.zeros_like(data)
-            scale_factor = float(torch.max(torch.abs(z_scores))) if not is_constant else 1.0
+            # Use 3-sigma range for scaling unless max deviation is larger
+            scale_factor = max(3.0, float(torch.max(torch.abs(z_scores)))) if not is_constant else 1.0
             stats.update(
                 {"mean": mean, "std": std, "scale_factor": max(scale_factor, epsilon)} # Ensure scale factor > 0
             )
@@ -422,8 +457,9 @@ class DataNormalizer:
         if method_lower == "iqr":
             normed = (x - stats["median"]) / stats["iqr"]
         elif method_lower == "log-min-max":
-            x_shifted = x + stats.get("offset", 0.0)
-            log_x = torch.log10(torch.clamp(x_shifted, min=epsilon))
+            # --- Removed Offset Logic ---
+            # Assumes x is already positive due to check in _compute_stats_for_key
+            log_x = torch.log10(x)
             denom = max(stats["max"] - stats["min"], epsilon)
             normed = torch.clamp((log_x - stats["min"]) / denom, 0.0, 1.0)
         elif method_lower == "arctan-compression":
@@ -433,7 +469,10 @@ class DataNormalizer:
         elif method_lower == "max-out":
             normed = x / stats["max_val"]
         elif method_lower == "invlogit-compression":
-            normed = 2 * torch.sigmoid((x - stats["mean"]) / stats["std"]) - 1
+            # Normalize: z = (x - mean) / std
+            z = (x - stats["mean"]) / stats["std"]
+            # Apply sigmoid: 2 * sigmoid(z) - 1
+            normed = 2 * torch.sigmoid(z) - 1
         elif method_lower == "custom":
             pos = torch.log10(torch.clamp(x, min=0) + 1 + epsilon)
             neg = -torch.log10(torch.clamp(-x, min=0) + 1 + epsilon)
@@ -519,7 +558,8 @@ class DataNormalizer:
         elif method == "log-min-max":
             # Note: Clamping in normalize limits the range, inverse might not reach original min/max
             log_val = x * (stats["max"] - stats["min"]) + stats["min"]
-            denormed = torch.pow(10, log_val) - stats.get("offset", 0.0)
+            # --- Removed Offset Logic ---
+            denormed = torch.pow(10, log_val)
         elif method == "arctan-compression":
             safe_x = torch.clamp(x, -0.999999, 0.999999)
             denormed = stats["center"] + (
@@ -528,12 +568,14 @@ class DataNormalizer:
         elif method == "max-out":
             denormed = x * stats["max_val"]
         elif method == "invlogit-compression":
-            # *** CORRECTED INVERSE LOGIC ***
-            safe_x = torch.clamp(x, -0.999999, 0.999999)
+            # --- CORRECTED INVERSE LOGIC ---
+            # Input x is in range [-1, 1] (approx)
+            # 1. Inverse the sigmoid scaling: p = (x + 1) / 2
+            safe_x = torch.clamp(x, -0.999999, 0.999999) # Ensure x is in valid range for p
             p = (safe_x + 1) / 2.0
-            # Calculate logit = log(p / (1-p))
+            # 2. Calculate the inverse sigmoid (logit): logit_p = log(p / (1-p))
             logit_p = torch.log(p / torch.clamp(1 - p, min=epsilon))
-            # Apply mean/std scaling AFTER logit
+            # 3. Inverse the z-score scaling: original = mean + std * logit_p
             denormed = stats["mean"] + stats["std"] * logit_p
         elif method == "custom":
             y = x * stats["m"]
@@ -549,7 +591,7 @@ class DataNormalizer:
             denormed = torch.zeros_like(x)
             denormed[linear] = unscaled[linear] * thr
             safe_exponent = torch.clamp(
-                torch.abs(unscaled[logarithmic]) - 1, min=-50, max=50
+                torch.abs(unscaled[logarithmic]) - 1, min=-50, max=50 # Avoid extreme exponents
             )
             denormed[logarithmic] = (
                 torch.sign(unscaled[logarithmic])
@@ -557,10 +599,12 @@ class DataNormalizer:
                 * torch.pow(10, safe_exponent)
             )
         elif method == "standard":
-            # *** CORRECTED INVERSE LOGIC ***
-            # Multiply by scale_factor and std, then add mean
-            # Note: Clamping in normalize limits the range
-            denormed = (x * stats["scale_factor"] * stats["std"]) + stats["mean"]
+            # --- CORRECTED INVERSE LOGIC ---
+            # Input x is in range [-1, 1] (approx)
+            # 1. Inverse the clamping/scaling factor: z_approx = x * scale_factor
+            z_approx = x * stats["scale_factor"]
+            # 2. Inverse the z-score: original = mean + std * z_approx
+            denormed = (z_approx * stats["std"]) + stats["mean"]
         else:
             raise ValueError(f"Unsupported denormalization method: '{method}'")
 
@@ -580,6 +624,9 @@ class DataNormalizer:
         """
         Applies normalization to all profiles in the input directory
         using the provided statistics, saving results to the output directory.
+
+        Raises:
+            RuntimeError: If processing fails for a file after stats calculation.
         """
         logger.info(
             f"Applying normalization and saving profiles to {self.output_dir}..."
@@ -587,7 +634,7 @@ class DataNormalizer:
         methods = stats.get("normalization_methods", {})
         if not methods:
             logger.error("No normalization methods found in provided statistics.")
-            return
+            raise RuntimeError("Cannot process profiles without normalization methods.")
 
         processed_count = 0
         error_count = 0
@@ -599,7 +646,8 @@ class DataNormalizer:
 
         for fpath in files:
             try:
-                prof = json.loads(fpath.read_text(encoding='utf-8'))
+                # Use utf-8-sig to handle potential BOM
+                prof = json.loads(fpath.read_text(encoding='utf-8-sig'))
                 normalized_profile = {}
                 for key, value in prof.items():
                     method = methods.get(key, "none").lower()
@@ -607,13 +655,11 @@ class DataNormalizer:
                         normalized_profile[key] = value
                         continue
 
-                    # Use stats associated with the key, which might be empty if calculation failed
                     key_stats = stats.get(key)
-                    if key_stats is None: # Should not happen if method != 'none' due to fix above
+                    if key_stats is None:
                          logger.error(f"Logic error: Stats missing for key '{key}' with method '{method}' in {fpath.name}. Skipping normalization.")
-                         normalized_profile[key] = value
+                         normalized_profile[key] = value # Keep original if stats somehow missing
                          continue
-                    # If stats calculation failed earlier, method is 'none', handled above.
 
                     try:
                         is_list = isinstance(value, list)
@@ -622,13 +668,17 @@ class DataNormalizer:
                             normed_tensor = self.normalize_tensor(
                                 tensor_val, method, key_stats
                             )
-                            normalized_profile[key] = (
-                                normed_tensor.tolist()
-                                if is_list
-                                else normed_tensor.item()
-                            )
+                            # Convert back to list/scalar and handle potential NaN/Inf after normalization
+                            if is_list:
+                                normed_list = normed_tensor.tolist()
+                                # Replace non-finite values with None or raise error? Decide policy.
+                                # For now, keep them as they might be handled later or indicate issues.
+                                normalized_profile[key] = [v if np.isfinite(v) else None for v in normed_list]
+                            else:
+                                normed_item = normed_tensor.item()
+                                normalized_profile[key] = normed_item if np.isfinite(normed_item) else None
                         else:
-                            normalized_profile[key] = value
+                            normalized_profile[key] = value # Keep original empty list/value
                     except Exception as norm_exc:
                         logger.warning(
                             f"Failed to normalize '{key}' in {fpath.name} with method '{method}': {norm_exc}. Keeping original value."
@@ -637,24 +687,33 @@ class DataNormalizer:
 
                 output_path = self.output_dir / fpath.name
                 try:
-                    # Attempt to use enhanced save_json if available
-                    from utils import save_json
-                    save_json(normalized_profile, output_path)
-                except ImportError:
-                     # Fallback to standard json saving
-                     output_path.write_text(json.dumps(normalized_profile, indent=2))
+                    if save_json:
+                         save_success = save_json(normalized_profile, output_path)
+                         if not save_success:
+                              logger.error(f"Failed to save normalized profile {output_path.name} using utils.save_json.")
+                              # Decide if this should be a fatal error
+                    else:
+                         # Fallback to standard json saving
+                         output_path.write_text(json.dumps(normalized_profile, indent=2))
+
+                except Exception as save_exc:
+                     logger.error(f"Failed to save normalized profile {output_path.name}: {save_exc}")
+                     # Decide if this should be a fatal error
 
                 processed_count += 1
 
+            except json.JSONDecodeError as file_exc:
+                 logger.error(f"JSON decode error processing file {fpath.name}: {file_exc}. Stopping.")
+                 raise RuntimeError(f"Fatal JSON decode error in {fpath.name}") from file_exc
             except Exception as file_exc:
                 logger.error(f"Error processing file {fpath.name}: {file_exc}")
-                error_count += 1
+                error_count += 1 # Count non-fatal errors per file
 
         logger.info(
             f"Normalization processing complete. Saved {processed_count} normalized profiles."
         )
         if error_count > 0:
             logger.warning(
-                f"Encountered errors in {error_count} files during processing."
+                f"Encountered non-fatal errors in {error_count} files during processing."
             )
 
