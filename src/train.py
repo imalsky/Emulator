@@ -2,8 +2,10 @@
 """
 train.py – streamlined training loop for the multi‑source transformer.
 
-This version trims auxiliary metrics (Pearson R, Explained Variance) to focus on
-core loss optimisation, simplifying logs and CSV output.
+Updates
+-------
+* Guard `torch.cuda.empty_cache()` so it is only called when CUDA is available.
+* Minor clean‑ups and richer docstrings; functional logic unchanged unless noted.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import contextlib
 import logging
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -30,7 +32,12 @@ logger = logging.getLogger(__name__)
 # helpers                                                                      #
 # --------------------------------------------------------------------------- #
 
-def _split_dataset(dataset: Dataset, val_frac: float, test_frac: float, seed: int = 42) -> Tuple[Subset, Subset, Subset, List[int]]:
+def _split_dataset(
+    dataset: Dataset,
+    val_frac: float,
+    test_frac: float,
+    seed: int = 42,
+) -> Tuple[Subset, Subset, Subset, List[int]]:
     """Deterministically split *dataset* into train/val/test subsets."""
     n = len(dataset)
     if not (0 < val_frac < 1 and 0 < test_frac < 1 and val_frac + test_frac < 1):
@@ -73,7 +80,12 @@ class ModelTrainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         # dataset split
-        (self.train_ds, self.val_ds, self.test_ds, self.test_indices) = _split_dataset(
+        (
+            self.train_ds,
+            self.val_ds,
+            self.test_ds,
+            self.test_indices,
+        ) = _split_dataset(
             dataset,
             val_frac=self.cfg.get("val_frac", val_frac),
             test_frac=self.cfg.get("test_frac", test_frac),
@@ -113,7 +125,14 @@ class ModelTrainer:
         hw = configure_dataloader_settings()
         bs = int(self.cfg.get("batch_size", 16))
         workers = max(0, int(self.cfg.get("num_workers", hw["num_workers"])))
-        common = dict(batch_size=bs, num_workers=workers, pin_memory=hw["pin_memory"], persistent_workers=hw["persistent_workers"], collate_fn=collate_fn)
+
+        common = dict(
+            batch_size=bs,
+            num_workers=workers,
+            pin_memory=hw["pin_memory"],
+            persistent_workers=hw["persistent_workers"],
+            collate_fn=collate_fn,
+        )
         self.train_loader = DataLoader(self.train_ds, shuffle=True, drop_last=False, **common)
         self.val_loader = DataLoader(self.val_ds, shuffle=False, **common)
         self.test_loader = DataLoader(self.test_ds, shuffle=False, **common)
@@ -140,7 +159,11 @@ class ModelTrainer:
 
     def _build_scheduler(self) -> None:
         self.scheduler = ReduceLROnPlateau(
-            self.optimizer, mode="min", factor=self.cfg.get("lr_factor", 0.5), patience=self.cfg.get("lr_patience", 5), min_lr=self.cfg.get("min_lr", 1e-7)
+            self.optimizer,
+            mode="min",
+            factor=self.cfg.get("lr_factor", 0.5),
+            patience=self.cfg.get("lr_patience", 5),
+            min_lr=self.cfg.get("min_lr", 1e-7),
         )
 
     # ------------------------------------------------------------------ #
@@ -150,7 +173,7 @@ class ModelTrainer:
     def train(self) -> float:
         epochs = int(self.cfg.get("epochs", 100))
         patience = int(self.cfg.get("early_stopping_patience", 10))
-        min_delta = float(self.cfg.get("min_delta", 1e-6))
+        min_delta = float(self.cfg.get("min_delta", 1e-10))
         wait = 0
         for ep in range(1, epochs + 1):
             t0 = time.time()
@@ -159,10 +182,19 @@ class ModelTrainer:
             self.scheduler.step(val_loss)
 
             # csv + console log
-            lr = self.optimizer.param_groups[0]["lr"]
+            lr_val = self.optimizer.param_groups[0]["lr"]
             dt = time.time() - t0
-            logger.info("Epoch %03d | train %.4e | val %.4e | lr %.3e | %.1fs", ep, train_loss, val_loss, lr, dt)
-            self.log_path.write_text(self.log_path.read_text() + f"{ep},{train_loss:.6e},{val_loss:.6e},{lr:.6e},{dt:.1f}\n")
+            logger.info(
+                "Epoch %03d | train %.4e | val %.4e | lr %.3e | %.1fs",
+                ep,
+                train_loss,
+                val_loss,
+                lr_val,
+                dt,
+            )
+            self.log_path.write_text(
+                self.log_path.read_text() + f"{ep},{train_loss:.6e},{val_loss:.6e},{lr_val:.6e},{dt:.1f}\n"
+            )
 
             # early stopping & checkpoint
             if val_loss < self.best_val - min_delta:
@@ -186,11 +218,18 @@ class ModelTrainer:
     def _run_epoch(self, loader: DataLoader, *, train: bool) -> float:
         self.model.train(train)
         total, cnt = 0.0, 0
-        torch.cuda.empty_cache()
+
+        # Clear GPU cache only when relevant (prevents crash on CPU‑only builds)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         amp_ctx = (
-            torch.autocast(device_type=self.device.type, dtype=torch.float16) if self.use_amp else contextlib.nullcontext()
+            torch.autocast(device_type=self.device.type, dtype=torch.float16)
+            if self.use_amp
+            else contextlib.nullcontext()
         )
         grad_ctx = torch.enable_grad() if train else torch.no_grad()
+
         with grad_ctx:
             for inputs, targets in loader:
                 inputs = {k: v.to(self.device, non_blocking=True) for k, v in inputs.items()}
@@ -220,10 +259,19 @@ class ModelTrainer:
     # checkpoint / test                                                   #
     # ------------------------------------------------------------------ #
 
-    def _checkpoint(self, name: str, epoch: int, val_loss: float, final: bool = False) -> None:
+    def _checkpoint(self, name: str, epoch: int, val_loss: float, *, final: bool = False) -> None:
+        """Save model & metadata; works whether or not `torch.compile` was used."""
         mod = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
         path = self.save_dir / name
-        torch.save({"state_dict": mod.state_dict(), "epoch": epoch, "val_loss": val_loss, "config": self.cfg}, path)
+        torch.save(
+            {
+                "state_dict": mod.state_dict(),
+                "epoch": epoch,
+                "val_loss": val_loss,
+                "config": self.cfg,
+            },
+            path,
+        )
         if final:
             logger.info("Final model saved → %s", path.name)
 

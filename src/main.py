@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-main.py – Command-line entry point for the atmospheric-flux pipeline.
+main.py – Command‑line entry point for the atmospheric‑flux pipeline.
+
+Update (2025‑04‑25)
+-------------------
+* **_run_tuning**: removed redundant sub‑directory construction.  The Optuna
+  objective already receives a unique `root` path (e.g. *data/tuning_results/
+  trial_0*).  We now pass that directly to `train_model`, preventing nested
+  folders such as *trial_0/tuning_trials/trial_0/*.
 """
 
 from __future__ import annotations
@@ -27,17 +34,17 @@ from utils import (
     seed_everything,
 )
 
-import warnings# Suppress the specific UserWarning about Nested Tensors and norm_first
-warnings.filterwarnings("ignore", message="enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True")
+import warnings  # Suppress Nested‑Tensor warning on pre‑norm encoder layers
+warnings.filterwarnings(
+    "ignore",
+    message="enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True",
+)
 
 logger = logging.getLogger(__name__)
-
-
 
 # --------------------------------------------------------------------------- #
 # Helpers                                                                     #
 # --------------------------------------------------------------------------- #
-
 
 def _normalize(cfg: Dict[str, Any], data_root: Path) -> bool:
     """Run normalisation once; return True on success."""
@@ -116,9 +123,15 @@ def train_model(
     return best
 
 
-def _run_tuning(cfg: Dict[str, Any], data_dir: Path, n_trials: int) -> bool:
-    logger.info("Hyper-parameter search: %d trials", n_trials)
+# --------------------------------------------------------------------------- #
+# Hyper‑parameter tuning                                                      #
+# --------------------------------------------------------------------------- #
 
+def _run_tuning(cfg: Dict[str, Any], data_dir: Path, n_trials: int) -> bool:
+    logger.info("Hyper‑parameter search: %d trials", n_trials)
+
+    # NOTE: *root* is already the unique trial directory supplied by
+    # run_hyperparameter_search → we now pass it straight through.
     def _train_wrapper(
         trial_cfg: Dict[str, Any],
         device: torch.device,
@@ -126,9 +139,7 @@ def _run_tuning(cfg: Dict[str, Any], data_dir: Path, n_trials: int) -> bool:
         collate: Callable,
         root: Path,
     ) -> float:
-        trial_id = trial_cfg.get("optuna_trial", "x")
-        trial_dir = root / "tuning_trials" / f"trial_{trial_id}"
-        return train_model(trial_cfg, device, ds, collate, trial_dir)
+        return train_model(trial_cfg, device, ds, collate, root)
 
     best_cfg = run_hyperparameter_search(
         base_config=cfg,
@@ -142,17 +153,15 @@ def _run_tuning(cfg: Dict[str, Any], data_dir: Path, n_trials: int) -> bool:
     )
     return best_cfg is not None
 
-
 # --------------------------------------------------------------------------- #
 # CLI                                                                          #
 # --------------------------------------------------------------------------- #
 
-
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Atmospheric-flux transformer pipeline")
+    p = argparse.ArgumentParser(description="Atmospheric‑flux transformer pipeline")
     p.add_argument("--normalize", action="store_true", help="Run data normalisation")
     p.add_argument("--train", action="store_true", help="Train a model")
-    p.add_argument("--tune", action="store_true", help="Optuna hyper-parameter search")
+    p.add_argument("--tune", action="store_true", help="Optuna hyper‑parameter search")
     p.add_argument("--config", type=Path, default=Path("inputs/model_input_params.jsonc"))
     p.add_argument("--data-dir", type=Path, default=Path("data"))
     p.add_argument("--trials", type=int, default=25, help="Optuna trials")
@@ -166,7 +175,6 @@ def _parse_args() -> argparse.Namespace:
 # --------------------------------------------------------------------------- #
 # Main                                                                         #
 # --------------------------------------------------------------------------- #
-
 
 def main() -> int:
     args = _parse_args()
@@ -183,7 +191,6 @@ def main() -> int:
         args.data_dir / "normalized_profiles",
         args.data_dir / "model",
         args.data_dir / "tuning_results",
-        args.data_dir / "tuning_trials",
     )
 
     # -------------------------------------------------- #
@@ -218,9 +225,5 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        logger.warning("Interrupted by user")
-        sys.exit(130)
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

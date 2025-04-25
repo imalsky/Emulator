@@ -54,10 +54,10 @@
   // ════════════════════════════════════════════════════════════════
   // MODEL HYPER-PARAMETERS
   // ════════════════════════════════════════════════════════════════
-  "d_model":            256,   // embedding size  (divisible by nhead)
-  "nhead":              8,     // multi-head attention
-  "num_encoder_layers": 8,
-  "dim_feedforward":    1024,
+  "d_model":            64,   // embedding size  (divisible by nhead)
+  "nhead":              2,     // multi-head attention
+  "num_encoder_layers": 2,
+  "dim_feedforward":    512,
   "dropout":            0.00,
 
   /* optional initial CNN block inside every SequenceEncoder */
@@ -72,7 +72,7 @@
   // ════════════════════════════════════════════════════════════════
   // TRAINING HYPER-PARAMETERS
   // ════════════════════════════════════════════════════════════════
-  "batch_size":            32,
+  "batch_size":            16,
   "epochs":                100,
   "gradient_clip_val":     1.0,
 
