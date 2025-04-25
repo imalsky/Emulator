@@ -2,61 +2,62 @@
 """
 hardware.py – Device detection and DataLoader configuration.
 
-Provides utilities to detect the available compute hardware (CUDA, MPS, CPU)
-and configure optimal settings for PyTorch DataLoaders based on the device.
+Focus
+-----
+* Robustly detect CUDA / MPS / CPU even on odd builds where a backend is
+  compiled in but unavailable at runtime.
+* Expose a single helper (`configure_dataloader_settings`) that returns a
+  dictionary of kwargs you can pass straight into `torch.utils.data.DataLoader`.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict
 
 import torch
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------  
+# Device detection  
+# -----------------------------------------------------------------------------
 
-# =============================================================================
-# Device Detection and Setup
-# =============================================================================
+
+def _has_mps() -> bool:
+    """True if the torch build supports MPS and it is available."""
+    return getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
 
 
 def get_device_type() -> str:
     """
-    Detects available hardware acceleration and returns the device type string.
+    Decide on the best acceleration backend present on this system.
 
-    Checks for CUDA, then MPS (Apple Silicon), falling back to CPU.
-
-    Returns:
-        One of "cuda", "mps", or "cpu".
+    Priority: CUDA > MPS (Apple Silicon) > CPU
     """
     if torch.cuda.is_available():
         return "cuda"
-
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+    if _has_mps():
         return "mps"
-
     return "cpu"
 
 
 def setup_device() -> torch.device:
     """
-    Selects the best available compute device (CUDA > MPS > CPU) and logs the choice.
-
-    Returns:
-        A torch.device object representing the selected device.
+    Return a `torch.device` corresponding to the best backend and log the choice.
     """
-    device_type = get_device_type()
-    device = torch.device(device_type)
+    dev_type = get_device_type()
+    device = torch.device(dev_type)
 
-    if device_type == "cuda":
+    if dev_type == "cuda":
         try:
-            gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
-            logger.info("Using CUDA device: %s", gpu_name)
-        except Exception as e:
-            logger.warning("Could not get CUDA device name: %s", e)
+            name = torch.cuda.get_device_name(torch.cuda.current_device())
+            logger.info("Using CUDA device: %s", name)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Could not query CUDA device name (%s)", exc)
             logger.info("Using CUDA device.")
-    elif device_type == "mps":
+    elif dev_type == "mps":
         logger.info("Using Apple Silicon MPS device.")
     else:
         logger.info("Using CPU device.")
@@ -64,87 +65,87 @@ def setup_device() -> torch.device:
     return device
 
 
+# -----------------------------------------------------------------------------  
+# Device-capability helper  
+# -----------------------------------------------------------------------------
+
+
 def get_device_properties() -> Dict[str, Any]:
     """
-    Returns a dictionary containing properties of the selected compute device.
+    Return a small dict with information about the selected backend.
 
-    Includes device type, AMP support status, and GPU-specific details
-    (name, memory, compute capability) if CUDA is available.
-
-    Returns:
-        A dictionary containing device properties.
+    Notes
+    -----
+    * `supports_amp` is True for CUDA (bfloat16/FP16) and False otherwise.
+    * Memory is the *total* GPU memory in bytes; call `torch.cuda.mem_get_info`
+      yourself if you want the free amount.
     """
-    device_type = get_device_type()
-    properties: Dict[str, Any] = {
-        "type": device_type,
-        "supports_amp": device_type == "cuda",
-    }
+    dev_type = get_device_type()
+    props: Dict[str, Any] = {"type": dev_type, "supports_amp": dev_type == "cuda"}
 
-    if device_type == "cuda":
+    if dev_type == "cuda":
         try:
             idx = torch.cuda.current_device()
-            cuda_props = torch.cuda.get_device_properties(idx)
-            properties.update(
+            spec = torch.cuda.get_device_properties(idx)
+            props.update(
                 {
-                    "name": cuda_props.name,
-                    "memory": cuda_props.total_memory,  # Total memory in bytes
-                    "capability": (cuda_props.major, cuda_props.minor),
+                    "name": spec.name,
+                    "memory": spec.total_memory,
+                    "capability": (spec.major, spec.minor),
                 }
             )
-        except Exception as e:
-            logger.warning(
-                "Could not retrieve detailed CUDA device properties: %s", e
-            )
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Could not read CUDA properties: %s", exc)
 
-    return properties
+    return props
 
 
-# =============================================================================
-# DataLoader Configuration
-# =============================================================================
+# -----------------------------------------------------------------------------  
+# DataLoader tuning helper  
+# -----------------------------------------------------------------------------
 
 
 def configure_dataloader_settings() -> Dict[str, Any]:
     """
-    Recommends optimal DataLoader keyword arguments based on the detected device.
+    Return recommended kwargs for a `DataLoader` tuned to the current backend.
 
-    Adjusts `pin_memory`, `num_workers`, and `persistent_workers` for potentially
-    better performance depending on the hardware (CUDA, MPS, CPU). These are
-    recommendations and might require further tuning based on the specific
-    system's CPU cores, RAM, and dataset I/O characteristics.
-
-    Returns:
-        A dictionary with recommended settings for DataLoader arguments:
-        `pin_memory`, `num_workers`, `persistent_workers`.
+    Environment variable override
+    -----------------------------
+    Set `NUM_WORKERS=<int>` in your shell to force a different worker count.
     """
-    device_type = get_device_type()
+    dev_type = get_device_type()
 
+    # Default recommendations
     settings: Dict[str, Any] = {
-        "pin_memory": False,
-        "persistent_workers": True,
+        "pin_memory": dev_type == "cuda",
+        "persistent_workers": dev_type == "cuda",
         "num_workers": 4,
     }
 
-    if device_type == "cuda":
-        settings["pin_memory"] = True
-        logger.debug("DataLoader: Enabled pin_memory for CUDA device.")
+    # Apple MPS is sensitive to multiprocessing – keep it simple
+    if dev_type == "mps":
+        settings.update({"persistent_workers": False, "num_workers": 1})
 
-    elif device_type == "mps":
-        settings["persistent_workers"] = False
-        settings["num_workers"] = 1
-        logger.debug(
-            "DataLoader: Adjusted settings for MPS (num_workers=1, persistent_workers=False)."
-        )
+    # Let the user override num_workers for profiling without touching code
+    env_override = os.getenv("NUM_WORKERS")
+    if env_override is not None:
+        try:
+            settings["num_workers"] = max(0, int(env_override))
+            logger.info("NUM_WORKERS override -> %d", settings["num_workers"])
+        except ValueError:
+            logger.warning("Invalid NUM_WORKERS value '%s' – ignoring", env_override)
 
+    # If num_workers == 0 we must disable persistent_workers
     if settings["num_workers"] == 0:
         settings["persistent_workers"] = False
 
     return settings
 
 
-# =============================================================================
-# Module Exports
-# =============================================================================
+# -----------------------------------------------------------------------------  
+# Public exports  
+# -----------------------------------------------------------------------------
+
 
 __all__ = [
     "get_device_type",
