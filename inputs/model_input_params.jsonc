@@ -13,7 +13,7 @@
     "reflected_net_flux" // per-level sequence to predict
   ],
 
-  /* One or more *sequence types*.  
+  /* One or more *sequence types*.
      Every variable listed under a key must have identical length
      inside every JSON profile – the loader enforces this strictly. */
   "sequence_types": {
@@ -29,7 +29,7 @@
   // Fixed lengths for each sequence type
   "sequence_lengths": {
     "sequence1": 100
-    // "sequence2": 50       // example
+    // "sequence2": 50
   },
 
   "global_variables": ["orbital_sep"], // scalar features injected via FiLM
@@ -40,22 +40,23 @@
   // ════════════════════════════════════════════════════════════════
   "normalization": {
     "key_methods": {
-      // NB:  strictly positive data required for log-min-max
+      // NB: strictly positive data required for log-min-max
       "pressure":           "log-min-max",
       "thermal_net_flux":   "symlog",
       "reflected_net_flux": "symlog"
     },
     "default_method":              "standard",
     "clip_outliers_before_scaling": false,
-    "symlog_percentile":            0.10
-    // "symlog_thresholds": { "thermal_net_flux": 1.0 } // optional override
+    "symlog_percentile":            0.10,
+    // "symlog_thresholds": { "thermal_net_flux": 1.0 },
+    "epsilon":                      1e-20         // global tolerance for all schemes
   },
 
   // ════════════════════════════════════════════════════════════════
   // MODEL HYPER-PARAMETERS
   // ════════════════════════════════════════════════════════════════
   "d_model":            64,   // embedding size  (divisible by nhead)
-  "nhead":              2,     // multi-head attention
+  "nhead":              2,    // multi-head attention heads
   "num_encoder_layers": 2,
   "dim_feedforward":    512,
   "dropout":            0.00,
@@ -99,7 +100,11 @@
   "test_frac":           0.15,
   "dataset_cache_size":  100000, // cache full normalised dataset
   "random_seed":         42,
+  "validate_profiles":   false,  // skip expensive upfront JSON scan
+
+  // new: frequency (in epochs) to clear CUDA cache – 0 = never
+  "clear_cuda_cache_every": 0,
 
   "use_amp":             true,   // AMP on CUDA
-  "use_torch_compile":   true    // compile() on CUDA
+  "use_torch_compile":   true    // torch.compile() on CUDA
 }

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-main.py – Command‑line entry point for the atmospheric‑flux pipeline.
+main.py – command‑line entry point for the atmospheric‑flux pipeline.
 
-Update (2025‑04‑25)
--------------------
-* **_run_tuning**: removed redundant sub‑directory construction.  The Optuna
-  objective already receives a unique `root` path (e.g. *data/tuning_results/
-  trial_0*).  We now pass that directly to `train_model`, preventing nested
-  folders such as *trial_0/tuning_trials/trial_0/*.
+Updates (2025‑04‑28)
+--------------------
+* Reads optional `validate_profiles` boolean from the top‑level config; defaults
+  to *True* for backwards compatibility.
+* Passes `validate_profiles` through to `AtmosphericDataset`, allowing users to
+  skip the expensive one‑off profile scan when desired.
+* Minor docstring/typing tidy‑ups; functional flow unchanged.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
-from optuna.exceptions import TrialPruned
 
 from hardware import setup_device
 from normalizer import DataNormalizer
@@ -34,7 +33,8 @@ from utils import (
     seed_everything,
 )
 
-import warnings  # Suppress Nested‑Tensor warning on pre‑norm encoder layers
+# suppress noisy nested‑tensor warning on pre‑norm encoder layers
+import warnings  # noqa: E402
 warnings.filterwarnings(
     "ignore",
     message="enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True",
@@ -43,11 +43,11 @@ warnings.filterwarnings(
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
-# Helpers                                                                     #
+# helpers                                                                     #
 # --------------------------------------------------------------------------- #
 
 def _normalize(cfg: Dict[str, Any], data_root: Path) -> bool:
-    """Run normalisation once; return True on success."""
+    """Run normalisation once; return *True* on success."""
     raw_dir = data_root / "profiles"
     out_dir = data_root / "normalized_profiles"
     ensure_dirs(raw_dir, out_dir)
@@ -69,9 +69,8 @@ def _normalize(cfg: Dict[str, Any], data_root: Path) -> bool:
     return True
 
 
-# Dataset cache so train/tune can share the same object in one run
+# dataset cache so train/tune can share the same object in one run
 _DATASET_CACHE: dict[str, Tuple[AtmosphericDataset, Callable]] = {}
-
 
 def _setup_dataset(cfg: Dict[str, Any], data_dir: Path) -> Optional[Tuple[AtmosphericDataset, Callable]]:
     key = str(data_dir.resolve())
@@ -93,12 +92,13 @@ def _setup_dataset(cfg: Dict[str, Any], data_dir: Path) -> Optional[Tuple[Atmosp
             sequence_lengths=cfg["sequence_lengths"],
             output_seq_type=cfg["output_seq_type"],
             cache_size=cfg.get("dataset_cache_size", 1024),
+            validate_profiles=cfg.get("validate_profiles", True),
         )
         collate = create_multi_source_collate_fn()
         _DATASET_CACHE[key] = (ds, collate)
         return ds, collate
     except Exception as exc:
-        logger.error("Dataset setup failed: %s", exc)
+        logger.error("Dataset setup failed: %s", exc, exc_info=True)
         return None
 
 
@@ -122,7 +122,6 @@ def train_model(
         raise RuntimeError("ModelTrainer did not return float")
     return best
 
-
 # --------------------------------------------------------------------------- #
 # Hyper‑parameter tuning                                                      #
 # --------------------------------------------------------------------------- #
@@ -130,8 +129,6 @@ def train_model(
 def _run_tuning(cfg: Dict[str, Any], data_dir: Path, n_trials: int) -> bool:
     logger.info("Hyper‑parameter search: %d trials", n_trials)
 
-    # NOTE: *root* is already the unique trial directory supplied by
-    # run_hyperparameter_search → we now pass it straight through.
     def _train_wrapper(
         trial_cfg: Dict[str, Any],
         device: torch.device,
@@ -154,7 +151,7 @@ def _run_tuning(cfg: Dict[str, Any], data_dir: Path, n_trials: int) -> bool:
     return best_cfg is not None
 
 # --------------------------------------------------------------------------- #
-# CLI                                                                          #
+# CLI                                                                         #
 # --------------------------------------------------------------------------- #
 
 def _parse_args() -> argparse.Namespace:
@@ -171,9 +168,8 @@ def _parse_args() -> argparse.Namespace:
         p.error("Specify at least one of --normalize, --train, --tune")
     return args
 
-
 # --------------------------------------------------------------------------- #
-# Main                                                                         #
+# main                                                                         #
 # --------------------------------------------------------------------------- #
 
 def main() -> int:
@@ -193,15 +189,11 @@ def main() -> int:
         args.data_dir / "tuning_results",
     )
 
-    # -------------------------------------------------- #
-    # Normalise                                          #
-    # -------------------------------------------------- #
+    # ----------------------- normalise -----------------------
     if args.normalize and not _normalize(cfg, args.data_dir):
         return 1
 
-    # -------------------------------------------------- #
-    # Train                                              #
-    # -------------------------------------------------- #
+    # ----------------------- train ---------------------------
     if args.train:
         device = setup_device()
         ds_info = _setup_dataset(cfg, args.data_dir)
@@ -214,12 +206,9 @@ def main() -> int:
             logger.error("Training failed: %s", exc, exc_info=True)
             return 1
 
-    # -------------------------------------------------- #
-    # Tune                                               #
-    # -------------------------------------------------- #
-    if args.tune:
-        if not _run_tuning(cfg, args.data_dir, args.trials):
-            return 1
+    # ----------------------- tune ----------------------------
+    if args.tune and not _run_tuning(cfg, args.data_dir, args.trials):
+        return 1
 
     logger.info("Pipeline finished successfully")
     return 0

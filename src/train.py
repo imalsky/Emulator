@@ -2,12 +2,14 @@
 """
 train.py – streamlined training loop for the multi‑source transformer.
 
-Updates
--------
-* Guard `torch.cuda.empty_cache()` so it is only called when CUDA is available.
-* Minor clean‑ups and richer docstrings; functional logic unchanged unless noted.
+Updates (2025‑04‑28)
+--------------------
+* **Smart GPU cache clearing** – `torch.cuda.empty_cache()` is now optional and
+  controllable via `clear_cuda_cache_every` (int ≥ 1) in the config.  Default 0
+  → never clear.  This prevents the full synchronisation cost every epoch while
+  still allowing an escape hatch for memory‑strained setups.
+* Minor docstring & typing polish – functional logic otherwise unchanged.
 """
-
 from __future__ import annotations
 
 import contextlib
@@ -29,19 +31,20 @@ from utils import save_json
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
-# helpers                                                                      #
+# helpers                                                                     #
 # --------------------------------------------------------------------------- #
 
 def _split_dataset(
     dataset: Dataset,
     val_frac: float,
     test_frac: float,
+    *,
     seed: int = 42,
 ) -> Tuple[Subset, Subset, Subset, List[int]]:
-    """Deterministically split *dataset* into train/val/test subsets."""
+    """Deterministically split *dataset* into train / val / test subsets."""
     n = len(dataset)
     if not (0 < val_frac < 1 and 0 < test_frac < 1 and val_frac + test_frac < 1):
-        raise ValueError("fractions must be between 0 and 1 and sum to < 1")
+        raise ValueError("fractions must be between 0 and 1 and sum to < 1")
 
     nv, nt = int(n * val_frac), int(n * test_frac)
     if n - nv - nt <= 0:
@@ -51,19 +54,17 @@ def _split_dataset(
     idx = torch.randperm(n, generator=g).tolist()
     test_idx, val_idx, train_idx = idx[:nt], idx[nt : nt + nv], idx[nt + nv :]
 
-    logger.info("Dataset split: %d train / %d val / %d test", len(train_idx), len(val_idx), len(test_idx))
+    logger.info(
+        "Dataset split: %d train / %d val / %d test", len(train_idx), len(val_idx), len(test_idx)
+    )
     return Subset(dataset, train_idx), Subset(dataset, val_idx), Subset(dataset, test_idx), test_idx
 
 # --------------------------------------------------------------------------- #
-# trainer                                                                       #
+# trainer                                                                      #
 # --------------------------------------------------------------------------- #
 
 class ModelTrainer:
     """Orchestrates training / validation / testing including checkpoints."""
-
-    # ------------------------------------------------------------------ #
-    # init                                                               #
-    # ------------------------------------------------------------------ #
 
     def __init__(
         self,
@@ -72,6 +73,7 @@ class ModelTrainer:
         save_dir: Path,
         dataset: Dataset,
         collate_fn: Optional[Callable] = None,
+        *,
         val_frac: float = 0.15,
         test_frac: float = 0.15,
     ) -> None:
@@ -114,6 +116,9 @@ class ModelTrainer:
         self.log_path.write_text("epoch,train_loss,val_loss,lr,time_s\n")
         self.best_val, self.best_epoch = float("inf"), -1
 
+        # clear‑cache setting
+        self._clear_every = int(self.cfg.get("clear_cuda_cache_every", 10))
+
         # save list of test files/indices
         self._save_test_list(dataset)
 
@@ -143,7 +148,9 @@ class ModelTrainer:
         if self.cfg.get("use_torch_compile", False) and self.device.type == "cuda":
             with contextlib.suppress(Exception):
                 self.model = torch.compile(self.model)  # type: ignore[attr-defined]
-        logger.info("Model built (%d parameters)", sum(p.numel() for p in self.model.parameters()))
+        logger.info(
+            "Model built (%d parameters)", sum(p.numel() for p in self.model.parameters())
+        )
 
     def _build_optimiser(self) -> None:
         opt_name = str(self.cfg.get("optimizer", "adamw")).lower()
@@ -181,6 +188,15 @@ class ModelTrainer:
             val_loss = self._run_epoch(self.val_loader, train=False)
             self.scheduler.step(val_loss)
 
+            # --- optional cache clear to mitigate sporadic CUDA OOMs ----
+            if (
+                self.device.type == "cuda"
+                and self._clear_every > 0
+                and ep % self._clear_every == 0
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.empty_cache()
+
             # csv + console log
             lr_val = self.optimizer.param_groups[0]["lr"]
             dt = time.time() - t0
@@ -193,7 +209,8 @@ class ModelTrainer:
                 dt,
             )
             self.log_path.write_text(
-                self.log_path.read_text() + f"{ep},{train_loss:.6e},{val_loss:.6e},{lr_val:.6e},{dt:.1f}\n"
+                self.log_path.read_text()
+                + f"{ep},{train_loss:.6e},{val_loss:.6e},{lr_val:.6e},{dt:.1f}\n"
             )
 
             # early stopping & checkpoint
@@ -212,16 +229,12 @@ class ModelTrainer:
         return self.best_val
 
     # ------------------------------------------------------------------ #
-    # epoch                                                               #
+    # epoch loop                                                         #
     # ------------------------------------------------------------------ #
 
     def _run_epoch(self, loader: DataLoader, *, train: bool) -> float:
         self.model.train(train)
         total, cnt = 0.0, 0
-
-        # Clear GPU cache only when relevant (prevents crash on CPU‑only builds)
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         amp_ctx = (
             torch.autocast(device_type=self.device.type, dtype=torch.float16)
@@ -256,11 +269,11 @@ class ModelTrainer:
         return total / max(cnt, 1)
 
     # ------------------------------------------------------------------ #
-    # checkpoint / test                                                   #
+    # checkpoint / test                                                  #
     # ------------------------------------------------------------------ #
 
     def _checkpoint(self, name: str, epoch: int, val_loss: float, *, final: bool = False) -> None:
-        """Save model & metadata; works whether or not `torch.compile` was used."""
+        """Save model & metadata; compatible with torch.compile‑wrapped models."""
         mod = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
         path = self.save_dir / name
         torch.save(
@@ -281,7 +294,7 @@ class ModelTrainer:
         save_json({"test_loss": loss}, self.save_dir / "test_metrics.json")
 
     # ------------------------------------------------------------------ #
-    # utilities                                                           #
+    # utilities                                                          #
     # ------------------------------------------------------------------ #
 
     def _save_test_list(self, dataset: Dataset) -> None:
