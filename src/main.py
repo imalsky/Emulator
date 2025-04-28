@@ -2,13 +2,6 @@
 """
 main.py – command‑line entry point for the atmospheric‑flux pipeline.
 
-Updates (2025‑04‑28)
---------------------
-* Reads optional `validate_profiles` boolean from the top‑level config; defaults
-  to *True* for backwards compatibility.
-* Passes `validate_profiles` through to `AtmosphericDataset`, allowing users to
-  skip the expensive one‑off profile scan when desired.
-* Minor docstring/typing tidy‑ups; functional flow unchanged.
 """
 from __future__ import annotations
 

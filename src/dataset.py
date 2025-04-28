@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """
 dataset.py – dataset utilities for the atmospheric-flux transformer.
-
-Updates (2025-04-28)
---------------------
-* **Optional validation** – constructor accepts `validate_profiles: bool` (default
-  *True*).  When *False* the expensive one-off JSON scan is skipped and every
-  ``*.json`` file (except the metadata) is assumed valid.
-* **StrictCollate** – shape consistency is now checked *before* stacking to avoid
-  wasted work on malformed batches.
-* Backwards-compatible: existing call-sites need not pass the new argument.
 """
 from __future__ import annotations
 

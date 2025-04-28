@@ -2,14 +2,6 @@
 """
 model.py – encoder‑only multi‑source transformer for atmospheric‑profile prediction.
 
-Updates (2025‑04‑28)
---------------------
-* **SinePositionalEncoding**: expanding the position table now *re‑registers* the
-  buffer instead of overwriting it with a plain tensor (keeps it in the state_dict).
-* **SequenceEncoder**: parameter name unified to `dim_feedforward` and the internal
-  `TransformerEncoderLayer` now uses `activation="gelu"` (string) for full
-  TorchInductor / torch.compile compatibility.
-* Minor typing & weight‑init polish; functional behaviour otherwise unchanged.
 """
 
 from __future__ import annotations

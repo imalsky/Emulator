@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
 normalizer.py – compute *and invert* eight normalisation schemes.
-
-Updates (2025-04-28)
---------------------
-* **Config-driven epsilon** – `DataNormalizer` now accepts an `epsilon` argument
-  (default `1e-20`).  Every normalisation branch and the saved metadata use this
-  same tolerance instead of scattered literals.
-* Fixed a bug where the *log-min-max* branch of `normalize_tensor` accessed
-  `eps` before assignment.
 """
 
 from __future__ import annotations

@@ -2,13 +2,6 @@
 """
 train.py – streamlined training loop for the multi‑source transformer.
 
-Updates (2025‑04‑28)
---------------------
-* **Smart GPU cache clearing** – `torch.cuda.empty_cache()` is now optional and
-  controllable via `clear_cuda_cache_every` (int ≥ 1) in the config.  Default 0
-  → never clear.  This prevents the full synchronisation cost every epoch while
-  still allowing an escape hatch for memory‑strained setups.
-* Minor docstring & typing polish – functional logic otherwise unchanged.
 """
 from __future__ import annotations
 

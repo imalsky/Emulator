@@ -2,12 +2,6 @@
 """
 hardware.py – Device detection and DataLoader configuration.
 
-Focus
------
-* Robustly detect CUDA / MPS / CPU even on odd builds where a backend is
-  compiled in but unavailable at runtime.
-* Expose a single helper (`configure_dataloader_settings`) that returns a
-  dictionary of kwargs you can pass straight into `torch.utils.data.DataLoader`.
 """
 
 from __future__ import annotations
