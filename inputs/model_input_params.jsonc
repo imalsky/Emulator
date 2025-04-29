@@ -23,13 +23,11 @@
       "thermal_net_flux",
       "reflected_net_flux"
     ]
-    // e.g. add "sequence2": ["var_a", "var_b"] if you have others
   },
 
   // Fixed lengths for each sequence type
   "sequence_lengths": {
     "sequence1": 100
-    // "sequence2": 50
   },
 
   "global_variables": ["orbital_sep"], // scalar features injected via FiLM
@@ -48,7 +46,6 @@
     "default_method":              "standard",
     "clip_outliers_before_scaling": false,
     "symlog_percentile":            0.10,
-    // "symlog_thresholds": { "thermal_net_flux": 1.0 },
     "epsilon":                      0
   },
 
