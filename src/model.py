@@ -19,10 +19,8 @@ logger = logging.getLogger(__name__)
 # Positional encoding                                                         #
 # --------------------------------------------------------------------------- #
 
-
 class SinePositionalEncoding(nn.Module):
     """Fixed sinusoidal positional encoding that *grows* if required."""
-
     def __init__(self, d_model: int, max_len: int = 5_000) -> None:
         super().__init__()
         if d_model % 2:
@@ -51,9 +49,7 @@ class SinePositionalEncoding(nn.Module):
         else:
             self.register_buffer("pe_table", pe, persistent=False)
 
-    # .................................................................
     # forward                                                           
-    # .................................................................
     def forward(self, x: Tensor) -> Tensor:  # [B,L,D]
         seq_len = x.size(1)
         if seq_len > self.pe_table.size(1):
@@ -65,11 +61,8 @@ class SinePositionalEncoding(nn.Module):
 # --------------------------------------------------------------------------- #
 # Dilated Conv1d block                                                         #
 # --------------------------------------------------------------------------- #
-
-
 class ConvBlock1D(nn.Module):
     """Simple dilated Conv1d residual stack."""
-
     def __init__(
         self,
         d_model: int,
@@ -111,7 +104,6 @@ class ConvBlock1D(nn.Module):
 # Sequence encoder                                                             #
 # --------------------------------------------------------------------------- #
 
-
 class SequenceEncoder(nn.Module):
     """Per‑sequence encoder = linear projection → optional CNN → Transformer."""
 
@@ -132,9 +124,7 @@ class SequenceEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.proj = nn.Linear(input_dim, d_model)
-        self.cnn = (
-            ConvBlock1D(d_model, cnn_layers, cnn_kernel, cnn_dropout) if use_cnn else None
-        )
+        self.cnn = (ConvBlock1D(d_model, cnn_layers, cnn_kernel, cnn_dropout) if use_cnn else None)
         self.pe = SinePositionalEncoding(d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(

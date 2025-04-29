@@ -17,16 +17,15 @@ from torch.utils.data import Dataset
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
-# Dataset implementation                                                       #
+# Dataset implementation                                                      #
 # --------------------------------------------------------------------------- #
-
 
 class AtmosphericDataset(Dataset):
     """Load *normalised* JSON profiles and return tensors for the model."""
 
-    # .....................................................................
+    # --------------------------------------------------------------------------- #
     # construction / config validation
-    # .....................................................................
+    # --------------------------------------------------------------------------- #
     def __init__(
         self,
         data_folder: Union[str, Path],
@@ -55,7 +54,7 @@ class AtmosphericDataset(Dataset):
         self.output_seq_type = output_seq_type
         self.validate_profiles = bool(validate_profiles)
 
-        # sanity-check config itself (cheap)
+        # sanity-check config itself
         self._check_cfg()
 
         # optionally scan / validate every JSON file once
@@ -73,9 +72,7 @@ class AtmosphericDataset(Dataset):
         self.cache_size = max(1, int(cache_size))
         self._cache: OrderedDict[int, Tuple[Dict[str, Tensor], Tensor]] = OrderedDict()
 
-    # .....................................................................
-    # private helpers
-    # .....................................................................
+    # helper
     def _check_cfg(self) -> None:
         """Validate internal dictionaries for self-consistency."""
         if not self.sequence_types:
@@ -89,9 +86,7 @@ class AtmosphericDataset(Dataset):
         if self.target_len <= 0:
             raise ValueError("target_len must be positive")
 
-    # .................................................................
     # full profile validation (optional)                                
-    # .................................................................
     def _scan_and_validate(self) -> List[Path]:
         files = [p for p in sorted(self.data_dir.glob("*.json")) if p.name != "normalization_metadata.json"]
         if not files:
@@ -146,15 +141,11 @@ class AtmosphericDataset(Dataset):
         if self.global_variables:
             sample["global"] = torch.tensor([prof[g] for g in self.global_variables], dtype=torch.float32)
         for seq_name, vars_ in self.sequence_types.items():
-            seq_tensor = torch.stack(
-                [torch.tensor(prof[v], dtype=torch.float32) for v in vars_], dim=1
-            )
+            seq_tensor = torch.stack([torch.tensor(prof[v], dtype=torch.float32) for v in vars_], dim=1)
             sample[seq_name] = seq_tensor
 
         # targets
-        target = torch.stack(
-            [torch.tensor(prof[tv], dtype=torch.float32) for tv in self.target_variables], dim=1
-        )
+        target = torch.stack([torch.tensor(prof[tv], dtype=torch.float32) for tv in self.target_variables], dim=1)
 
         # update cache
         self._cache[idx] = (sample, target)
@@ -187,18 +178,13 @@ class StrictCollate:
             if len(set(shapes)) != 1:
                 raise ValueError(f"Shape mismatch for key '{k}' in collate: {set(shapes)}")
             inputs[k] = torch.stack([sample[0][k] for sample in batch], dim=0)
-
         targets = torch.stack([sample[1] for sample in batch], dim=0)
         return inputs, targets
 
 
-# --------------------------------------------------------------------------- #
-# Convenience factory                                                         #
-# --------------------------------------------------------------------------- #
-
-def create_multi_source_collate_fn() -> Callable:
+def create_multi_source_collate_fn() -> StrictCollate:
+    """Alias for StrictCollate to keep interface."""
     return StrictCollate()
-
 
 __all__ = [
     "AtmosphericDataset",

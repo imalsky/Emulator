@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 hardware.py – Device detection and DataLoader configuration.
-
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------  
 # Device detection  
 # -----------------------------------------------------------------------------
-
 
 def _has_mps() -> bool:
     """True if the torch build supports MPS and it is available."""
@@ -62,7 +60,6 @@ def setup_device() -> torch.device:
 # -----------------------------------------------------------------------------  
 # Device-capability helper  
 # -----------------------------------------------------------------------------
-
 
 def get_device_properties() -> Dict[str, Any]:
     """
@@ -139,7 +136,6 @@ def configure_dataloader_settings() -> Dict[str, Any]:
 # -----------------------------------------------------------------------------  
 # Public exports  
 # -----------------------------------------------------------------------------
-
 
 __all__ = [
     "get_device_type",

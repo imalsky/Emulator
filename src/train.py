@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from torch import nn, optim
+from torch.amp.grad_scaler import GradScaler # Added import
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset, Subset
 
@@ -47,18 +48,16 @@ def _split_dataset(
     idx = torch.randperm(n, generator=g).tolist()
     test_idx, val_idx, train_idx = idx[:nt], idx[nt : nt + nv], idx[nt + nv :]
 
-    logger.info(
-        "Dataset split: %d train / %d val / %d test", len(train_idx), len(val_idx), len(test_idx)
-    )
+    logger.info("Dataset split: %d train / %d val / %d test", len(train_idx), len(val_idx), len(test_idx))
+
     return Subset(dataset, train_idx), Subset(dataset, val_idx), Subset(dataset, test_idx), test_idx
 
 # --------------------------------------------------------------------------- #
-# trainer                                                                      #
+# trainer                                                                     #
 # --------------------------------------------------------------------------- #
 
 class ModelTrainer:
     """Orchestrates training / validation / testing including checkpoints."""
-
     def __init__(
         self,
         config: Dict[str, Any],
@@ -96,7 +95,9 @@ class ModelTrainer:
 
         # AMP
         self.use_amp = bool(self.cfg.get("use_amp", False) and device.type == "cuda")
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+
+        # Apply the fix for FutureWarning here:
+        self.scaler: Optional[GradScaler] = GradScaler(device.type) if self.use_amp else None
         if self.use_amp:
             logger.info("AMP enabled on CUDA")
 
@@ -109,8 +110,8 @@ class ModelTrainer:
         self.log_path.write_text("epoch,train_loss,val_loss,lr,time_s\n")
         self.best_val, self.best_epoch = float("inf"), -1
 
-        # clear‑cache setting
-        self._clear_every = int(self.cfg.get("clear_cuda_cache_every", 10))
+        # clear‑cache setting - Use default 0 (off) if not specified
+        self._clear_every = int(self.cfg.get("clear_cuda_cache_every", 0))
 
         # save list of test files/indices
         self._save_test_list(dataset)
@@ -128,7 +129,8 @@ class ModelTrainer:
             batch_size=bs,
             num_workers=workers,
             pin_memory=hw["pin_memory"],
-            persistent_workers=hw["persistent_workers"],
+            # Ensure persistent_workers is False if workers is 0
+            persistent_workers=workers > 0 and hw["persistent_workers"],
             collate_fn=collate_fn,
         )
         self.train_loader = DataLoader(self.train_ds, shuffle=True, drop_last=False, **common)
@@ -139,11 +141,11 @@ class ModelTrainer:
     def _build_model(self) -> None:
         self.model = create_prediction_model(self.cfg).to(self.device)
         if self.cfg.get("use_torch_compile", False) and self.device.type == "cuda":
+            # Keep original silent suppression as per user's code
             with contextlib.suppress(Exception):
                 self.model = torch.compile(self.model)  # type: ignore[attr-defined]
-        logger.info(
-            "Model built (%d parameters)", sum(p.numel() for p in self.model.parameters())
-        )
+                
+        logger.info("Model built (%d parameters)", sum(p.numel() for p in self.model.parameters()))
 
     def _build_optimiser(self) -> None:
         opt_name = str(self.cfg.get("optimizer", "adamw")).lower()
@@ -153,9 +155,13 @@ class ModelTrainer:
             self.optimizer = optim.SGD(self.model.parameters(), lr=lr, weight_decay=wd, momentum=0.9)
         elif opt_name == "adam":
             self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=wd)
+        # Default to AdamW if optimizer name is not 'sgd' or 'adam'
         else:
+            if opt_name != "adamw":
+                 logger.warning("Unsupported optimizer '%s', defaulting to AdamW.", opt_name)
             self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
-        logger.info("Optimizer: %s lr=%.1e wd=%.1e", opt_name, lr, wd)
+        logger.info("Optimizer: %s lr=%.1e wd=%.1e", self.optimizer.__class__.__name__, lr, wd)
+
 
     def _build_scheduler(self) -> None:
         self.scheduler = ReduceLROnPlateau(
@@ -164,6 +170,7 @@ class ModelTrainer:
             factor=self.cfg.get("lr_factor", 0.5),
             patience=self.cfg.get("lr_patience", 5),
             min_lr=self.cfg.get("min_lr", 1e-7),
+            # Keep original verbose setting (default False)
         )
 
     # ------------------------------------------------------------------ #
@@ -181,7 +188,7 @@ class ModelTrainer:
             val_loss = self._run_epoch(self.val_loader, train=False)
             self.scheduler.step(val_loss)
 
-            # --- optional cache clear to mitigate sporadic CUDA OOMs ----
+            # --- optional cache clear ---
             if (
                 self.device.type == "cuda"
                 and self._clear_every > 0
@@ -190,24 +197,26 @@ class ModelTrainer:
             ):
                 torch.cuda.empty_cache()
 
-            # csv + console log
+            # --- csv + console log ---
             lr_val = self.optimizer.param_groups[0]["lr"]
             dt = time.time() - t0
             logger.info(
-                "Epoch %03d | train %.4e | val %.4e | lr %.3e | %.1fs",
+                "Epoch %03d | train %.4e | val %.4e | lr %.4e | %.1fs",
                 ep,
                 train_loss,
                 val_loss,
                 lr_val,
                 dt,
             )
+            # Keep original logging method (read + write)
             self.log_path.write_text(
                 self.log_path.read_text()
                 + f"{ep},{train_loss:.6e},{val_loss:.6e},{lr_val:.6e},{dt:.1f}\n"
             )
 
-            # early stopping & checkpoint
+            # --- early stopping & checkpoint ---
             if val_loss < self.best_val - min_delta:
+                # Original had no logging here, keeping it that way
                 self.best_val, self.best_epoch, wait = val_loss, ep, 0
                 self._checkpoint("best_model.pt", ep, val_loss)
             else:
@@ -216,9 +225,11 @@ class ModelTrainer:
                     logger.info("Early stopping after %d epochs", ep)
                     break
 
-        # final checkpoint & test
+        # --- final checkpoint & test ---
+        # Use last recorded epoch 'ep' and 'val_loss'
         self._checkpoint("final_model.pt", ep, val_loss, final=True)
         self.test()
+        # Original had no final logging here
         return self.best_val
 
     # ------------------------------------------------------------------ #
@@ -229,27 +240,38 @@ class ModelTrainer:
         self.model.train(train)
         total, cnt = 0.0, 0
 
+        # Determine autocast context based on device and config
+        # Keep original float16 default
         amp_ctx = (
             torch.autocast(device_type=self.device.type, dtype=torch.float16)
             if self.use_amp
             else contextlib.nullcontext()
         )
+        # Enable/disable gradient calculation
         grad_ctx = torch.enable_grad() if train else torch.no_grad()
 
+        # Keep original loop without tqdm
         with grad_ctx:
             for inputs, targets in loader:
+                # Keep original data moving without extra try/except
                 inputs = {k: v.to(self.device, non_blocking=True) for k, v in inputs.items()}
                 targets = targets.to(self.device, non_blocking=True)
                 with amp_ctx:
+                    # Keep original forward/loss calc without extra try/except
                     pred = self.model(inputs)
                     loss = self.criterion(pred, targets)
+
+                # Check for non-finite loss
                 if not torch.isfinite(loss):
-                    continue  # skip nan/inf batch
+                    logger.info("Non finite loss!")
+                    continue
+
                 if train:
+                    # Backward pass & optimization step
                     self.optimizer.zero_grad(set_to_none=True)
-                    if self.use_amp:
+                    if self.scaler: # Check if scaler exists (i.e., use_amp is True)
                         self.scaler.scale(loss).backward()
-                        self.scaler.unscale_(self.optimizer)
+                        self.scaler.unscale_(self.optimizer) # Unscale before clipping
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
@@ -257,8 +279,12 @@ class ModelTrainer:
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         self.optimizer.step()
+
+                # Accumulate loss
                 total += loss.item()
                 cnt += 1
+
+        # Calculate average loss for the epoch
         return total / max(cnt, 1)
 
     # ------------------------------------------------------------------ #
@@ -267,30 +293,37 @@ class ModelTrainer:
 
     def _checkpoint(self, name: str, epoch: int, val_loss: float, *, final: bool = False) -> None:
         """Save model & metadata; compatible with torch.compile‑wrapped models."""
+        # Ensure the model object for saving state_dict is the original one if compiled
         mod = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
         path = self.save_dir / name
-        torch.save(
-            {
-                "state_dict": mod.state_dict(),
-                "epoch": epoch,
-                "val_loss": val_loss,
-                "config": self.cfg,
-            },
-            path,
-        )
+        checkpoint_data = {
+            "state_dict": mod.state_dict(),
+            "epoch": epoch,
+            "val_loss": val_loss,
+            "config": self.cfg, # Save config used for this training run
+        }
+        # Keep original saving without extra try/except
+        torch.save(checkpoint_data, path)
+        # Original logged only final save, keeping it that way
         if final:
             logger.info("Final model saved → %s", path.name)
 
+
     def test(self) -> None:
+        """Evaluate the final model on the held-out test set."""
+        # Keep original test execution without extra logging/eval mode setting
         loss = self._run_epoch(self.test_loader, train=False)
         logger.info("Test loss: %.4e", loss)
+        # Keep original saving without extra try/except or logging
         save_json({"test_loss": loss}, self.save_dir / "test_metrics.json")
+
 
     # ------------------------------------------------------------------ #
     # utilities                                                          #
     # ------------------------------------------------------------------ #
 
     def _save_test_list(self, dataset: Dataset) -> None:
+        """Saves the indices used for the test set."""
         save_json({"test_indices": sorted(self.test_indices)}, self.save_dir / "test_set_info.json")
 
 

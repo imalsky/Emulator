@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
 utils.py – core helpers for the atmospheric-profile pipeline.
-
-Highlights
-----------
-* JSON / JSONC loading (optional json5)
-* Rigorous config validation
-* Simple logging bootstrap
-* Robust JSON serialisation for numpy / torch / Path
-* One-call reproducibility seeding
 """
 
 from __future__ import annotations

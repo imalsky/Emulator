@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["DataNormalizer"]
 
-
 # --------------------------------------------------------------------------- #
 # helper utilities                                                             #
 # --------------------------------------------------------------------------- #
@@ -33,7 +32,6 @@ __all__ = ["DataNormalizer"]
 def _to_tensor(v: Union[List[float], float]) -> Tensor:
     """Convert a scalar or python list to a 1-D float32 tensor."""
     return torch.tensor(v if isinstance(v, list) else [v], dtype=torch.float32)
-
 
 # --------------------------------------------------------------------------- #
 # main class                                                                   #
@@ -64,7 +62,7 @@ class DataNormalizer:
         output_folder: Union[str, Path],
         *,
         batch_size: int = 100,
-        epsilon: float = 1e-20,
+        epsilon: float = 1e-10,
     ) -> None:
         self.input_dir = Path(input_folder)
         self.output_dir = Path(output_folder)
@@ -294,7 +292,7 @@ class DataNormalizer:
         if x.numel() == 0 or method == "none" or stats.get("is_constant"):
             return x
 
-        eps = stats.get("epsilon", 1e-20)
+        eps = stats.get("epsilon", 1e-10)
         method = method.lower().strip()
 
         if method == "iqr":
@@ -386,7 +384,7 @@ class DataNormalizer:
         orig_dtype = x.dtype
         x = x.float()
 
-        eps = stats.get("epsilon", 1e-20)
+        eps = stats.get("epsilon", 1e-10)
 
         if method == "iqr":
             y = x * stats["iqr"] + stats["median"]
