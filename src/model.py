@@ -10,8 +10,6 @@ Features:
 
 The model is designed for regression tasks on 1D atmospheric profiles. The output sequence length is
 determined by the target variable specification.
-
-MODIFIED: Using OLDER SinePositionalEncoding and OLDER FiLMLayer.
 """
 
 import math
