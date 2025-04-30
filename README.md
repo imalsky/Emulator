@@ -2,24 +2,22 @@
 
 ## Overview
 
-SequenceEmulator is a deep learning project designed to predict or emulate atmospheric profiles using a transformer-based neural network implemented in PyTorch. It tackles this as a regression task, learning complex relationships within and between different types of atmospheric sequence data. The model can handle multiple input sequences simultaneously and incorporate global context features.
+SequenceEmulator is an emulator designed to predict atmospheric profiles using a transformer-based neural network implemented in PyTorch. The model can handle multiple input sequences simultaneously and incorporate global context features.
 
 ## Model Architecture (`src/model.py`)
 
-The core model is the `MultiEncoderTransformer`, an encoder-only transformer architecture with the following components:
+The core model is the `MultiEncoderTransformer`, a bidirectional encoder-only transformer architecture with the following components:
 
 * **Multi-Encoder Design:** Can process multiple distinct input sequence types (e.g., different kinds of atmospheric measurements or simulations) concurrently. Each sequence type is handled by a dedicated `SequenceEncoder`.
 * **`SequenceEncoder`:**
     * Applies a linear projection to map input features to the model dimension (`d_model`).
-    * Optionally includes a `ConvBlock1D` module: A stack of 1D dilated convolutions with Group Normalization, GELU activation, Dropout, and residual connections, applied before the main transformer layers. This can help capture local patterns.
     * Adds `SinePositionalEncoding` to inject information about the position within the sequence.
     * Uses a standard PyTorch `TransformerEncoder` stack (composed of `TransformerEncoderLayer` with multi-head self-attention and feed-forward networks) for sequence processing. Supports `norm_first` configuration.
-* **Global Feature Handling (Optional):**
+* **Global Feature Handling:**
     * A `GlobalEncoder` (MLP with GELU, Dropout, LayerNorm) processes non-sequential global input features.
     * `FiLMLayer` (Feature-wise Linear Modulation) uses the encoded global features to generate scaling (gamma) and shifting (beta) parameters, which modulate the output of the sequence encoders, effectively conditioning them on global context.
 * **Interaction between Sequences (Optional):**
-    * `CrossAttention` module (standard multi-head attention) allows one sequence type to attend to the information encoded in another sequence type, enabling interaction and information sharing between different inputs. This is typically applied after individual sequence encoding and FiLM conditioning.
-* **Output Head:** A final linear layer maps the encoded representation of a designated `output_seq_type` to the desired target variable dimension.
+    * `CrossAttention` module allows one sequence type to attend to the information encoded in another sequence type, enabling interaction and information sharing between different inputs.
 * **Factory Function:** `create_prediction_model` builds the model instance from a configuration dictionary.
 
 ## Directory Structure
@@ -47,10 +45,6 @@ The core model is the `MultiEncoderTransformer`, an encoder-only transformer arc
 ## Setup
 
 1.  **Clone the repository:**
-    ```bash
-    git clone <repository_url>
-    cd Emulator-2
-    ```
 
 2.  **Dependencies:** The project requires Python 3 and several libraries. Key dependencies include:
     * PyTorch (including `torchvision`, `torchaudio` if installed via PyTorch website recommendations)
