@@ -1,0 +1,126 @@
+/* Basic Reset */
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+/* Google Font & Body Styling */
+body {
+    font-family: 'Roboto', sans-serif;
+    line-height: 1.7;
+    color: #333; /* Dark grey text */
+    background-color: #f8f9fa; /* Light grey background */
+    padding: 1rem;
+}
+
+/* Centered Container */
+.container {
+    max-width: 850px;
+    margin: 2rem auto;
+    padding: 2rem 3rem;
+    background-color: #ffffff; /* White content background */
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+    border-radius: 8px;
+}
+
+/* Header Styling */
+header {
+    text-align: center;
+    margin-bottom: 2.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 2px solid #e0e0e0; /* Light border */
+}
+
+header h1 {
+    color: #0056b3; /* Accent blue */
+    margin-bottom: 0.5rem;
+    font-weight: 700;
+}
+
+header p {
+    color: #555;
+    font-size: 1.1em;
+}
+
+/* Main Content Sections */
+main section {
+    margin-bottom: 2rem;
+}
+
+/* Headings within Sections */
+h2 {
+    color: #2c3e50; /* Darker blue-grey */
+    margin-bottom: 1rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid #eee;
+    font-weight: 700;
+}
+
+/* Paragraphs */
+p {
+    margin-bottom: 1rem;
+}
+
+/* Lists */
+ul {
+    list-style-position: inside;
+    padding-left: 1rem;
+    margin-bottom: 1rem;
+}
+
+li {
+    margin-bottom: 0.5rem;
+}
+
+/* Code Blocks */
+code {
+    font-family: 'Courier New', Courier, monospace;
+    background-color: #e9ecef; /* Light background for inline code */
+    padding: 0.2em 0.5em;
+    border-radius: 4px;
+    font-size: 0.95em;
+}
+
+pre {
+    background-color: #282c34; /* Dark background for code blocks */
+    color: #abb2bf; /* Light text for code blocks */
+    padding: 1rem;
+    border-radius: 5px;
+    overflow-x: auto; /* Allow horizontal scrolling for long lines */
+    margin-bottom: 1rem;
+    font-size: 0.9em;
+    line-height: 1.5;
+}
+
+pre code {
+    background-color: transparent; /* Reset background for code inside pre */
+    padding: 0;
+    border-radius: 0;
+}
+
+/* Links */
+a {
+    color: #0056b3; /* Accent blue */
+    text-decoration: none;
+    transition: color 0.2s ease-in-out;
+}
+
+a:hover {
+    color: #003d82; /* Darker blue on hover */
+    text-decoration: underline;
+}
+
+/* Footer Styling */
+footer {
+    text-align: center;
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    border-top: 2px solid #e0e0e0; /* Light border */
+    font-size: 0.9em;
+    color: #6c757d; /* Muted grey */
+}
+
+footer p {
+    margin-bottom: 0.3rem;
+}
