@@ -1,0 +1,37 @@
+# Minimal Conda environment specification for SequenceEmulator
+
+name: emulator  # You can change this name (or use 'nn' if you prefer)
+
+channels:
+  - pytorch        # Primary channel for PyTorch
+  - nvidia         # Often needed for CUDA toolkit/drivers via Conda
+  - conda-forge    # A good source for many scientific packages
+  - defaults
+
+dependencies:
+  # --- Core Requirements ---
+  - python=3.10    # Specify your desired Python version (e.g., 3.10 or 3.12 based on your export)
+
+  # Deep Learning Library (adjust pytorch-cuda based on your system if using GPU)
+  - pytorch::pytorch
+  - pytorch::torchvision # Commonly installed alongside pytorch
+  - pytorch::torchaudio # Commonly installed alongside pytorch
+  # - pytorch::pytorch-cuda=11.8 # Example: Uncomment and set your CUDA version if installing via conda
+
+  # Numerical computation
+  - numpy
+
+  # Hyperparameter Optimization
+  - optuna
+
+  # Plotting & Data Handling (mostly for notebooks/testing)
+  - matplotlib
+  - pandas
+
+  # --- Utilities ---
+  # For installing packages not readily available on Conda channels
+  - pip
+
+  # List packages to be installed via pip below
+  - pip:
+      - jsoncomment  # For parsing .jsonc configuration files

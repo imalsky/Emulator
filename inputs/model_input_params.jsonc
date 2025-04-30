@@ -23,11 +23,13 @@
       "thermal_net_flux",
       "reflected_net_flux"
     ]
+    // e.g. add "sequence2": ["var_a", "var_b"] if you have others
   },
 
   // Fixed lengths for each sequence type
   "sequence_lengths": {
     "sequence1": 100
+    // "sequence2": 50
   },
 
   "global_variables": ["orbital_sep"], // scalar features injected via FiLM
@@ -46,27 +48,19 @@
     "default_method":              "standard",
     "clip_outliers_before_scaling": false,
     "symlog_percentile":            0.10,
+    // "symlog_thresholds": { "thermal_net_flux": 1.0 },
     "epsilon":                      0
   },
 
   // ════════════════════════════════════════════════════════════════
   // MODEL HYPER-PARAMETERS
   // ════════════════════════════════════════════════════════════════
-  "d_model":            128,   // embedding size  (divisible by nhead)
+  "d_model":            256,   // embedding size  (divisible by nhead)
   "nhead":              4,    // multi-head attention heads
   "num_encoder_layers": 4,
-  "dim_feedforward":    512,
+  "dim_feedforward":    2048,
   "dropout":            0.00,
-
-  /* optional initial CNN block inside every SequenceEncoder */
-  "use_sequence_cnn":  false,
-  "cnn_kernel_size":   3,
-  "cnn_num_layers":    4,
-  "cnn_dropout":       0.05,
-
-  "norm_first":        true,   // Pre-LN transformer
-  "head_activation":   "none", // "none" | "tanh" | "sigmoid"
-
+  
   // ════════════════════════════════════════════════════════════════
   // TRAINING HYPER-PARAMETERS
   // ════════════════════════════════════════════════════════════════
@@ -76,15 +70,15 @@
 
   "optimizer":             "adamw",  // "adamw" | "adam" | "sgd"
   "learning_rate":         1e-4,
-  "weight_decay":          1e-7,
+  "weight_decay":          1e-5,
 
   "early_stopping_patience": 10,
   "min_delta":               1e-10,
 
   // LR scheduler (ReduceLROnPlateau parameters)
-  "lr_patience":          5,
+  "lr_patience":          3,
   "lr_factor":            0.5,
-  "min_lr":               1e-7,
+  "min_lr":               1e-10,
 
   // ════════════════════════════════════════════════════════════════
   // DATA-LOADING & MISC
@@ -100,5 +94,6 @@
   "clear_cuda_cache_every": 0,
 
   "use_amp":             true,   // AMP on CUDA
-  "use_torch_compile":   true    // torch.compile() on CUDA
+  "use_torch_compile":   true ,   // torch.compile() on CUDA
+  "norm_first":        true   // Pre-LN transformer
 }
