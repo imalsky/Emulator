@@ -50,6 +50,6 @@ fi
 nvidia-smi
 
 # Run your Python script
-python src/main.py --hypertune
+python src/main.py --train
 
 echo "Job completed successfully."
