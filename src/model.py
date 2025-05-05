@@ -76,12 +76,8 @@ class SequenceEncoder(nn.Module):
         self.input_proj = nn.Linear(input_dim, d_model)
         self.pos_encoder = SinePositionalEncoding(d_model)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=norm_first,
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True, norm_first=norm_first,
             activation='relu'
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
