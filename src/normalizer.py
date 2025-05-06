@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-normalizer.py – compute *and invert* eight normalisation schemes.
+normalizer.py – compute *and invert* eight normalisation schemes,
+plus a simple boolean converter.
 """
 
 from __future__ import annotations
@@ -15,27 +16,34 @@ import numpy as np
 import torch
 from torch import Tensor
 
-# Optional robust JSON writer (handles numpy / torch / Path objects)
 try:
-    from utils import save_json                # local helper
-except ImportError:                            # utils.py not on PYTHONPATH
-    save_json = None                           # type: ignore
+    from utils import save_json 
+except ImportError:
+    save_json = None 
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["DataNormalizer"]
 
 # --------------------------------------------------------------------------- #
-# helper utilities                                                             #
+# helper utilities                                                            #
 # --------------------------------------------------------------------------- #
+
 
 def _to_tensor(v: Union[List[float], float]) -> Tensor:
-    """Convert a scalar or python list to a 1-D float32 tensor."""
+    """Convert a scalar or python list to a 1‑D float32 tensor."""
     return torch.tensor(v if isinstance(v, list) else [v], dtype=torch.float32)
 
+
+def _np_quantile(t: Tensor, q: float) -> float:
+    """Quantile via NumPy in float‑64 – safe for large tensors."""
+    return float(np.quantile(t.cpu().numpy().astype(np.float64), q))
+
+
 # --------------------------------------------------------------------------- #
-# main class                                                                   #
+# main class                                                                  #
 # --------------------------------------------------------------------------- #
+
 
 class DataNormalizer:
     """Compute global statistics, normalise data, and invert the transform."""
@@ -49,6 +57,7 @@ class DataNormalizer:
         "custom",
         "symlog",
         "standard",
+        "bool",      # NEW
         "none",
     }
 
@@ -89,9 +98,9 @@ class DataNormalizer:
         if t.numel() == 0:
             return t
         if not (0 <= low < high <= 1):
-            raise ValueError("Quantiles must satisfy 0 ≤ low < high ≤ 1")
-        lo = torch.quantile(t.float(), low)
-        hi = torch.quantile(t.float(), high)
+            raise ValueError("Quantiles must satisfy 0 ≤ low < high ≤ 1")
+        lo = _np_quantile(t.float(), low)
+        hi = _np_quantile(t.float(), high)
         return torch.clamp(t, min=lo, max=hi)
 
     # ------------------------------------------------------------------ #
@@ -108,7 +117,7 @@ class DataNormalizer:
         symlog_thresholds: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
-        Scan every JSON profile, compute per-key stats for each chosen
+        Scan every JSON profile, compute per‑key stats for each chosen
         normalisation scheme, and return a metadata dict (also saved to disk).
         """
         files = [
@@ -151,11 +160,9 @@ class DataNormalizer:
             raise ValueError(f"Unknown default method '{default_method}'")
 
         key_methods = {k: m.lower().strip() for k, m in (key_methods or {}).items()}
-        methods_final = {
-            k: key_methods.get(k, default_method) for k in value_buf.keys()
-        }
+        methods_final = {k: key_methods.get(k, default_method) for k in value_buf.keys()}
         for bk in bool_keys:
-            methods_final[bk] = "none"
+            methods_final[bk] = "bool"
 
         # compute stats -------------------------------------------------
         stats: Dict[str, Any] = {}
@@ -188,7 +195,7 @@ class DataNormalizer:
             save_json(meta, meta_path)
         else:
             meta_path.write_text(json.dumps(meta, indent=2))
-        logger.info("Saved normalization metadata → %s", meta_path.name)
+        logger.info("Saved normalization metadata: %s", meta_path.name)
         return meta
 
     # ------------------------------------------------------------------ #
@@ -219,15 +226,22 @@ class DataNormalizer:
         eps = self.eps
         method = method.lower().strip()
 
+        # ('bool' and 'none' need no statistics)
+        if method in {"none", "bool"}:
+            return stats
+
+        # promote to float64 numpy to prevent overflow during mean/std
+        arr64 = data.cpu().numpy().astype(np.float64)
+
         if method == "iqr":
-            q1 = float(torch.quantile(data, 0.25))
-            q3 = float(torch.quantile(data, 0.75))
-            stats.update(median=float(torch.median(data).values), iqr=max(q3 - q1, eps))
+            q1 = np.quantile(arr64, 0.25)
+            q3 = np.quantile(arr64, 0.75)
+            stats.update(median=float(np.median(arr64)), iqr=max(q3 - q1, eps))
 
         elif method == "log-min-max":
             if gmin <= 0:
                 raise ValueError("'log-min-max' requires strictly positive data")
-            log_vals = torch.log10(data)
+            log_vals = np.log10(arr64)
             stats.update(min=float(log_vals.min()), max=float(log_vals.max()))
 
         elif method == "arctan-compression":
@@ -241,7 +255,9 @@ class DataNormalizer:
             stats["max_val"] = max(abs(gmin), abs(gmax), eps)
 
         elif method == "invlogit-compression":
-            stats.update(mean=float(data.mean()), std=max(float(data.std()), eps))
+            mu = float(arr64.mean())
+            sigma = max(float(arr64.std()), eps)
+            stats.update(mean=mu, std=sigma)
 
         elif method == "custom":
             m_pos = math.log10(gmax + 1 + eps) if gmax > -eps else 0.0
@@ -252,13 +268,16 @@ class DataNormalizer:
             if is_constant:
                 stats.update(threshold=1.0, scale_factor=1.0)
             else:
-                abs_data = torch.abs(data)
+                abs_arr = np.abs(arr64)
                 thr = max(
-                    float(torch.quantile(abs_data, symlog_percentile))
-                    if symlog_threshold is None
-                    else symlog_threshold,
+                    float(
+                        np.quantile(abs_arr, symlog_percentile)
+                        if symlog_threshold is None
+                        else symlog_threshold
+                    ),
                     eps,
                 )
+                abs_data = torch.from_numpy(abs_arr).to(data.dtype)
                 lin = abs_data <= thr
                 trans = torch.zeros_like(data)
                 trans[lin] = data[lin] / thr
@@ -270,13 +289,12 @@ class DataNormalizer:
                 )
 
         elif method == "standard":
-            mu, sigma = float(data.mean()), max(float(data.std()), eps)
+            mu = float(arr64.mean())
+            sigma = max(float(arr64.std()), eps)
             z = (data - mu) / sigma if not is_constant else torch.zeros_like(data)
             scale = max(3.0, float(torch.max(torch.abs(z)))) if not is_constant else 1.0
             stats.update(mean=mu, std=sigma, scale_factor=scale)
 
-        elif method == "none":
-            pass
         else:
             raise ValueError(f"Unsupported method '{method}'")
 
@@ -288,12 +306,15 @@ class DataNormalizer:
 
     @staticmethod
     def normalize_tensor(x: Tensor, method: str, stats: Dict[str, float]) -> Tensor:
-        """Return a new tensor – **does not** modify *x* in-place."""
-        if x.numel() == 0 or method == "none" or stats.get("is_constant"):
+        """Return a new tensor – **does not** modify *x* in‑place."""
+        if x.numel() == 0 or stats.get("is_constant"):
+            return x
+
+        method = method.lower().strip()
+        if method in {"none", "bool"}:
             return x
 
         eps = stats.get("epsilon", 1e-10)
-        method = method.lower().strip()
 
         if method == "iqr":
             y = (x - stats["median"]) / stats["iqr"]
@@ -326,7 +347,7 @@ class DataNormalizer:
         elif method == "symlog":
             thr, sf = stats["threshold"], stats["scale_factor"]
             abs_x = torch.abs(x)
-            lin = abs_x <= thr                       # linear region
+            lin = abs_x <= thr
             y = torch.zeros_like(x)
             y[lin] = x[lin] / thr
             safe_arg = torch.clamp(abs_x[~lin] / thr, min=eps)
@@ -354,12 +375,21 @@ class DataNormalizer:
         v: Union[Tensor, List[float], float],
         metadata: Dict[str, Any],
         var_name: str,
-    ) -> Union[Tensor, List[float], float]:
+    ) -> Union[Tensor, List[float], float, bool]:
         """
         Invert the normalisation for variable *var_name* using *metadata*.
         """
         methods = metadata.get("normalization_methods", {})
         method = methods.get(var_name, "none").lower().strip()
+
+        # Boolean inversion needs no stats
+        if method == "bool":
+            if isinstance(v, Tensor):
+                return (v != 0).to(dtype=torch.bool)
+            if isinstance(v, list):
+                return [bool(x) for x in v]
+            return bool(v)
+
         if method == "none":
             return v
 
@@ -460,6 +490,18 @@ class DataNormalizer:
             out_prof: Dict[str, Any] = {}
             for k, v in prof.items():
                 meth = methods.get(k, "none").lower()
+
+                # Boolean handling ------------------------------------
+                if meth == "bool":
+                    if v is None:
+                        out_prof[k] = v
+                    elif isinstance(v, list):
+                        out_prof[k] = [int(bool(x)) for x in v]
+                    else:
+                        out_prof[k] = int(bool(v))
+                    continue
+
+                # Skip untouched keys ---------------------------------
                 if meth == "none" or v is None or isinstance(v, bool):
                     out_prof[k] = v
                     continue
@@ -495,4 +537,4 @@ class DataNormalizer:
             else:
                 out_path.write_text(json.dumps(out_prof, indent=2))
 
-        logger.info("Normalization complete → %s", self.output_dir)
+        logger.info("Normalization complete %s", self.output_dir)

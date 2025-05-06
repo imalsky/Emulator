@@ -78,7 +78,7 @@ class SequenceEncoder(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
             dropout=dropout, batch_first=True, norm_first=norm_first,
-            activation='relu'
+            activation='gelu'
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 

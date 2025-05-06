@@ -2,37 +2,26 @@
   // ════════════════════════════════════════════════════════════════
   // DATA SPECIFICATION
   // ════════════════════════════════════════════════════════════════
-  "input_variables": [
-    "pressure",          // per-level sequence
-    "temperature",       // per-level sequence
-    "orbital_sep"        // global scalar (kept here for bookkeeping)
-  ],
+  "input_variables": ["wavenumber_cm-1"],
 
-  "target_variables": [
-    "thermal_net_flux",  // per-level sequence to predict
-    "reflected_net_flux" // per-level sequence to predict
-  ],
+  "target_variables": ["thermal_flux"],
 
   /* One or more *sequence types*.
      Every variable listed under a key must have identical length
      inside every JSON profile – the loader enforces this strictly. */
   "sequence_types": {
-    "sequence1": [
-      "pressure",
-      "temperature",
-      "thermal_net_flux",
-      "reflected_net_flux"
-    ]
-    // e.g. add "sequence2": ["var_a", "var_b"] if you have others
+    "sequence1": ["wavenumber_cm-1","thermal_flux"]
   },
 
   // Fixed lengths for each sequence type
   "sequence_lengths": {
-    "sequence1": 100
+    "sequence1": 196
     // "sequence2": 50
   },
 
-  "global_variables": ["orbital_sep"], // scalar features injected via FiLM
+  "global_variables":   ["pressure_power_law","log_delta","alpha","T_int",
+                         "T_irr","mu","temperature_shift","gravity","Tstar",
+                         "orbital_separation_au","is_nightside","log_gamma1","log_gamma2"],
   "output_seq_type":  "sequence1",     // defines the model-head length
 
   // ════════════════════════════════════════════════════════════════
@@ -40,25 +29,23 @@
   // ════════════════════════════════════════════════════════════════
   "normalization": {
     "key_methods": {
-      // NB: strictly positive data required for log-min-max
-      "pressure":           "log-min-max",
-      "thermal_net_flux":   "symlog",
-      "reflected_net_flux": "symlog"
+      "wavenumber_cm-1": "log-min-max",
+      "thermal_flux": "symlog",
+      "is_nightside": "bool"
     },
     "default_method":              "standard",
     "clip_outliers_before_scaling": false,
     "symlog_percentile":            0.10,
-    // "symlog_thresholds": { "thermal_net_flux": 1.0 },
-    "epsilon":                      0
+    "epsilon":                      1e-10
   },
 
   // ════════════════════════════════════════════════════════════════
   // MODEL HYPER-PARAMETERS
   // ════════════════════════════════════════════════════════════════
-  "d_model":            256,   // embedding size  (divisible by nhead)
+  "d_model":            128,   // embedding size  (divisible by nhead)
   "nhead":              4,    // multi-head attention heads
-  "num_encoder_layers": 4,
-  "dim_feedforward":    2048,
+  "num_encoder_layers": 3,
+  "dim_feedforward":    512,
   "dropout":            0.00,
   
   // ════════════════════════════════════════════════════════════════
