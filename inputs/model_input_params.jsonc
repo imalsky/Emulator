@@ -15,6 +15,10 @@
   },
 
   // Fixed lengths for each sequence type
+  // This is intentionally kinda bad code
+  // To force the user to make sure that all the sequences are the same length
+  // and that the length is known
+  // I don't want to pad the sequences. Too many errors might slip by
   "sequence_lengths": {
     "sequence1": 485
   },
@@ -39,7 +43,7 @@
 
   "normalization": {
     "key_methods": {
-      //"wavenumber_cm-1": "log-min-max",
+      "wav": "log-min-max"
       //"thermal_flux": "log-min-max",
       //"is_nightside": "bool"
     },
@@ -54,15 +58,16 @@
   // ════════════════════════════════════════════════════════════════
   "d_model":            128,   // embedding size  (divisible by nhead)
   "nhead":              4,    // multi-head attention heads
-  "num_encoder_layers": 3,
-  "dim_feedforward":    256,
+  "num_encoder_layers": 4,
+  "dim_feedforward":    512,
   "dropout":            0.00,
-  
+  "positional_encoding_type": "None",
+
   // ════════════════════════════════════════════════════════════════
   // TRAINING HYPER-PARAMETERS
   // ════════════════════════════════════════════════════════════════
   "batch_size":            16,
-  "epochs":                100,
+  "epochs":                10,
   "gradient_clip_val":     1.0,
 
   "optimizer":             "adamw",  // "adamw" | "adam" | "sgd"

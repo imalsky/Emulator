@@ -15,6 +15,7 @@ determined by the target variable specification.
 import math
 import logging
 from typing import Dict, Optional, List, Set, Tuple
+import sys # Added for sys.exit
 
 import torch
 import torch.nn as nn
@@ -70,11 +71,22 @@ class SequenceEncoder(nn.Module):
         num_layers: int,
         dim_feedforward: int,
         dropout: float = 0.1,
-        norm_first: bool = False
+        norm_first: bool = False,
+        positional_encoding_type: Optional[str] = "sinusoidal",
+        max_len: int = 512
     ):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, d_model)
-        self.pos_encoder = SinePositionalEncoding(d_model)
+
+        if positional_encoding_type is None or 'None' or 'none':
+            self.pos_encoder = None
+            logger.warning("No positional encoding will be used for SequenceEncoder.")
+        elif positional_encoding_type.lower() in ["sinusoidal", "sine"]:
+            self.pos_encoder = SinePositionalEncoding(d_model, max_len=max_len)
+        else:
+            logger.error(f"Unsupported positional_encoding_type: {positional_encoding_type}. Choose None or 'sinusoidal'.")
+            sys.exit(1)
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
             dropout=dropout, batch_first=True, norm_first=norm_first,
@@ -85,7 +97,8 @@ class SequenceEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the sequence encoder."""
         x = self.input_proj(x)
-        x = self.pos_encoder(x)
+        if self.pos_encoder is not None:
+            x = self.pos_encoder(x)
         return self.encoder(x)
 
 
@@ -179,6 +192,7 @@ class MultiEncoderTransformer(nn.Module):
         output_seq_type: Key from sequence_dims defining output length.
         norm_first: If True, apply layer norm before other ops.
         max_sequence_length: Maximum supported sequence length.
+        positional_encoding_type: Type of positional encoding for sequences.
     """
     def __init__(
         self,
@@ -192,7 +206,8 @@ class MultiEncoderTransformer(nn.Module):
         dropout: float = 0.1,
         output_seq_type: Optional[str] = None,
         norm_first: bool = False,
-        max_sequence_length: int = 512
+        max_sequence_length: int = 512,
+        positional_encoding_type: Optional[str] = "sinusoidal"
     ):
         super().__init__()
         self.d_model = d_model
@@ -231,7 +246,9 @@ class MultiEncoderTransformer(nn.Module):
                 input_dim=len(var_dict), d_model=d_model, nhead=nhead,
                 num_layers=num_encoder_layers,
                 dim_feedforward=dim_feedforward, dropout=dropout,
-                norm_first=norm_first
+                norm_first=norm_first,
+                positional_encoding_type=positional_encoding_type,
+                max_len=max_sequence_length
             )
 
         self.global_encoder = None
@@ -411,6 +428,8 @@ def create_prediction_model(
     target_variables = config.get("target_variables")
     sequence_types_config = config.get("sequence_types")
     global_variables = config.get("global_variables", [])
+    positional_encoding_type = config.get("positional_encoding_type", "sinusoidal")
+
 
     if not input_variables: raise ValueError("'input_variables' missing/empty.")
     if not target_variables: raise ValueError("'target_variables' missing/empty.")
@@ -478,7 +497,8 @@ def create_prediction_model(
         dropout=config.get("dropout", 0.1),
         output_seq_type=output_seq_type,
         norm_first=config.get("norm_first", False),
-        max_sequence_length=config.get("max_sequence_length", 512)
+        max_sequence_length=config.get("max_sequence_length", 512),
+        positional_encoding_type=positional_encoding_type
     )
 
     model.input_vars = list(input_variables)
