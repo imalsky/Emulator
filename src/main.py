@@ -48,10 +48,11 @@ def _normalize(cfg: Dict[str, Any], data_root: Path) -> bool:
 
     norm_cfg = cfg.get("normalization", {}) #
     config_epsilon = norm_cfg.get("epsilon") # Read epsilon from the loaded config section
-    normalizer = DataNormalizer( #
+    normalizer = DataNormalizer(
         input_folder=raw_dir,
         output_folder=out_dir,
-        epsilon=config_epsilon if config_epsilon is not None else 1e-10
+        config_data=cfg,
+        epsilon=norm_cfg.get("epsilon")
     )
     
     # The epsilon used for stats calculation is now the one passed to the constructor
