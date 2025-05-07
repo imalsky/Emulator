@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-hyperparams.py – Optuna-based hyperparameter tuning for the atmospheric-flux transformer.
+hyperparams.py – Optuna-based hyperparameter tuning.
 
-This module defines the hyperparameter search space, the Optuna objective function,
-and manages the overall optimization process, including checkpointing the best
-configuration found so far and saving the final best configuration.
+This module defines the hyperparameter search space, the Optuna objective
+function, and manages the overall optimization process.
 """
 from __future__ import annotations
 
 import copy
+import json as std_json
 import logging
 import os
 from datetime import datetime
@@ -16,102 +16,101 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import optuna
-import torch # Keep for torch.isfinite
+import torch
 from optuna import Study, Trial
 from optuna.exceptions import TrialPruned
 
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------- #
-# Hyperparameter Space Definition                                             #
-# --------------------------------------------------------------------------- #
 
 def _suggest_hyperparams(trial: Trial, cfg: Dict[str, Any]) -> None:
     """
-    Suggests hyperparameters using Optuna's trial object and updates cfg in-place.
+    Suggests hyperparameters using Optuna's trial object.
+
+    This function updates the provided configuration dictionary `cfg` in-place
+    with hyperparameter values suggested by the Optuna `trial`.
+
+    Args:
+        trial: The Optuna trial object for the current optimization iteration.
+        cfg: The configuration dictionary to be updated with suggested values.
     """
     cfg.update(
         {
             "d_model": trial.suggest_categorical("d_model", [256, 512]),
             "nhead": trial.suggest_categorical("nhead", [4, 8, 16]),
             "num_encoder_layers": trial.suggest_int("num_encoder_layers", 2, 8),
-            "dim_feedforward": trial.suggest_categorical("dim_feedforward", [1024, 2048, 4096]),
+            "dim_feedforward": trial.suggest_categorical(
+                "dim_feedforward", [1024, 2048, 4096]
+            ),
             "dropout": trial.suggest_float("dropout", 0.0, 0.3, step=0.05),
-            # Example for other tunable parameters if they are in your base_config:
-            # "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
-            # "batch_size": trial.suggest_categorical("batch_size", [16, 32, 64]),
-            # "optimizer": trial.suggest_categorical("optimizer", ["adamw", "adam", "sgd"]),
         }
     )
-    # If learning_rate, batch_size etc. are part of base_config and meant to be tuned,
-    # ensure they are also updated here. For example:
-    # if "learning_rate" in cfg: # Check if it exists in base_config to be overridden
-    #     cfg["learning_rate"] = trial.suggest_float("learning_rate_tuned", 1e-5, 1e-3, log=True)
 
-
-# --------------------------------------------------------------------------- #
-# Optuna Objective Function                                                   #
-# --------------------------------------------------------------------------- #
 
 def _objective(
     trial: Trial,
     base_config: Dict[str, Any],
     data_dir: Path,
-    setup_dataset_fn: Callable[[Dict[str, Any], Path], Optional[Tuple[Any, Callable]]],
-    train_fn: Callable[[Dict[str, Any], Any, Any, Any, Path], float],
+    setup_dataset_fn: Callable[
+        [Dict[str, Any], Path], Optional[Tuple[Any, Callable]]
+    ],
+    train_fn: Callable[
+        [Trial, Dict[str, Any], Any, Any, Any, Path], float
+    ],
     device_fn: Callable[[], Any],
-    save_config_fn: Callable[[Dict[str, Any], Union[str, Path]], bool], # Explicitly pass this
+    save_config_fn: Callable[[Dict[str, Any], Union[str, Path]], bool],
     ckpt_root: Path,
 ) -> float:
     """
-    Objective function for Optuna optimization.
+    Defines the objective function for Optuna hyperparameter optimization.
+
+    This function takes an Optuna trial, suggests hyperparameters, sets up
+    the dataset and device, runs the training process, and returns the
+    metric to be optimized (e.g., validation loss).
 
     Args:
-        trial: Optuna trial object.
-        base_config: Base configuration dictionary.
+        trial: The Optuna trial object.
+        base_config: The base configuration dictionary.
         data_dir: Path to the data directory.
         setup_dataset_fn: Function to set up the dataset and collate function.
-        train_fn: Function to train the model and return best validation score.
+        train_fn: Function to train the model and return the optimization metric.
         device_fn: Function to get the computational device.
         save_config_fn: Function to save the configuration dictionary.
-        ckpt_root: Root directory for trial-specific checkpoints.
+        ckpt_root: Root directory for trial-specific checkpoints and configurations.
 
     Returns:
-        Best validation score achieved during training for this trial.
+        The value of the metric to be minimized (e.g., best validation loss).
 
     Raises:
-        TrialPruned: If the trial should be pruned early.
+        TrialPruned: If the trial is pruned by Optuna or due to an error.
     """
     cfg = copy.deepcopy(base_config)
-    cfg["optuna_trial_number"] = trial.number # Add trial number for reference
+    cfg["optuna_trial_number"] = trial.number
     _suggest_hyperparams(trial, cfg)
 
     if cfg["d_model"] % cfg["nhead"] != 0:
         logger.warning(
             "Trial %d pruned: d_model (%d) not divisible by nhead (%d).",
-            trial.number, cfg["d_model"], cfg["nhead"]
+            trial.number,
+            cfg["d_model"],
+            cfg["nhead"],
         )
         raise TrialPruned("d_model must be divisible by nhead")
 
-    # Ensure the trial's checkpoint directory exists before saving config
     ckpt_root.mkdir(parents=True, exist_ok=True)
-
-    # Save the current trial's full configuration
-    trial_config_path = ckpt_root / "trial_config.json" # Changed from .json5 to .json for consistency
+    trial_config_path = ckpt_root / "trial_config.json"
     try:
-        if save_config_fn(cfg, trial_config_path):
-            logger.info(f"Trial {trial.number}: Saved trial-specific config to {trial_config_path}")
-        else:
-            logger.warning(f"Trial {trial.number}: Failed to save trial-specific config to {trial_config_path}")
+        save_config_fn(cfg, trial_config_path)
+        logger.info(
+            f"Trial {trial.number}: Saved trial-specific config to "
+            f"{trial_config_path}"
+        )
+        trial.set_user_attr("full_config_dict_path", str(trial_config_path))
     except Exception as e:
-        logger.error(f"Trial {trial.number}: Error saving trial-specific config: {e}", exc_info=True)
-    
-    # Store the full config in trial user_attrs for potential access in _checkpoint_best_config
-    try:
-        trial.set_user_attr("full_config_dict", cfg)
-    except Exception as e: # Optuna might have limitations on attribute size
-        logger.warning(f"Trial {trial.number}: Could not set full_config_dict as user_attr: {e}")
-
+        logger.error(
+            f"Trial {trial.number}: Error saving/setting trial config: {e}",
+            exc_info=True,
+        )
 
     device = device_fn()
     dataset_info = setup_dataset_fn(cfg, data_dir)
@@ -121,97 +120,138 @@ def _objective(
     dataset, collate = dataset_info
 
     try:
-        best_val = train_fn(cfg, device, dataset, collate, ckpt_root)
-    except TrialPruned as e: # Let Optuna handle pruning gracefully
-        logger.info("Trial %d pruned during training: %s", trial.number, e)
+        best_val = train_fn(trial, cfg, device, dataset, collate, ckpt_root)
+    except TrialPruned:
         raise
     except Exception as e:
-        logger.error("Trial %d training failed: %s", trial.number, e, exc_info=True)
-        # Consider returning a high loss value instead of pruning for unexpected errors,
-        # or re-raise if it's critical. For now, pruning.
+        logger.error(
+            "Trial %d training failed: %s", trial.number, e, exc_info=True
+        )
         raise TrialPruned(f"Training exception: {e}") from e
 
-    if not (isinstance(best_val, float) and torch.isfinite(torch.tensor(best_val))):
+    if not (
+        isinstance(best_val, float) and torch.isfinite(torch.tensor(best_val))
+    ):
         logger.warning(
             "Trial %d pruned: non-finite validation loss (%.4e).",
-            trial.number, best_val
+            trial.number,
+            best_val,
         )
         raise TrialPruned("non-finite validation loss")
 
-    logger.info("Trial %d finished with validation loss: %.4e", trial.number, best_val)
+    logger.info(
+        "Trial %d finished with validation loss: %.4e", trial.number, best_val
+    )
     return best_val
 
-
-# --------------------------------------------------------------------------- #
-# Public API: Main Search Function                                            #
-# --------------------------------------------------------------------------- #
 
 def run_hyperparameter_search(
     base_config: Dict[str, Any],
     data_dir: str,
     output_dir: str,
-    setup_dataset_func: Callable[[Dict[str, Any], Path], Optional[Tuple[Any, Callable]]],
-    train_model_func: Callable[[Dict[str, Any], Any, Any, Any, Path], float],
+    setup_dataset_func: Callable[
+        [Dict[str, Any], Path], Optional[Tuple[Any, Callable]]
+    ],
+    train_model_func: Callable[
+        [Trial, Dict[str, Any], Any, Any, Any, Path], float
+    ],
     setup_device_func: Callable[[], Any],
     save_config_func: Callable[[Dict[str, Any], Union[str, Path]], bool],
     *,
     num_trials: int = 10,
 ) -> Optional[Dict[str, Any]]:
     """
-    Runs the hyperparameter search using Optuna.
-    (Args description remains the same as your provided version)
+    Executes the Optuna hyperparameter search process.
+
+    This function initializes an Optuna study, defines a sampler and pruner,
+    and runs the optimization loop for a specified number of trials.
+    It saves the best configuration found.
+
+    Args:
+        base_config: The starting configuration dictionary.
+        data_dir: Path to the directory containing the dataset.
+        output_dir: Path to the directory where results and checkpoints are saved.
+        setup_dataset_func: Callable that returns the dataset and collate function.
+        train_model_func: Callable that trains the model and returns the best score.
+        setup_device_func: Callable that returns the compute device.
+        save_config_func: Callable to save the configuration dictionary to a file.
+        num_trials: The number of Optuna trials to run.
+
+    Returns:
+        The best configuration dictionary found, or None if the search fails
+        or no trials complete.
     """
     data_path = Path(data_dir)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # Save the base configuration used for this tuning session for reference
     try:
-        save_config_func(base_config, out_path / "base_config_for_tuning_run.json")
-        logger.info(f"Saved base configuration for this tuning run to {out_path / 'base_config_for_tuning_run.json'}")
+        save_config_func(
+            base_config, out_path / "base_config_for_tuning_run.json"
+        )
     except Exception as e:
-        logger.error(f"Failed to save base configuration for tuning run: {e}", exc_info=True)
+        logger.error(
+            f"Failed to save base configuration for tuning run: {e}",
+            exc_info=True,
+        )
 
+    n_startup_trials = base_config.get(
+        "optuna_pruner_startup_trials", max(1, num_trials // 20)
+    )
+    n_warmup_steps = base_config.get("optuna_pruner_warmup_steps", 1)
+    interval_steps = base_config.get("optuna_pruner_interval_steps", 1)
 
     sampler = optuna.samplers.TPESampler(
         seed=base_config.get("random_seed", 42),
         multivariate=True,
         group=True,
-        warn_independent_sampling=False
+        warn_independent_sampling=False,
     )
     pruner = optuna.pruners.MedianPruner(
-        n_startup_trials=max(5, num_trials // 10),
-        n_warmup_steps=base_config.get("optuna_pruner_warmup_steps", 3),
-        interval_steps=base_config.get("optuna_pruner_interval_steps", 1)
+        n_startup_trials=n_startup_trials,
+        n_warmup_steps=n_warmup_steps,
+        interval_steps=interval_steps,
     )
-    study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
+    study = optuna.create_study(
+        direction="minimize", sampler=sampler, pruner=pruner
+    )
 
     def _checkpoint_best_config(study_: Study, trial_: Trial) -> None:
-        """Saves information about the best trial so far."""
+        """
+        Callback to save a summary of the best trial found so far.
+        """
         if study_.best_trial is None or study_.best_trial.number != trial_.number:
             return
-
         logger.info(
             "Trial %d is new best (loss=%.4e). Optuna params: %s",
-            trial_.number, trial_.value, trial_.params
+            trial_.number,
+            trial_.value,
+            trial_.params,
         )
-        # The full configuration for this best trial is already saved in its trial_X directory.
-        # Here, we save a summary of the best Optuna parameters.
-        best_optuna_summary = {
+        summary = {
             "best_trial_number": trial_.number,
             "best_value": trial_.value,
             "optuna_suggested_params": trial_.params,
-            "trial_config_location": str(out_path / f"trial_{trial_.number}" / "trial_config.json")
+            "trial_config_location": trial_.user_attrs.get(
+                "full_config_dict_path", "N/A"
+            ),
         }
         try:
-            save_config_func(best_optuna_summary, out_path / "best_trial_summary_current.json")
+            save_config_func(
+                summary, out_path / "best_trial_summary_current.json"
+            )
         except Exception as e:
             logger.error(
-                f"Failed to save best current trial summary for trial {trial_.number}: {e}",
-                exc_info=True
+                f"Failed to save best current trial summary for trial "
+                f"{trial_.number}: {e}",
+                exc_info=True,
             )
 
-    logger.info("Starting Optuna hyperparameter search for %d trials...", num_trials)
+    logger.info(
+        f"Starting Optuna search ({num_trials} trials) with pruner: "
+        f"MedianPruner(startup={n_startup_trials}, warmup={n_warmup_steps}, "
+        f"interval={interval_steps})"
+    )
     start_time = datetime.now()
 
     try:
@@ -223,94 +263,69 @@ def run_hyperparameter_search(
                 setup_dataset_func,
                 train_model_func,
                 setup_device_func,
-                save_config_func,  # Pass the save_config_func here
-                out_path / f"trial_{t.number}", # This is ckpt_root
+                save_config_func,
+                out_path / f"trial_{t.number}",
             ),
             n_trials=num_trials,
             callbacks=[_checkpoint_best_config],
             gc_after_trial=True,
             show_progress_bar=os.getenv("DISABLE_TQDM", "0") == "0",
-            catch=(TrialPruned,), # Ensure TrialPruned exceptions are caught and handled by Optuna
+            catch=(TrialPruned,),
         )
     except KeyboardInterrupt:
         logger.warning("Search interrupted by user.")
-    except Exception as exc: # Catch other unexpected errors during study.optimize
-        logger.error("Optuna search failed unexpectedly: %s", exc, exc_info=True)
+        return None
+    except Exception as exc:
+        logger.error(
+            "Optuna search failed unexpectedly: %s", exc, exc_info=True
+        )
         return None
     finally:
-        duration = datetime.now() - start_time
-        logger.info("Optuna search duration: %s", duration)
+        logger.info("Optuna search duration: %s", datetime.now() - start_time)
 
-    if not study.trials:
-        logger.error("No trials were run.")
-        return None
-
-    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    completed_trials = [
+        t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
+    ]
     if not completed_trials:
         logger.error("No trials completed successfully.")
-        pruned_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
-        fail_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
-        logger.info(
-            "Trial summary: %d pruned, %d failed.",
-            len(pruned_trials), len(fail_trials)
-        )
         return None
 
     best_trial = study.best_trial
     logger.info(
         "Best trial overall: #%d, Value: %.4e, Optuna Params: %s",
-        best_trial.number, best_trial.value, best_trial.params
+        best_trial.number,
+        best_trial.value,
+        best_trial.params,
     )
 
-    # Construct the best_cfg using the full configuration stored in the best trial's directory
-    best_trial_config_path = out_path / f"trial_{best_trial.number}" / "trial_config.json"
     best_cfg_overall = None
-    if best_trial_config_path.exists():
+    best_trial_cfg_path = (
+        out_path / f"trial_{best_trial.number}" / "trial_config.json"
+    )
+    if best_trial_cfg_path.exists():
         try:
-            with open(best_trial_config_path, 'r') as f:
-                # Assuming trial_config.json is standard JSON. If it could be jsonc,
-                # utils.load_config (which handles jsonc) should be used.
-                # For simplicity, using standard json.load here as save_config_func uses json.dump.
-                import json as std_json 
+            with open(best_trial_cfg_path, "r") as f:
                 best_cfg_overall = std_json.load(f)
-            # Ensure Optuna specific values are also in the final best_cfg if not already captured
-            best_cfg_overall["optuna_final_best_trial_number"] = best_trial.number
-            best_cfg_overall["optuna_final_best_value"] = best_trial.value
-            best_cfg_overall["optuna_suggested_params_for_best_trial"] = best_trial.params
-
         except Exception as e:
-            logger.error(f"Failed to load the best trial's config from {best_trial_config_path}: {e}. Falling back to reconstructing from base_config and params.")
-            best_cfg_overall = copy.deepcopy(base_config)
-            best_cfg_overall.update(best_trial.params)
-            best_cfg_overall["optuna_final_best_trial_number"] = best_trial.number
-            best_cfg_overall["optuna_final_best_value"] = best_trial.value
-    else:
-        logger.warning(f"Best trial's config file not found at {best_trial_config_path}. Reconstructing from base_config and params.")
+            logger.error(f"Failed to load best trial's config: {e}")
+
+    if best_cfg_overall is None:
         best_cfg_overall = copy.deepcopy(base_config)
         best_cfg_overall.update(best_trial.params)
-        best_cfg_overall["optuna_final_best_trial_number"] = best_trial.number
-        best_cfg_overall["optuna_final_best_value"] = best_trial.value
+        logger.warning("Reconstructed best_cfg_overall from base and Optuna params.")
 
+    best_cfg_overall["optuna_final_best_trial_number"] = best_trial.number
+    best_cfg_overall["optuna_final_best_value"] = best_trial.value
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     final_path = out_path / f"best_config_overall_{timestamp}.json"
-
     try:
-        if save_config_func(best_cfg_overall, final_path):
-            logger.info(
-                "Hyperparameter search complete. Best overall config (from trial %d) saved to %s",
-                best_trial.number, final_path.name
-            )
-            # Also save to a non-timestamped file for easy access to the latest best
-            fixed_best_path = out_path / "best_config.json"
-            if save_config_func(best_cfg_overall, fixed_best_path):
-                 logger.info("Also saved best overall config to %s", fixed_best_path.name)
-        else:
-            logger.error("Failed to save final best overall configuration.")
-            return None
+        save_config_func(best_cfg_overall, final_path)
+        logger.info(f"Best overall config saved to {final_path.name}")
+        save_config_func(best_cfg_overall, out_path / "best_config.json")
     except Exception as e:
         logger.error(
-            "Exception during final config save: %s", e, exc_info=True
+            f"Exception during final config save: {e}", exc_info=True
         )
         return None
 

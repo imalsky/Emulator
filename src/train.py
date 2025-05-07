@@ -2,6 +2,9 @@
 """
 train.py – streamlined training loop for the multi‑source transformer.
 
+This module contains the ModelTrainer class, which handles the training,
+validation, and testing of the transformer model, including checkpointing,
+early stopping, and Optuna integration for hyperparameter tuning.
 """
 from __future__ import annotations
 
@@ -11,10 +14,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import numpy as np
+import optuna
 import torch
+from optuna.exceptions import TrialPruned
 from torch import nn, optim
-from torch.amp.grad_scaler import GradScaler # Added import
+from torch.amp.grad_scaler import GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset, Subset
 
@@ -24,9 +28,6 @@ from utils import save_json
 
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------- #
-# helpers                                                                     #
-# --------------------------------------------------------------------------- #
 
 def _split_dataset(
     dataset: Dataset,
@@ -35,29 +36,56 @@ def _split_dataset(
     *,
     seed: int = 42,
 ) -> Tuple[Subset, Subset, Subset, List[int]]:
-    """Deterministically split *dataset* into train / val / test subsets."""
-    n = len(dataset)
-    if not (0 < val_frac < 1 and 0 < test_frac < 1 and val_frac + test_frac < 1):
-        raise ValueError("fractions must be between 0 and 1 and sum to < 1")
+    """
+    Deterministically splits a dataset into training, validation, and test subsets.
 
+    Args:
+        dataset: The full dataset to be split.
+        val_frac: The fraction of the dataset to use for validation.
+        test_frac: The fraction of the dataset to use for testing.
+        seed: The random seed for shuffling to ensure reproducible splits.
+
+    Returns:
+        A tuple containing the training, validation, and test Subsets,
+        and a list of indices used for the test set.
+    """
+    n = len(dataset)
+    if not (
+        0 < val_frac < 1 and 0 < test_frac < 1 and val_frac + test_frac < 1
+    ):
+        raise ValueError(
+            "fractions must be between 0 and 1 and sum to < 1"
+        )
     nv, nt = int(n * val_frac), int(n * test_frac)
     if n - nv - nt <= 0:
         raise ValueError("dataset too small for requested split ratio")
-
     g = torch.Generator().manual_seed(seed)
     idx = torch.randperm(n, generator=g).tolist()
     test_idx, val_idx, train_idx = idx[:nt], idx[nt : nt + nv], idx[nt + nv :]
+    logger.info(
+        "Dataset split: %d train / %d val / %d test",
+        len(train_idx),
+        len(val_idx),
+        len(test_idx),
+    )
+    return (
+        Subset(dataset, train_idx),
+        Subset(dataset, val_idx),
+        Subset(dataset, test_idx),
+        test_idx,
+    )
 
-    logger.info("Dataset split: %d train / %d val / %d test", len(train_idx), len(val_idx), len(test_idx))
-
-    return Subset(dataset, train_idx), Subset(dataset, val_idx), Subset(dataset, test_idx), test_idx
-
-# --------------------------------------------------------------------------- #
-# trainer                                                                     #
-# --------------------------------------------------------------------------- #
 
 class ModelTrainer:
-    """Orchestrates training / validation / testing including checkpoints."""
+    """
+    Orchestrates the training, validation, and testing of the model.
+
+    This class manages the entire lifecycle of model training, including
+    dataset splitting, DataLoader setup, model and optimizer instantiation,
+    the main training loop with validation and early stopping, checkpointing,
+    Optuna integration for pruning, and final model testing.
+    """
+
     def __init__(
         self,
         config: Dict[str, Any],
@@ -68,12 +96,25 @@ class ModelTrainer:
         *,
         val_frac: float = 0.15,
         test_frac: float = 0.15,
+        optuna_trial: Optional[optuna.Trial] = None,
     ) -> None:
+        """
+        Initializes the ModelTrainer.
+
+        Args:
+            config: Configuration dictionary for training parameters.
+            device: The PyTorch device (CPU or CUDA) for training.
+            save_dir: Directory to save model checkpoints, logs, and artifacts.
+            dataset: The complete dataset instance.
+            collate_fn: Custom collate function for DataLoaders.
+            val_frac: Fraction of data for the validation set.
+            test_frac: Fraction of data for the test set.
+            optuna_trial: Optuna Trial object if part of a hyperparameter search.
+        """
         self.cfg, self.device = config, device
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-
-        # dataset split
+        self.optuna_trial = optuna_trial
         (
             self.train_ds,
             self.val_ds,
@@ -85,110 +126,136 @@ class ModelTrainer:
             test_frac=self.cfg.get("test_frac", test_frac),
             seed=self.cfg.get("random_seed", 42),
         )
-
-        # data loaders
         self._build_dataloaders(collate_fn)
-        # model + optimiser + scheduler
         self._build_model()
         self._build_optimiser()
         self._build_scheduler()
-
-        # AMP
-        self.use_amp = bool(self.cfg.get("use_amp", False) and device.type == "cuda")
-
-        # Apply the fix for FutureWarning here:
-        self.scaler: Optional[GradScaler] = GradScaler(device.type) if self.use_amp else None
+        self.use_amp = bool(
+            self.cfg.get("use_amp", False) and device.type == "cuda"
+        )
+        self.scaler: Optional[GradScaler] = (
+            GradScaler() if self.use_amp else None
+        )
         if self.use_amp:
             logger.info("AMP enabled on CUDA")
-
-        # loss & grad‑clip
         self.criterion = nn.MSELoss()
-        self.max_grad_norm = max(float(self.cfg.get("gradient_clip_val", 1.0)), 1e-12)
-
-        # logging
+        self.max_grad_norm = max(
+            float(self.cfg.get("gradient_clip_val", 1.0)), 1e-12
+        )
         self.log_path = self.save_dir / "training_log.csv"
         self.log_path.write_text("epoch,train_loss,val_loss,lr,time_s\n")
         self.best_val, self.best_epoch = float("inf"), -1
-
-        # clear‑cache setting - Use default 0 (off) if not specified
         self._clear_every = int(self.cfg.get("clear_cuda_cache_every", 0))
-
-        # save list of test files/indices
-        self._save_test_list(dataset)
-
-    # ------------------------------------------------------------------ #
-    # build helpers                                                      #
-    # ------------------------------------------------------------------ #
+        self._save_test_list()
 
     def _build_dataloaders(self, collate_fn: Optional[Callable]) -> None:
+        """Initializes training, validation, and test DataLoaders."""
         hw = configure_dataloader_settings()
         bs = int(self.cfg.get("batch_size", 16))
         workers = max(0, int(self.cfg.get("num_workers", hw["num_workers"])))
-
         common = dict(
             batch_size=bs,
             num_workers=workers,
             pin_memory=hw["pin_memory"],
-            # Ensure persistent_workers is False if workers is 0
             persistent_workers=workers > 0 and hw["persistent_workers"],
             collate_fn=collate_fn,
         )
-        self.train_loader = DataLoader(self.train_ds, shuffle=True, drop_last=False, **common)
+        self.train_loader = DataLoader(
+            self.train_ds, shuffle=True, drop_last=False, **common
+        )
         self.val_loader = DataLoader(self.val_ds, shuffle=False, **common)
         self.test_loader = DataLoader(self.test_ds, shuffle=False, **common)
         logger.info("DataLoaders ready (batch=%d, workers=%d)", bs, workers)
 
     def _build_model(self) -> None:
+        """Creates and initializes the prediction model."""
         self.model = create_prediction_model(self.cfg).to(self.device)
-        if self.cfg.get("use_torch_compile", False) and self.device.type == "cuda":
-            # Keep original silent suppression as per user's code
-            with contextlib.suppress(Exception):
-                self.model = torch.compile(self.model)  # type: ignore[attr-defined]
-                
-        logger.info("Model built (%d parameters)", sum(p.numel() for p in self.model.parameters()))
+        if (
+            self.cfg.get("use_torch_compile", False)
+            and self.device.type == "cuda"
+            and hasattr(torch, "compile")
+        ):
+            try:
+                self.model = torch.compile(self.model)
+            except Exception as e:
+                logger.warning(
+                    f"torch.compile failed: {e}. Using uncompiled model."
+                )
+        logger.info(
+            "Model built (%d parameters)",
+            sum(p.numel() for p in self.model.parameters()),
+        )
 
     def _build_optimiser(self) -> None:
+        """Initializes the optimizer based on the configuration."""
         opt_name = str(self.cfg.get("optimizer", "adamw")).lower()
         lr = float(self.cfg.get("learning_rate", 1e-4))
         wd = float(self.cfg.get("weight_decay", 1e-5))
         if opt_name == "sgd":
-            self.optimizer = optim.SGD(self.model.parameters(), lr=lr, weight_decay=wd, momentum=0.9)
+            self.optimizer = optim.SGD(
+                self.model.parameters(), lr=lr, weight_decay=wd, momentum=0.9
+            )
         elif opt_name == "adam":
-            self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=wd)
-        # Default to AdamW if optimizer name is not 'sgd' or 'adam'
+            self.optimizer = optim.Adam(
+                self.model.parameters(), lr=lr, weight_decay=wd
+            )
         else:
             if opt_name != "adamw":
-                 logger.warning("Unsupported optimizer '%s', defaulting to AdamW.", opt_name)
-            self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
-        logger.info("Optimizer: %s lr=%.1e wd=%.1e", self.optimizer.__class__.__name__, lr, wd)
-
+                logger.warning(
+                    "Unsupported optimizer '%s', defaulting to AdamW.", opt_name
+                )
+            self.optimizer = optim.AdamW(
+                self.model.parameters(), lr=lr, weight_decay=wd
+            )
+        logger.info(
+            "Optimizer: %s lr=%.1e wd=%.1e",
+            self.optimizer.__class__.__name__,
+            lr,
+            wd,
+        )
 
     def _build_scheduler(self) -> None:
+        """Initializes the learning rate scheduler."""
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
             mode="min",
             factor=self.cfg.get("lr_factor", 0.5),
             patience=self.cfg.get("lr_patience", 5),
             min_lr=self.cfg.get("min_lr", 1e-7),
-            # Keep original verbose setting (default False)
         )
 
-    # ------------------------------------------------------------------ #
-    # high‑level train / test                                            #
-    # ------------------------------------------------------------------ #
-
     def train(self) -> float:
+        """
+        Executes the main training loop over a configured number of epochs.
+
+        Includes training steps, validation, Optuna pruning, logging,
+        early stopping, and checkpointing.
+
+        Returns:
+            The best validation loss achieved during training.
+        """
         epochs = int(self.cfg.get("epochs", 100))
         patience = int(self.cfg.get("early_stopping_patience", 10))
         min_delta = float(self.cfg.get("min_delta", 1e-10))
         wait = 0
+        final_epoch_completed = 0 # Tracks the last epoch run
+
         for ep in range(1, epochs + 1):
+            final_epoch_completed = ep
             t0 = time.time()
-            train_loss = self._run_epoch(self.train_loader, train=True)
-            val_loss = self._run_epoch(self.val_loader, train=False)
+            train_loss = self._run_epoch(
+                self.train_loader, train=True, epoch=ep
+            )
+            val_loss = self._run_epoch(
+                self.val_loader, train=False, epoch=ep
+            )
             self.scheduler.step(val_loss)
 
-            # --- optional cache clear ---
+            if self.optuna_trial:
+                self.optuna_trial.report(val_loss, ep)
+                if self.optuna_trial.should_prune():
+                    raise TrialPruned()
+
             if (
                 self.device.type == "cuda"
                 and self._clear_every > 0
@@ -197,7 +264,6 @@ class ModelTrainer:
             ):
                 torch.cuda.empty_cache()
 
-            # --- csv + console log ---
             lr_val = self.optimizer.param_groups[0]["lr"]
             dt = time.time() - t0
             logger.info(
@@ -208,15 +274,13 @@ class ModelTrainer:
                 lr_val,
                 dt,
             )
-            # Keep original logging method (read + write)
-            self.log_path.write_text(
-                self.log_path.read_text()
-                + f"{ep},{train_loss:.6e},{val_loss:.6e},{lr_val:.6e},{dt:.1f}\n"
-            )
+            with open(self.log_path, "a") as f:
+                f.write(
+                    f"{ep},{train_loss:.6e},{val_loss:.6e},"
+                    f"{lr_val:.6e},{dt:.1f}\n"
+                )
 
-            # --- early stopping & checkpoint ---
             if val_loss < self.best_val - min_delta:
-                # Original had no logging here, keeping it that way
                 self.best_val, self.best_epoch, wait = val_loss, ep, 0
                 self._checkpoint("best_model.pt", ep, val_loss)
             else:
@@ -224,107 +288,150 @@ class ModelTrainer:
                 if wait >= patience:
                     logger.info("Early stopping after %d epochs", ep)
                     break
+        else:
+            # This else block executes if the loop completed without a 'break'
+            final_epoch_completed = epochs
 
-        # --- final checkpoint & test ---
-        # Use last recorded epoch 'ep' and 'val_loss'
-        self._checkpoint("final_model.pt", ep, val_loss, final=True)
+
+        self._checkpoint(
+            "final_model.pt", final_epoch_completed, val_loss, final=True
+        )
         self.test()
-        # Original had no final logging here
         return self.best_val
 
-    # ------------------------------------------------------------------ #
-    # epoch loop                                                         #
-    # ------------------------------------------------------------------ #
+    def _run_epoch(
+        self, loader: DataLoader, *, train: bool, epoch: int
+    ) -> float:
+        """
+        Executes a single epoch of training or validation.
 
-    def _run_epoch(self, loader: DataLoader, *, train: bool) -> float:
+        Args:
+            loader: The DataLoader for the current phase (train or val).
+            train: Boolean indicating if this is a training phase.
+            epoch: The current epoch number (for logging purposes).
+
+        Returns:
+            The average loss for the epoch.
+        """
         self.model.train(train)
-        total, cnt = 0.0, 0
-
-        # Determine autocast context based on device and config
-        # Keep original float16 default
+        total_loss, count = 0.0, 0
         amp_ctx = (
             torch.autocast(device_type=self.device.type, dtype=torch.float16)
             if self.use_amp
             else contextlib.nullcontext()
         )
-        # Enable/disable gradient calculation
         grad_ctx = torch.enable_grad() if train else torch.no_grad()
 
-        # Keep original loop without tqdm
         with grad_ctx:
             for inputs, targets in loader:
-                # Keep original data moving without extra try/except
-                inputs = {k: v.to(self.device, non_blocking=True) for k, v in inputs.items()}
+                inputs = {
+                    k: v.to(self.device, non_blocking=True)
+                    for k, v in inputs.items()
+                }
                 targets = targets.to(self.device, non_blocking=True)
                 with amp_ctx:
-                    # Keep original forward/loss calc without extra try/except
                     pred = self.model(inputs)
                     loss = self.criterion(pred, targets)
-
-                # Check for non-finite loss
                 if not torch.isfinite(loss):
-                    logger.info("Non finite loss!")
+                    logger.warning(
+                        f"Epoch {epoch}: Non-finite loss. Skipping batch."
+                    )
                     continue
-
                 if train:
-                    # Backward pass & optimization step
                     self.optimizer.zero_grad(set_to_none=True)
-                    if self.scaler: # Check if scaler exists (i.e., use_amp is True)
+                    if self.scaler:
                         self.scaler.scale(loss).backward()
-                        self.scaler.unscale_(self.optimizer) # Unscale before clipping
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.max_grad_norm
+                        )
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.max_grad_norm
+                        )
                         self.optimizer.step()
+                total_loss += loss.item() * targets.size(0)
+                count += targets.size(0)
+        return total_loss / max(count, 1)
 
-                # Accumulate loss
-                total += loss.item()
-                cnt += 1
+    def _checkpoint(
+        self, name: str, epoch: int, val_loss: float, *, final: bool = False
+    ) -> None:
+        """
+        Saves a model checkpoint.
 
-        # Calculate average loss for the epoch
-        return total / max(cnt, 1)
-
-    # ------------------------------------------------------------------ #
-    # checkpoint / test                                                  #
-    # ------------------------------------------------------------------ #
-
-    def _checkpoint(self, name: str, epoch: int, val_loss: float, *, final: bool = False) -> None:
-        """Save model & metadata; compatible with torch.compile‑wrapped models."""
-        # Ensure the model object for saving state_dict is the original one if compiled
-        mod = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+        Args:
+            name: The filename for the checkpoint (e.g., "best_model.pt").
+            epoch: The epoch number at which the checkpoint is saved.
+            val_loss: The validation loss at this checkpoint.
+            final: Boolean indicating if this is the final model checkpoint.
+        """
+        mod = (
+            self.model._orig_mod
+            if hasattr(self.model, "_orig_mod")
+            else self.model
+        )
         path = self.save_dir / name
         checkpoint_data = {
             "state_dict": mod.state_dict(),
             "epoch": epoch,
             "val_loss": val_loss,
-            "config": self.cfg, # Save config used for this training run
+            "config": self.cfg,
         }
-        # Keep original saving without extra try/except
-        torch.save(checkpoint_data, path)
-        # Original logged only final save, keeping it that way
-        if final:
-            logger.info("Final model saved → %s", path.name)
-
+        try:
+            torch.save(checkpoint_data, path)
+            if final:
+                logger.info("Final model saved → %s", path.name)
+        except Exception as e:
+            logger.error(
+                f"Failed to save checkpoint {name}: {e}", exc_info=True
+            )
 
     def test(self) -> None:
-        """Evaluate the final model on the held-out test set."""
-        # Keep original test execution without extra logging/eval mode setting
-        loss = self._run_epoch(self.test_loader, train=False)
-        logger.info("Test loss: %.4e", loss)
-        # Keep original saving without extra try/except or logging
-        save_json({"test_loss": loss}, self.save_dir / "test_metrics.json")
+        """Evaluates the best model on the held-out test set."""
+        best_model_path = self.save_dir / "best_model.pt"
+        if best_model_path.exists():
+            try:
+                ckpt = torch.load(best_model_path, map_location=self.device)
+                mod = (
+                    self.model._orig_mod
+                    if hasattr(self.model, "_orig_mod")
+                    else self.model
+                )
+                mod.load_state_dict(ckpt["state_dict"])
+                logger.info(
+                    f"Loaded best model (epoch {ckpt.get('epoch', '?')}) for testing."
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to load best model for testing: {e}",
+                    exc_info=True,
+                )
+        else:
+            logger.warning(
+                "Best model checkpoint not found. Testing with final model state."
+            )
+        loss = self._run_epoch(self.test_loader, train=False, epoch=-1)
+        logger.info("Test loss (on best model): %.4e", loss)
+        try:
+            save_json(
+                {"test_loss": loss}, self.save_dir / "test_metrics.json"
+            )
+        except Exception as e:
+            logger.error(f"Failed to save test metrics: {e}", exc_info=True)
 
-
-    # ------------------------------------------------------------------ #
-    # utilities                                                          #
-    # ------------------------------------------------------------------ #
-
-    def _save_test_list(self, dataset: Dataset) -> None:
-        """Saves the indices used for the test set."""
-        save_json({"test_indices": sorted(self.test_indices)}, self.save_dir / "test_set_info.json")
+    def _save_test_list(self) -> None:
+        """Saves the indices used for the test set to a JSON file."""
+        try:
+            save_json(
+                {"test_indices": sorted(self.test_indices)},
+                self.save_dir / "test_set_info.json",
+            )
+        except Exception as e:
+            logger.error(f"Failed to save test set info: {e}", exc_info=True)
 
 
 __all__ = ["ModelTrainer"]
