@@ -7,7 +7,7 @@ figures/*
 !figures/.gitkeep
 
 plots/*
-!plots/.gitkeep
+plots/
 
 # Exclude older code that I want to keep just in case
 old_code/
