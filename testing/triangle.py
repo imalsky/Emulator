@@ -18,6 +18,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Subset
+from torch.cuda.amp import autocast # Added for AMP
 # Import the function 'corner' from the module 'corner'
 from corner import corner as corner_plot_func
 
@@ -114,11 +115,16 @@ def main():
         # --- Inference & Data Prep ---
         logger.info("Running inference...")
         inputs_batch, y_true_batch = next(iter(plot_loader))
+        inputs_batch_device = {k: v.to(device) for k, v in inputs_batch.items()} # Moved device transfer here
         with torch.no_grad():
-            predictions_batch = model({k: v.to(device) for k, v in inputs_batch.items()}).cpu()
+            if device.type == 'cuda':
+                with autocast(): # AMP enabled for CUDA
+                    predictions_batch = model(inputs_batch_device).cpu()
+            else: # CPU execution
+                predictions_batch = model(inputs_batch_device).cpu() # .cpu() is fine here
 
         if "global" not in inputs_batch: sys.exit("No 'global' key in input batch.")
-        global_tensors_norm = inputs_batch["global"].cpu()
+        global_tensors_norm = inputs_batch["global"].cpu() # .cpu() if not already done
         corner_data = np.stack([
             DataNormalizer.denormalize(global_tensors_norm[:, i], norm_meta, var_name).numpy()
             for i, var_name in enumerate(global_input_vars)

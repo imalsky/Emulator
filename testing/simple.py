@@ -17,6 +17,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Subset
+from torch.cuda.amp import autocast # Added for AMP
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -78,7 +79,7 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Running on device: {device}")
 
-        num_samples_to_plot = cfg.get("plotting_num_samples", 3)
+        num_samples_to_plot = 10
 
         # --- Load Dataset ---
         logger.info(f"Loading dataset from: {DATA_DIR}")
@@ -176,7 +177,12 @@ def main():
         logger.info("Running inference...")
         t_start = time.perf_counter()
         with torch.no_grad():
-            predictions_batch = model(inputs_batch_device).cpu()
+            if device.type == 'cuda':
+                with autocast(): # AMP enabled for CUDA
+                    predictions_batch = model(inputs_batch_device).cpu()
+            else: # CPU execution
+                predictions_batch = model(inputs_batch_device).cpu() # .cpu() is fine here as model is on cpu
+
         infer_time_ms = (time.perf_counter() - t_start) * 1000
         logger.info(f"Inference for {len(selected_indices)} profiles took {infer_time_ms:.2f} ms.")
 

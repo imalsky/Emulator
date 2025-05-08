@@ -78,13 +78,23 @@ class SequenceEncoder(nn.Module):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, d_model)
 
-        if positional_encoding_type is None or 'None' or 'none':
+        # Determine the type of positional encoding
+        if positional_encoding_type is None:
             self.pos_encoder = None
-            logger.warning("No positional encoding will be used for SequenceEncoder.")
-        elif positional_encoding_type.lower() in ["sinusoidal", "sine"]:
-            self.pos_encoder = SinePositionalEncoding(d_model, max_len=max_len)
+            logger.warning("No positional encoding will be used (type was None).")
+        elif isinstance(positional_encoding_type, str):
+            pe_type_lower = positional_encoding_type.lower()
+            if pe_type_lower == 'none':
+                self.pos_encoder = None
+                logger.warning("No positional encoding will be used (type was 'none').")
+            elif pe_type_lower in ["sinusoidal", "sine", "sin"]: # Added "sin" for brevity
+                self.pos_encoder = SinePositionalEncoding(d_model, max_len=max_len)
+                logger.info(f"Using sinusoidal positional encoding (type was '{positional_encoding_type}').")
+            else:
+                logger.error(f"Unsupported positional_encoding_type string: '{positional_encoding_type}'. Exiting.")
+                sys.exit(1)
         else:
-            logger.error(f"Unsupported positional_encoding_type: {positional_encoding_type}. Choose None or 'sinusoidal'.")
+            logger.error(f"Invalid positional_encoding_type: {positional_encoding_type} (type: {type(positional_encoding_type)}). Exiting.")
             sys.exit(1)
 
         encoder_layer = nn.TransformerEncoderLayer(
