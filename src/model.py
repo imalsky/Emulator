@@ -87,7 +87,7 @@ class SequenceEncoder(nn.Module):
             if pe_type_lower == 'none':
                 self.pos_encoder = None
                 logger.warning("No positional encoding will be used (type was 'none').")
-            elif pe_type_lower in ["sinusoidal", "sine", "sin"]: # Added "sin" for brevity
+            elif pe_type_lower in ["sinusoidal", "sine", "sin"]:
                 self.pos_encoder = SinePositionalEncoding(d_model, max_len=max_len)
                 logger.info(f"Using sinusoidal positional encoding (type was '{positional_encoding_type}').")
             else:
