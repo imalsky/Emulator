@@ -1,101 +1,95 @@
 {
   // ════════════════════════════════════════════════════════════════
   // DATA SPECIFICATION
+  // Defines the structure and variables of the input and output data.
   // ════════════════════════════════════════════════════════════════
-  // Make sure that input variables are the sequences you want, target variables are the output sequences
-  // Also make sure to sure the global_variables
-  "input_variables": ["wav"],
-  "target_variables": ["albedo"],
+  "input_variables": ["wav"], // List of keys for input sequences/features from JSON profiles.
+  "target_variables": ["albedo"], // List of keys for target sequences/features from JSON profiles.
 
-  /* One or more *sequence types*.
-     Every variable listed under a key must have identical length
-     inside every JSON profile – the loader enforces this strictly. */
+  /*
+   * sequence_types: Defines groups of variables that share a common sequence structure.
+   * Each key is a sequence type name (e.g., "spectral_data", "atmospheric_profile").
+   * Each value is a list of variable names (keys from JSON profiles) that belong to this sequence type.
+   * All variables within the same sequence type in a single JSON profile MUST have the same length.
+   * Different profiles can have different lengths for the same sequence type.
+   */
   "sequence_types": {
-    "sequence1": ["wav","albedo"]
+    "sequence1": ["wav", "albedo"]
   },
 
-  // Fixed lengths for each sequence type
-  // This is intentionally kinda bad code
-  // To force the user to make sure that all the sequences are the same length
-  // and that the length is known
-  // I don't want to pad the sequences. Too many errors might slip by
-  "sequence_lengths": {
-    "sequence1": 485
-  },
+  /*
+   * global_variables: List of keys for scalar features that apply globally to the profile.
+   * These are typically single numeric values per JSON profile.
+   */
+  "global_variables": [
+    "var1", "var2", "var3", "var4", "var5",
+    "var6", "var7", "var8", "var9", "var10"
+  ],
 
-  //"global_variables":   ["pressure_power_law","log_delta","alpha","T_int",
-  //                       "T_irr","mu","temperature_shift","gravity","Tstar",
-  //                       "orbital_separation_au","is_nightside","log_gamma1","log_gamma2"],
-  "global_variables":   ["var1", "var2", "var3", "var4", "var5",
-                         "var6", "var7", "var8", "var9", "var10"],
-  "output_seq_type":  "sequence1",
+  // output_seq_type: Specifies which sequence type in "sequence_types" dictates the
+  // primary output sequence structure and length for the model's prediction.
+  "output_seq_type": "sequence1",
+
+  // padding_value: Numerical value used to pad sequences to uniform length within a batch.
+  "padding_value": 0.0,
 
   // ════════════════════════════════════════════════════════════════
   // NORMALISATION SETTINGS
+  // Configures how data variables are normalized before being fed to the model.
   // ════════════════════════════════════════════════════════════════
-  //iqr
-  //log-min-max
-  //max-out
-  //scaled_signed_offset_log
-  //symlog
-  //standard
-  //bool
-
   "normalization": {
-    "key_methods": {
-      "wav": "log-min-max"
-      //"thermal_flux": "log-min-max",
-      //"is_nightside": "bool"
-    },
-    "default_method":              "standard",
+    "key_methods": {"wav": "log-min-max"},
+    "default_method": "standard",
     "clip_outliers_before_scaling": false,
-    "symlog_percentile":            0.10,
-    "epsilon":                      1e-10
+    "symlog_percentile": 0.10,
+    "epsilon": 1e-10
   },
 
   // ════════════════════════════════════════════════════════════════
   // MODEL HYPER-PARAMETERS
+  // Defines the architecture of the transformer model.
   // ════════════════════════════════════════════════════════════════
-  "d_model":            128,   // embedding size  (divisible by nhead)
-  "nhead":              4,    // multi-head attention heads
-  "num_encoder_layers": 4,
-  "dim_feedforward":    512,
-  "dropout":            0.00,
-  "positional_encoding_type": "None",
+  "d_model": 128,               // Dimensionality of the model's embeddings and hidden states. Must be divisible by nhead.
+  "nhead": 4,                   // Number of heads in the multi-head attention mechanisms.
+  "num_encoder_layers": 4,      // Number of layers in the transformer encoder stack for each sequence type.
+  "dim_feedforward": 512,       // Dimensionality of the feedforward network within encoder layers.
+  "dropout": 0.00,              // Dropout rate used in various parts of the model.
+  "positional_encoding_type": "sine",
+  "max_sequence_length": 1024,
 
   // ════════════════════════════════════════════════════════════════
   // TRAINING HYPER-PARAMETERS
+  // Configures the training process.
   // ════════════════════════════════════════════════════════════════
-  "batch_size":            16,
-  "epochs":                200,
-  "gradient_clip_val":     1.0,
+  "batch_size": 16,             // Number of samples per batch during training and evaluation.
+  "epochs": 200,                // Maximum number of training epochs.
+  "gradient_clip_val": 1.0,     // Maximum norm for gradient clipping to prevent exploding gradients.
 
-  "optimizer":             "adamw",  // "adamw" | "adam" | "sgd"
-  "learning_rate":         1e-4,
-  "weight_decay":          1e-5,
-
+  // optimizer: Specifies the optimization algorithm.
+  // Options: "adamw", "adam", "sgd".
+  "optimizer": "adamw",
+  "learning_rate": 1e-4,        // Initial learning rate for the optimizer.
+  "weight_decay": 1e-5,         // Weight decay (L2 penalty) for regularization.
   "early_stopping_patience": 20,
-  "min_delta":               1e-10,
+  "min_delta": 1e-10,
 
-  // LR scheduler (ReduceLROnPlateau parameters)
-  "lr_patience":          3,
-  "lr_factor":            0.5,
-  "min_lr":               1e-10,
+  // LR scheduler (ReduceLROnPlateau) parameters:
+  "lr_patience": 3,             // Number of epochs with no improvement after which learning rate will be reduced.
+  "lr_factor": 0.5,             // Factor by which the learning rate will be reduced (new_lr = lr * lr_factor).
+  "min_lr": 1e-10,              // Lower bound on the learning rate.
 
   // ════════════════════════════════════════════════════════════════
-  // DATA-LOADING & MISC
+  // DATA-LOADING & MISCELLANEOUS
   // ════════════════════════════════════════════════════════════════
-  "num_workers":         0,
-  "val_frac":            0.15,
-  "test_frac":           0.15,
-  "dataset_cache_size":  100000, // cache full normalised dataset
-  "random_seed":         42,
-  "validate_profiles":   false,  // skip expensive upfront JSON scan
+  // "num_workers" has been removed. A constant value will be used in the code.
+  "val_frac": 0.15,             // Fraction of the dataset to use for validation.
+  "test_frac": 0.15,            // Fraction of the dataset to use for testing.
+  "dataset_cache_size": 100000,
+  "random_seed": 42,           
+  "validate_profiles": false,
 
-  // new: frequency (in epochs) to clear CUDA cache – 0 = never
   "clear_cuda_cache_every": 0,
-
-  "use_amp":             false,   // AMP on CUDA
-  "use_torch_compile":   true ,   // torch.compile() on CUDA
-  "norm_first":        true   // Pre-LN transformer
+  "use_amp": false,               // If true, enables Automatic Mixed Precision (AMP) for training on CUDA.
+  "use_torch_compile": true,    // If true, attempts to use torch.compile() for model optimization on CUDA.
+  "norm_first": true            // If true, applies layer normalization before self-attention/feedforward (Pre-LN).
 }

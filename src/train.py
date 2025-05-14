@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-"""
-train.py – streamlined training loop for the multi‑source transformer.
-
-This module contains the ModelTrainer class, which handles the training,
-validation, and testing of the transformer model, including checkpointing,
-early stopping, and Optuna integration for hyperparameter tuning.
-"""
 from __future__ import annotations
 
 import contextlib
 import logging
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -20,14 +14,18 @@ from optuna.exceptions import TrialPruned
 from torch import nn, optim
 from torch.amp.grad_scaler import GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Subset
 
+# Local imports
 from dataset import AtmosphericDataset
 from hardware import configure_dataloader_settings
-from model import create_prediction_model
+from model import MultiEncoderTransformer, create_prediction_model
 from utils import save_json
 
 logger = logging.getLogger(__name__)
+
+# Define a constant for DataLoader workers
+DATALOADER_NUM_WORKERS = 1
 
 
 def _split_dataset(
@@ -38,54 +36,70 @@ def _split_dataset(
     seed: int = 42,
 ) -> Tuple[Subset, Subset, Subset, List[str]]:
     """
-    Deterministically splits an AtmosphericDataset into training, validation,
-    and test subsets. It also returns the filenames of the profiles
-    assigned to the test set.
+    Deterministically splits an AtmosphericDataset into train, val, test.
 
     Args:
-        dataset: The full AtmosphericDataset instance to be split.
-        val_frac: The fraction of the dataset to allocate for validation.
-        test_frac: The fraction of the dataset to allocate for testing.
-        seed: A random seed to ensure reproducible splits.
+        dataset: The full AtmosphericDataset instance.
+        val_frac: Fraction for validation.
+        test_frac: Fraction for testing.
+        seed: Random seed for reproducible splits.
 
     Returns:
-        A tuple containing:
-            - Training Subset.
-            - Validation Subset.
-            - Test Subset.
-            - A list of filenames corresponding to the profiles in the test set.
+        Tuple: (train_subset, val_subset, test_subset, test_filenames_list).
     """
     n = len(dataset)
     if not (
         0 < val_frac < 1 and 0 < test_frac < 1 and val_frac + test_frac < 1
     ):
-        raise ValueError(
-            "Fractions must be between 0 and 1 and sum to less than 1."
+        # Critical configuration error.
+        logger.critical(
+            "Dataset split fractions (val_frac: %f, test_frac: %f) are "
+            "invalid. They must be between 0 and 1, and their sum must be "
+            "less than 1. Exiting.", val_frac, test_frac
         )
-    nv, nt = int(n * val_frac), int(n * test_frac)
-    if n - nv - nt <= 0:
-        raise ValueError("Dataset is too small for the requested split ratio.")
-    g = torch.Generator().manual_seed(seed)
-    idx = torch.randperm(n, generator=g).tolist()
+        sys.exit(1)
 
-    test_indices_int: List[int] = idx[:nt]
-    val_indices_int: List[int] = idx[nt : nt + nv]
-    train_indices_int: List[int] = idx[nt + nv :]
+
+    num_val = int(n * val_frac)
+    num_test = int(n * test_frac)
+    num_train = n - num_val - num_test
+
+    if num_train <= 0:
+        logger.critical(
+            "Dataset size %d is too small for the requested split "
+            "fractions (val: %f, test: %f), resulting in %d training "
+            "samples. Exiting.", n, val_frac, test_frac, num_train
+        )
+        sys.exit(1)
+
+
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(n, generator=generator).tolist()
+
+    test_indices: List[int] = indices[:num_test]
+    val_indices: List[int] = indices[num_test : num_test + num_val]
+    train_indices: List[int] = indices[num_test + num_val:]
 
     logger.info(
-        "Dataset split: %d train / %d val / %d test (by index count)",
-        len(train_indices_int),
-        len(val_indices_int),
-        len(test_indices_int),
+        "Dataset split: %d train / %d val / %d test samples.",
+        len(train_indices),
+        len(val_indices),
+        len(test_indices),
     )
 
-    test_filenames = dataset.get_profile_filenames_by_indices(test_indices_int)
-    logger.info(f"First few test filenames: {test_filenames[:3]}...")
+    try:
+        test_filenames = dataset.get_profile_filenames_by_indices(test_indices)
+        if test_filenames:
+            logger.info("First few test filenames: %s...",test_filenames[:min(3, len(test_filenames))])
+    except IndexError as e:
+        logger.critical("Error retrieving test filenames by indices: %s. Exiting.", e)
+        sys.exit(1)
+
 
     return (
-        Subset(dataset, train_indices_int),
-        Subset(dataset, val_indices_int),
-        Subset(dataset, test_indices_int),
+        Subset(dataset, train_indices),
+        Subset(dataset, val_indices),
+        Subset(dataset, test_indices),
         test_filenames,
     )
 
@@ -93,10 +107,10 @@ def _split_dataset(
 class ModelTrainer:
     """
     Orchestrates the training, validation, and testing of the model.
-    This class manages the model training lifecycle, including data splitting,
-    DataLoader setup, model and optimizer instantiation, the main training loop
-    with validation, early stopping, checkpointing, Optuna integration,
-    and final model evaluation on a test set.
+
+    Manages data splitting, DataLoader setup, model/optimizer instantiation,
+    training loop with validation, early stopping, checkpointing, Optuna
+    integration, and final test set evaluation.
     """
 
     def __init__(
@@ -105,31 +119,28 @@ class ModelTrainer:
         device: torch.device,
         save_dir: Path,
         dataset: AtmosphericDataset,
-        collate_fn: Optional[Callable] = None,
+        collate_fn: Callable, # Expecting an instance of PadCollate
         *,
-        val_frac: float = 0.15,
-        test_frac: float = 0.15,
         optuna_trial: Optional[optuna.Trial] = None,
     ) -> None:
         """
         Initializes the ModelTrainer.
 
         Args:
-            config: A dictionary containing training parameters and model configuration.
-            device: The PyTorch device (e.g., 'cuda', 'cpu') for training.
-            save_dir: The directory where model checkpoints, logs, and other artifacts
-                      will be saved.
+            config: Dictionary with training parameters and model config.
+            device: PyTorch device for training.
+            save_dir: Directory for saving model artifacts and logs.
             dataset: The complete AtmosphericDataset instance.
-            collate_fn: An optional custom collate function for the DataLoaders.
-            val_frac: The fraction of the dataset to use for validation.
-            test_frac: The fraction of the dataset to use for testing.
-            optuna_trial: An optional Optuna Trial object, used if training is part
-                          of a hyperparameter optimization study.
+            collate_fn: Custom collate function for DataLoaders.
+            optuna_trial: Optional Optuna Trial object for HPO.
         """
-        self.cfg, self.device = config, device
+        self.cfg = config
+        self.device = device
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.optuna_trial = optuna_trial
+        self.padding_value = float(self.cfg.get("padding_value", 0.0))
+
         (
             self.train_ds,
             self.val_ds,
@@ -137,14 +148,15 @@ class ModelTrainer:
             self.test_filenames,
         ) = _split_dataset(
             dataset,
-            val_frac=self.cfg.get("val_frac", val_frac),
-            test_frac=self.cfg.get("test_frac", test_frac),
+            val_frac=self.cfg.get("val_frac", 0.15),
+            test_frac=self.cfg.get("test_frac", 0.15),
             seed=self.cfg.get("random_seed", 42),
         )
         self._build_dataloaders(collate_fn)
         self._build_model()
         self._build_optimiser()
         self._build_scheduler()
+
         self.use_amp = bool(
             self.cfg.get("use_amp", False) and device.type == "cuda"
         )
@@ -152,39 +164,62 @@ class ModelTrainer:
             GradScaler() if self.use_amp else None
         )
         if self.use_amp:
-            logger.info("AMP enabled on CUDA")
-        self.criterion = nn.MSELoss()
+            logger.info("AMP enabled on CUDA.")
+
+        self.criterion = nn.MSELoss(reduction='none')
         self.max_grad_norm = max(
             float(self.cfg.get("gradient_clip_val", 1.0)), 1e-12
         )
+
         self.log_path = self.save_dir / "training_log.csv"
-        self.log_path.write_text("epoch,train_loss,val_loss,lr,time_s\n")
-        self.best_val, self.best_epoch = float("inf"), -1
-        self._clear_every = int(self.cfg.get("clear_cuda_cache_every", 0))
+        try:
+            with open(self.log_path, "w", encoding="utf-8") as f:
+                f.write("epoch,train_loss,val_loss,lr,time_s\n")
+        except IOError as e:
+            logger.critical("Failed to write training log header to %s: %s. Exiting.", self.log_path, e)
+            sys.exit(1)
+
+
+        self.best_val_loss, self.best_epoch = float("inf"), -1
+        self._clear_cuda_every = int(self.cfg.get("clear_cuda_cache_every", 0))
         self._save_test_set_info()
 
-    def _build_dataloaders(self, collate_fn: Optional[Callable]) -> None:
-        """Initializes training, validation, and test DataLoaders."""
-        hw = configure_dataloader_settings()
-        bs = int(self.cfg.get("batch_size", 16))
-        workers = max(0, int(self.cfg.get("num_workers", hw["num_workers"])))
-        common = dict(
-            batch_size=bs,
-            num_workers=workers,
-            pin_memory=hw["pin_memory"],
-            persistent_workers=workers > 0 and hw["persistent_workers"],
+    def _build_dataloaders(self, collate_fn: Callable) -> None:
+        """Initializes DataLoaders for train, validation, and test sets."""
+        hw_settings = configure_dataloader_settings() # For pin_memory, persistent_workers
+        batch_size = int(self.cfg.get("batch_size", 16))
+        
+        # Use constant for num_workers, remove from config and hw_settings for this purpose
+        num_w = DATALOADER_NUM_WORKERS
+
+        common_dl_args = dict(
+            batch_size=batch_size,
+            num_workers=num_w,
+            pin_memory=hw_settings["pin_memory"], # Still use from hw_settings
+            persistent_workers=num_w > 0 and hw_settings["persistent_workers"], # Still use
             collate_fn=collate_fn,
         )
         self.train_loader = DataLoader(
-            self.train_ds, shuffle=True, drop_last=False, **common
+            self.train_ds, shuffle=True, drop_last=False, **common_dl_args
         )
-        self.val_loader = DataLoader(self.val_ds, shuffle=False, **common)
-        self.test_loader = DataLoader(self.test_ds, shuffle=False, **common)
-        logger.info("DataLoaders ready (batch=%d, workers=%d)", bs, workers)
+        self.val_loader = DataLoader(
+            self.val_ds, shuffle=False, **common_dl_args
+        )
+        self.test_loader = DataLoader(
+            self.test_ds, shuffle=False, **common_dl_args
+        )
+        logger.info(
+            "DataLoaders created (batch_size=%d, num_workers=%d).",
+            batch_size, num_w
+        )
 
     def _build_model(self) -> None:
         """Creates and initializes the prediction model."""
-        self.model = create_prediction_model(self.cfg).to(self.device)
+        # create_prediction_model handles device assignment and potential exits
+        # for critical hyperparameter issues.
+        self.model: MultiEncoderTransformer = create_prediction_model(
+            self.cfg, device=self.device
+        )
         if (
             self.cfg.get("use_torch_compile", False)
             and self.device.type == "cuda"
@@ -192,20 +227,21 @@ class ModelTrainer:
         ):
             try:
                 self.model = torch.compile(self.model) # type: ignore
-            except Exception as e:
+                logger.info("Model compiled with torch.compile().")
+            except Exception as e: # Catch any exception from torch.compile
                 logger.warning(
-                    f"torch.compile failed: {e}. Using uncompiled model."
+                    "torch.compile failed: %s. Using uncompiled model.", e
                 )
-        logger.info(
-            "Model built (%d parameters)",
-            sum(p.numel() for p in self.model.parameters()),
-        )
+        num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        logger.info("Model built with %s trainable parameters.", f"{num_params:,}")
+
 
     def _build_optimiser(self) -> None:
-        """Initializes the optimizer based on the configuration."""
+        """Initializes the optimizer based on configuration."""
         opt_name = str(self.cfg.get("optimizer", "adamw")).lower()
         lr = float(self.cfg.get("learning_rate", 1e-4))
         wd = float(self.cfg.get("weight_decay", 1e-5))
+
         if opt_name == "sgd":
             self.optimizer = optim.SGD(
                 self.model.parameters(), lr=lr, weight_decay=wd, momentum=0.9
@@ -214,19 +250,20 @@ class ModelTrainer:
             self.optimizer = optim.Adam(
                 self.model.parameters(), lr=lr, weight_decay=wd
             )
+        elif opt_name == "adamw":
+            self.optimizer = optim.AdamW(
+                self.model.parameters(), lr=lr, weight_decay=wd
+            )
         else:
-            if opt_name != "adamw":
-                logger.warning(
-                    "Unsupported optimizer '%s', defaulting to AdamW.", opt_name
-                )
+            logger.warning(
+                "Unsupported optimizer '%s' in config, defaulting to AdamW.", opt_name
+            )
             self.optimizer = optim.AdamW(
                 self.model.parameters(), lr=lr, weight_decay=wd
             )
         logger.info(
-            "Optimizer: %s lr=%.1e wd=%.1e",
-            self.optimizer.__class__.__name__,
-            lr,
-            wd,
+            "Optimizer: %s (lr=%.1e, weight_decay=%.1e)",
+            self.optimizer.__class__.__name__, lr, wd
         )
 
     def _build_scheduler(self) -> None:
@@ -241,132 +278,200 @@ class ModelTrainer:
 
     def train(self) -> float:
         """
-        Executes the main training loop over a configured number of epochs.
-        This loop includes training steps, validation, Optuna pruning (if enabled),
-        logging of metrics, early stopping based on validation performance,
-        and checkpointing of the best and final models.
+        Executes the main training loop.
+
+        Includes training steps, validation, Optuna pruning, logging,
+        early stopping, and checkpointing.
 
         Returns:
-            The best validation loss achieved during training.
+            The best validation loss achieved.
         """
         epochs = int(self.cfg.get("epochs", 100))
         patience = int(self.cfg.get("early_stopping_patience", 10))
         min_delta = float(self.cfg.get("min_delta", 1e-10))
-        wait = 0
-        final_epoch_completed = 0
-        last_val_loss = float('inf')
+        
+        epochs_without_improvement = 0
+        completed_epochs = 0
+        current_validation_loss = float('inf')
 
-        for ep in range(1, epochs + 1):
-            final_epoch_completed = ep
-            t0 = time.time()
+
+        for epoch_num in range(1, epochs + 1):
+            completed_epochs = epoch_num
+            epoch_start_time = time.time()
+
             train_loss = self._run_epoch(
-                self.train_loader, train=True, epoch=ep
+                self.train_loader, train_phase=True, epoch_num=epoch_num
             )
-            last_val_loss = self._run_epoch(
-                self.val_loader, train=False, epoch=ep
+            current_validation_loss = self._run_epoch(
+                self.val_loader, train_phase=False, epoch_num=epoch_num
             )
-            self.scheduler.step(last_val_loss)
+            self.scheduler.step(current_validation_loss)
 
             if self.optuna_trial:
-                self.optuna_trial.report(last_val_loss, ep)
+                self.optuna_trial.report(current_validation_loss, epoch_num)
                 if self.optuna_trial.should_prune():
-                    logger.info(f"Optuna trial pruned at epoch {ep}.")
+                    logger.info("Optuna trial pruned at epoch %d.", epoch_num)
                     raise TrialPruned()
 
             if (
                 self.device.type == "cuda"
-                and self._clear_every > 0
-                and ep % self._clear_every == 0
+                and self._clear_cuda_every > 0
+                and epoch_num % self._clear_cuda_every == 0
                 and torch.cuda.is_available()
             ):
-                logger.debug(f"Clearing CUDA cache at epoch {ep}")
+                logger.debug("Clearing CUDA cache at epoch %d.", epoch_num)
                 torch.cuda.empty_cache()
 
-            lr_val = self.optimizer.param_groups[0]["lr"]
-            dt = time.time() - t0
-            logger.info(
-                "Epoch %03d | train %.4e | val %.4e | lr %.4e | %.1fs",
-                ep,
-                train_loss,
-                last_val_loss,
-                lr_val,
-                dt,
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            epoch_duration = time.time() - epoch_start_time
+            log_line = (
+                f"{epoch_num},{train_loss:.6e},{current_validation_loss:.6e},"
+                f"{current_lr:.6e},{epoch_duration:.1f}\n"
             )
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(
-                    f"{ep},{train_loss:.6e},{last_val_loss:.6e},"
-                    f"{lr_val:.6e},{dt:.1f}\n"
-                )
+            try:
+                with open(self.log_path, "a", encoding="utf-8") as f:
+                    f.write(log_line)
+            except IOError as e:
+                logger.error("Failed to write to training log %s: %s", self.log_path, e)
 
-            if last_val_loss < self.best_val - min_delta:
-                self.best_val, self.best_epoch, wait = last_val_loss, ep, 0
-                self._checkpoint("best_model.pt", ep, last_val_loss)
+            logger.info(
+                "Epoch %03d | Train Loss: %.4e | Val Loss: %.4e | LR: %.2e | Time: %.1fs",
+                epoch_num, train_loss, current_validation_loss, current_lr, epoch_duration
+            )
+
+
+            if current_validation_loss < self.best_val_loss - min_delta:
+                self.best_val_loss = current_validation_loss
+                self.best_epoch = epoch_num
+                epochs_without_improvement = 0
+                self._checkpoint("best_model.pt", epoch_num, current_validation_loss)
             else:
-                wait += 1
-                if wait >= patience:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= patience:
                     logger.info(
-                        f"Early stopping triggered after {ep} epochs "
-                        f"(patience {patience} reached)."
-                        )
+                        "Early stopping at epoch %d after %d epochs "
+                        "without improvement on validation loss.",
+                        epoch_num, patience
+                    )
                     break
         else:
-            logger.info(f"Training completed {epochs} epochs.")
-            final_epoch_completed = epochs
+            logger.info("Training completed %d epochs.", epochs)
+            completed_epochs = epochs
 
-        self._checkpoint("final_model.pt", final_epoch_completed, last_val_loss, final=True)
+
+        self._checkpoint("final_model.pt", completed_epochs, current_validation_loss, final=True)
         self.test()
-        return self.best_val
+        return self.best_val_loss
 
     def _run_epoch(
-        self, loader: DataLoader, *, train: bool, epoch: int
+        self, loader: DataLoader, *, train_phase: bool, epoch_num: int
     ) -> float:
         """
-        Executes a single epoch of training or validation.
-        Iterates through the provided DataLoader, performs forward and backward
-        passes (for training), computes loss, and accumulates metrics.
+        Executes a single epoch of training or validation/testing.
 
         Args:
-            loader: The DataLoader for the current phase (train or validation).
-            train: A boolean indicating if the model should be in training mode
-                   (i.e., if gradients should be computed and parameters updated).
-            epoch: The current epoch number, used for logging purposes.
+            loader: DataLoader for the current phase.
+            train_phase: True if training, False for validation/testing.
+            epoch_num: Current epoch number (for logging).
 
         Returns:
-            The average loss for the epoch.
+            Average loss for the epoch over active (non-padded) elements.
         """
-        self.model.train(train)
-        total_loss, count = 0.0, 0
-        amp_ctx = (
-            torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp)
-            if self.use_amp
+        self.model.train(train_phase)
+        accumulated_loss = 0.0
+        total_active_elements = 0
+
+        device_type = self.device.type
+        # Autocast is typically most beneficial and stable on CUDA.
+        # Other backends might have varying levels of support or none.
+        effective_use_amp = self.use_amp and device_type == 'cuda'
+
+        autocast_ctx = (
+            torch.autocast(
+                device_type=device_type, # Should be 'cuda' if effective_use_amp is True
+                dtype=torch.float16,
+                enabled=effective_use_amp
+            )
+            if effective_use_amp
             else contextlib.nullcontext()
         )
-        grad_ctx = torch.enable_grad() if train else torch.no_grad()
 
-        phase_name = "Train" if train else "Val"
-        log_interval = max(1, len(loader) // 10)
+        grad_context = torch.enable_grad() if train_phase else torch.no_grad()
+        phase_str = "Train" if train_phase else "Val/Test"
+        log_interval = max(1, len(loader) // 5)
 
-        with grad_ctx:
-            for batch_idx, (inputs, targets) in enumerate(loader):
+        with grad_context:
+            for batch_idx, batch_data in enumerate(loader):
+                # Data from PadCollate:
+                # inputs_dict, input_masks_dict (True=VALID), targets_tensor, target_mask_tensor (True=VALID)
+                inputs, input_masks, targets, target_mask = batch_data
+
                 inputs = {
                     k: v.to(self.device, non_blocking=True)
                     for k, v in inputs.items()
                 }
+                input_masks = {
+                    k: v.to(self.device, non_blocking=True)
+                    for k, v in input_masks.items()
+                    if isinstance(v, torch.Tensor) # Global inputs might not have masks
+                }
                 targets = targets.to(self.device, non_blocking=True)
-                with amp_ctx:
-                    pred = self.model(inputs)
-                    loss = self.criterion(pred, targets)
+                target_mask = target_mask.to(self.device, non_blocking=True) # True means valid
 
-                if not torch.isfinite(loss):
+                with autocast_ctx:
+                    # model.forward expects input_masks where True means VALID
+                    predictions = self.model(inputs, input_masks=input_masks)
+                    loss_unreduced = self.criterion(predictions, targets)
+
+                    # Ensure target_mask is correctly broadcastable to loss_unreduced shape
+                    if target_mask.ndim == predictions.ndim -1 and target_mask.shape == predictions.shape[:-1]:
+                        # e.g. target_mask (B,L), predictions (B,L,F)
+                        active_loss_mask = target_mask.unsqueeze(-1)
+                    elif target_mask.shape == loss_unreduced.shape:
+                        # Mask already matches loss shape (e.g. for (B,F) or (B,L,F) if features are masked)
+                        active_loss_mask = target_mask
+                    elif target_mask.ndim == 1 and predictions.ndim == 2 and target_mask.size(0) == predictions.size(0):
+                        # e.g. target_mask (B,), predictions (B,F)
+                        active_loss_mask = target_mask.unsqueeze(-1)
+                    else:
+                        logger.warning(
+                            "Epoch %d (%s), Batch %d: Target mask shape %s is not directly "
+                            "broadcastable to prediction shape %s for loss masking. "
+                            "Attempting to expand or using all elements.",
+                            epoch_num, phase_str, batch_idx, target_mask.shape, predictions.shape
+                        )
+                        # Attempt a common case: mask is (B, L) and loss is (B, L, F)
+                        if target_mask.shape == loss_unreduced.shape[:-1]:
+                             active_loss_mask = target_mask.unsqueeze(-1)
+                        else: # Fallback: assume all elements contribute if unsure
+                             active_loss_mask = torch.ones_like(loss_unreduced, dtype=torch.bool, device=self.device)
+
+
+                    masked_loss_values = loss_unreduced[active_loss_mask]
+                    num_active_in_batch = masked_loss_values.numel()
+
+                    if num_active_in_batch > 0:
+                        current_batch_loss = masked_loss_values.mean()
+                    else:
+                        # Avoid division by zero if no active elements (e.g. fully padded batch)
+                        current_batch_loss = torch.tensor(
+                            0.0, device=self.device, requires_grad=train_phase
+                        )
+
+                if not torch.isfinite(current_batch_loss):
                     logger.warning(
-                        f"Epoch {epoch} ({phase_name}): Non-finite loss detected (value: {loss.item()}). Skipping batch {batch_idx}."
+                        "Epoch %d (%s): Non-finite loss "
+                        "(%s) at batch %d. Skipping batch.",
+                        epoch_num, phase_str, current_batch_loss.item(), batch_idx
                     )
+                    if num_active_in_batch == 0:
+                         logger.warning("Loss was non-finite AND num_active_elements was 0 for the batch.")
                     continue
 
-                if train:
+                if train_phase:
                     self.optimizer.zero_grad(set_to_none=True)
                     if self.scaler:
-                        self.scaler.scale(loss).backward()
+                        self.scaler.scale(current_batch_loss).backward()
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), self.max_grad_norm
@@ -374,111 +479,166 @@ class ModelTrainer:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
-                        loss.backward()
+                        current_batch_loss.backward()
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), self.max_grad_norm
                         )
                         self.optimizer.step()
-                total_loss += loss.item() * targets.size(0)
-                count += targets.size(0)
 
-                if train and batch_idx % log_interval == 0 and batch_idx > 0:
+                accumulated_loss += current_batch_loss.item() * num_active_in_batch
+                total_active_elements += num_active_in_batch
+
+                if batch_idx > 0 and batch_idx % log_interval == 0 :
                     logger.debug(
-                        f"Epoch {epoch} [{phase_name}] Batch {batch_idx}/{len(loader)} Loss: {loss.item():.4e}"
+                        "Epoch %d [%s] Batch %d/%d AvgLossInBatch: %.4e",
+                        epoch_num, phase_str, batch_idx, len(loader),
+                        current_batch_loss.item()
                     )
 
-        return total_loss / max(count, 1)
+        if total_active_elements == 0:
+            logger.warning(
+                "Epoch %d (%s): No active elements found across all batches "
+                "to compute loss. Returning 0.0 for epoch loss.",
+                 epoch_num, phase_str
+            )
+            return 0.0
+        return accumulated_loss / total_active_elements
 
     def _checkpoint(
-        self, name: str, epoch: int, val_loss: float, *, final: bool = False
+        self, filename: str, epoch: int, val_loss: float, *, final: bool = False
     ) -> None:
         """
-        Saves a model checkpoint to disk.
-        The checkpoint includes the model's state dictionary, the epoch number,
-        validation loss, and the configuration used for training.
+        Saves a model checkpoint.
 
         Args:
-            name: The filename for the checkpoint (e.g., "best_model.pt").
-            epoch: The epoch number at which the checkpoint is being saved.
-            val_loss: The validation loss corresponding to this checkpoint.
-            final: A boolean indicating if this is the final model checkpoint
-                   at the end of training.
+            filename: Filename for the checkpoint.
+            epoch: Epoch number for this checkpoint.
+            val_loss: Validation loss for this checkpoint.
+            final: True if this is the final model checkpoint.
         """
-        mod_to_save = (
+        model_to_save = (
             self.model._orig_mod # type: ignore
-            if hasattr(self.model, "_orig_mod")
+            if hasattr(self.model, "_orig_mod") # For torch.compile
             else self.model
         )
-        path = self.save_dir / name
-        checkpoint_data = {
-            "state_dict": mod_to_save.state_dict(),
+        save_path = self.save_dir / filename
+        
+        checkpoint_config = self.cfg.copy()
+        # Ensure runtime nhead (if adjusted by create_prediction_model) is saved
+        if hasattr(model_to_save, 'nhead') and isinstance(model_to_save.nhead, int):
+            checkpoint_config['nhead'] = model_to_save.nhead
+        elif hasattr(self.model, 'nhead') and isinstance(self.model.nhead, int):
+            checkpoint_config['nhead'] = self.model.nhead
+
+
+        checkpoint = {
+            "state_dict": model_to_save.state_dict(),
             "epoch": epoch,
             "val_loss": val_loss,
-            "config": self.cfg,
+            "config": checkpoint_config,
         }
         try:
-            torch.save(checkpoint_data, path)
-            #action = "Final model saved" if final else "Checkpoint saved"
-            #logger.info(f"{action} (Epoch {epoch}, Val Loss: {val_loss:.4e}) → {path.name}")
-        except Exception as e:
-            logger.error(
-                f"Failed to save checkpoint {name} at epoch {epoch}: {e}", exc_info=True
+            torch.save(checkpoint, save_path)
+            status_msg = "Final model" if final else "Checkpoint"
+            logger.info(
+                "%s saved (Epoch %d, Val Loss: %.4e) to %s",
+                status_msg, epoch, val_loss, save_path.name
             )
+        except IOError as e:
+            logger.error(
+                "Failed to save checkpoint %s at epoch %d: %s",
+                filename, epoch, e
+            )
+        except Exception as e: # Catch other potential torch.save errors
+             logger.error(
+                "Unexpected error saving checkpoint %s at epoch %d: %s",
+                filename, epoch, e, exc_info=True
+            )
+
 
     def test(self) -> None:
-        """
-        Evaluates the best performing model (loaded from "best_model.pt")
-        on the held-out test set and logs the test loss.
-        If the best model cannot be loaded, it attempts to test with the
-        current model state.
-        """
-        best_model_path = self.save_dir / "best_model.pt"
+        """Evaluates the best or final model on the test set."""
+        best_model_filename = "best_model.pt"
+        best_model_path = self.save_dir / best_model_filename
+        
+        config_for_testing = self.cfg.copy() # Start with current config
+        model_was_loaded_from_checkpoint = False
+        
         if best_model_path.exists():
             try:
-                ckpt = torch.load(best_model_path, map_location=self.device)
-                model_for_testing = (
-                    self.model._orig_mod # type: ignore
-                    if hasattr(self.model, "_orig_mod")
-                    else self.model
-                )
-                model_for_testing.load_state_dict(ckpt["state_dict"])
+                checkpoint = torch.load(best_model_path, map_location=self.device)
+                if 'config' in checkpoint:
+                    # Prioritize config from checkpoint for model architecture
+                    config_for_testing = checkpoint['config']
+                    logger.info(
+                        "Using model configuration from checkpoint '%s' for testing.",
+                        best_model_filename
+                    )
+
+                # Re-create model using the determined config
+                test_model = create_prediction_model(config_for_testing, device=self.device)
+                
+                if (
+                    config_for_testing.get("use_torch_compile", False)
+                    and self.device.type == "cuda"
+                    and hasattr(torch, "compile")
+                ):
+                    try:
+                        test_model = torch.compile(test_model) # type: ignore
+                    except Exception as e:
+                        logger.warning("torch.compile failed for test model: %s.", e)
+
+                # Load state dict into the potentially compiled model's underlying module
+                model_to_load_state = test_model._orig_mod if hasattr(test_model, '_orig_mod') else test_model
+                model_to_load_state.load_state_dict(checkpoint["state_dict"])
+                
+                self.model = test_model # Use this loaded model for testing
+                model_was_loaded_from_checkpoint = True
                 logger.info(
-                    f"Loaded best model (Epoch {ckpt.get('epoch', '?')}, Val Loss: {ckpt.get('val_loss', float('nan')):.4e}) for testing."
+                    "Loaded best model from %s (Epoch %s, Val Loss: %.4e) for testing.",
+                    best_model_filename,
+                    checkpoint.get('epoch', 'N/A'),
+                    checkpoint.get('val_loss', float('nan'))
                 )
+            except FileNotFoundError: # Should be caught by exists(), but defensive
+                logger.warning("Best model checkpoint %s not found during load attempt.", best_model_path)
             except Exception as e:
                 logger.error(
-                    f"Failed to load best model for testing from {best_model_path}: {e}",
-                    exc_info=True,
+                    "Failed to load best model from %s: %s. "
+                    "Testing with the model from the end of training if available.",
+                    best_model_path, e, exc_info=True
                 )
-                logger.warning("Testing with the current model state instead (if any).")
+                # If loading best fails, self.model is already the final trained model (or initial if training failed early)
         else:
             logger.warning(
-                f"Best model checkpoint ({best_model_path}) not found. "
-                "Testing with the final model state if available, or current model."
+                "Best model checkpoint (%s) not found. "
+                "Testing with the model from the end of training.",
+                best_model_path
             )
+            # self.model is already the final trained model
 
-        loss = self._run_epoch(self.test_loader, train=False, epoch=-1)
-        logger.info("Test loss (on best or final model): %.4e", loss)
+        if not model_was_loaded_from_checkpoint and self.model is None:
+            logger.error("No model available for testing. Test phase skipped.")
+            return
+
+
+        test_loss = self._run_epoch(self.test_loader, train_phase=False, epoch_num=-1)
+        logger.info("Test Loss (on evaluated model): %.4e", test_loss)
         try:
             save_json(
-                {"test_loss": loss}, self.save_dir / "test_metrics.json"
+                {"test_loss": test_loss}, self.save_dir / "test_metrics.json"
             )
-        except Exception as e:
-            logger.error(f"Failed to save test metrics: {e}", exc_info=True)
+        except Exception as e: # Catch specific IOError or general Exception
+            logger.error("Failed to save test metrics: %s", e, exc_info=True)
 
     def _save_test_set_info(self) -> None:
-        """
-        Saves the list of filenames corresponding to the test set profiles
-        to a JSON file ("test_set_info.json") in the save directory.
-        """
+        """Saves filenames of the test set profiles."""
+        info_path = self.save_dir / "test_set_info.json"
         try:
-            save_json(
-                {"test_filenames": sorted(self.test_filenames)},
-                self.save_dir / "test_set_info.json",
-            )
-            logger.info(f"Test set filenames saved to {self.save_dir / 'test_set_info.json'}")
+            save_json({"test_filenames": sorted(self.test_filenames)}, info_path)
+            logger.info("Test set filenames saved to %s", info_path.name)
         except Exception as e:
-            logger.error(f"Failed to save test set info: {e}", exc_info=True)
+            logger.error("Failed to save test set info to %s: %s", info_path, e, exc_info=True)
 
 
 __all__ = ["ModelTrainer"]

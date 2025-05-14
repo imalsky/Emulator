@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-main.py – command‑line entry point for the atmospheric‑flux pipeline.
-
-This script handles command-line arguments to orchestrate data normalization,
-model training with a fixed configuration, or hyperparameter tuning using Optuna.
-"""
 from __future__ import annotations
 
 import argparse
@@ -14,10 +8,11 @@ import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
-import optuna
+import optuna # For type hinting Optuna.Trial
 import torch
 
-from dataset import AtmosphericDataset, create_multi_source_collate_fn
+# Local application imports
+from dataset import AtmosphericDataset, PadCollate, create_multi_source_collate_fn
 from hardware import setup_device
 from hyperparams import run_hyperparameter_search
 from normalizer import DataNormalizer
@@ -30,271 +25,359 @@ from utils import (
     setup_logging,
 )
 
+# Suppress specific PyTorch UserWarnings for cleaner output.
+# These warnings are often informational and don't indicate critical issues.
 warnings.filterwarnings(
     "ignore",
     message=(
         "enable_nested_tensor is True, but self.use_nested_tensor is False "
         "because encoder_layer.norm_first was True"
     ),
+    category=UserWarning
 )
+warnings.filterwarnings(
+    "ignore",
+    message="torch.nn.functional.glu is deprecated.",
+    category=UserWarning
+)
+
 
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = Path("inputs/model_input_params.jsonc")
-DATA_DIR_PATH = Path("data")
-DEFAULT_NUM_TRIALS = 100
+# Default paths and constants for the pipeline.
+DEFAULT_CONFIG_PATH = Path("inputs/model_input_params.jsonc")
+DEFAULT_DATA_DIR_PATH = Path("data")
+DEFAULT_OPTUNA_TRIALS = 100
 
 
-def _normalize(cfg: Dict[str, Any], data_root: Path) -> bool:
+def _normalize_data(config: Dict[str, Any], data_root_dir: Path) -> bool:
     """
     Performs data normalization based on the provided configuration.
 
-    Calculates global statistics and applies normalization to profile data.
+    This function initializes a DataNormalizer, calculates global statistics
+    from the raw profiles, and then processes these profiles to create
+    normalized versions.
 
     Args:
-        cfg: The main configuration dictionary.
-        data_root: The root directory for data (containing 'profiles').
+        config: The main configuration dictionary, containing normalization
+                settings and variable definitions.
+        data_root_dir: The root directory for data, expected to contain
+                       a 'profiles' subdirectory with raw data.
 
     Returns:
-        True if normalization was successful, False otherwise.
+        True if normalization was successful.
+        The function relies on DataNormalizer to call sys.exit(1)
+        on critical, unrecoverable errors.
     """
-    raw_dir = data_root / "profiles"
-    out_dir = data_root / "normalized_profiles"
-    ensure_dirs(raw_dir, out_dir)
-    norm_cfg = cfg.get("normalization", {})
-    normalizer = DataNormalizer(
-        input_folder=raw_dir,
-        output_folder=out_dir,
-        config_data=cfg,
-        epsilon=norm_cfg.get("epsilon"),
+    raw_profiles_dir = data_root_dir / "profiles"
+    normalized_profiles_dir = data_root_dir / "normalized_profiles"
+    ensure_dirs(raw_profiles_dir, normalized_profiles_dir)
+
+    norm_config_section = config.get("normalization", {})
+    normalizer_instance = DataNormalizer(
+        input_folder=raw_profiles_dir,
+        output_folder=normalized_profiles_dir,
+        config_data=config,
+        epsilon=norm_config_section.get("epsilon"),
     )
-    stats = normalizer.calculate_global_stats(
-        key_methods=norm_cfg.get("key_methods"),
-        default_method=norm_cfg.get("default_method", "standard"),
-        clip_outliers_before_scaling=norm_cfg.get(
+    global_stats = normalizer_instance.calculate_global_stats(
+        key_methods=norm_config_section.get("key_methods"),
+        default_method=norm_config_section.get("default_method", "standard"),
+        clip_outliers_before_scaling=norm_config_section.get(
             "clip_outliers_before_scaling", False
         ),
-        symlog_percentile=norm_cfg.get("symlog_percentile", 0.5),
-        symlog_thresholds=norm_cfg.get("symlog_thresholds"),
+        symlog_percentile=norm_config_section.get("symlog_percentile", 0.5),
+        symlog_thresholds=norm_config_section.get("symlog_thresholds"),
     )
-    if stats is None:
-        logger.error("Normalization statistics calculation failed.")
+    # DataNormalizer.calculate_global_stats will sys.exit on critical errors.
+    # If it returns None without exiting, it's an unexpected state.
+    if global_stats is None:
+        logger.error(
+            "Normalization statistics calculation returned None unexpectedly. "
+            "This indicates an issue within DataNormalizer if sys.exit was not called."
+        )
         return False
-    normalizer.process_profiles(stats)
+    normalizer_instance.process_profiles(global_stats)
     return True
 
 
-def _setup_dataset(
-    cfg: Dict[str, Any], data_dir: Path
-) -> Optional[Tuple[AtmosphericDataset, Callable]]:
+def _initialize_dataset_and_collate(
+    config: Dict[str, Any], data_dir: Path
+) -> Optional[Tuple[AtmosphericDataset, PadCollate]]:
     """
-    Loads and prepares the dataset for training or evaluation.
+    Loads and prepares the dataset and the custom collate function.
 
     Args:
-        cfg: The main configuration dictionary.
-        data_dir: The root directory where normalized data is located.
+        config: The main configuration dictionary.
+        data_dir: Root directory where normalized data ('normalized_profiles')
+                  is expected to be located.
 
     Returns:
-        A tuple containing the AtmosphericDataset instance and the collate
-        function, or None if dataset setup fails.
+        A tuple containing (AtmosphericDataset instance, PadCollate instance),
+        or None if the setup fails (e.g., normalized data not found).
+        AtmosphericDataset itself will sys.exit on critical initialization errors.
     """
-    norm_dir = data_dir / "normalized_profiles"
-    if not norm_dir.exists():
+    normalized_data_path = data_dir / "normalized_profiles"
+    if not normalized_data_path.exists():
         logger.error(
-            "Normalised data not found at %s; run --normalize first", norm_dir
+            "Normalized data directory not found at %s. "
+            "Please run the pipeline with the --normalize flag first.",
+            normalized_data_path
         )
         return None
     try:
-        ds = AtmosphericDataset(
-            data_folder=norm_dir,
-            input_variables=cfg["input_variables"],
-            target_variables=cfg["target_variables"],
-            global_variables=cfg.get("global_variables", []),
-            sequence_types=cfg["sequence_types"],
-            sequence_lengths=cfg["sequence_lengths"],
-            output_seq_type=cfg["output_seq_type"],
-            cache_size=cfg.get("dataset_cache_size", 1024),
-            validate_profiles=cfg.get("validate_profiles", True),
+        padding_val = float(config.get("padding_value", 0.0))
+        dataset_instance = AtmosphericDataset(
+            data_folder=normalized_data_path,
+            input_variables=config["input_variables"],
+            target_variables=config["target_variables"],
+            global_variables=config.get("global_variables", []),
+            sequence_types=config["sequence_types"],
+            output_seq_type=config["output_seq_type"],
+            padding_value=padding_val,
+            cache_size=config.get("dataset_cache_size", 1024),
+            validate_profiles=config.get("validate_profiles", True),
         )
-        collate = create_multi_source_collate_fn()
-        return ds, collate
+        collate_function = create_multi_source_collate_fn(
+            padding_value=padding_val
+        )
+        return dataset_instance, collate_function
     except Exception as exc:
-        logger.error("Dataset setup failed: %s", exc, exc_info=True)
+        # Catch any other unexpected errors during dataset or collate setup.
+        # AtmosphericDataset is expected to sys.exit on its own critical errors.
+        logger.error(
+            "Dataset and collate function setup failed with an unexpected error: %s",
+            exc, exc_info=True
+        )
         return None
 
 
-def train_model(
-    trial: Optional[optuna.Trial],
-    config: Dict[str, Any],
-    device: torch.device,
-    dataset: AtmosphericDataset,
-    collate_fn: Callable,
-    save_dir: Path,
+def _execute_model_training(
+    optuna_trial_obj: Optional[optuna.Trial],
+    train_config: Dict[str, Any],
+    compute_device: torch.device,
+    dataset_obj: AtmosphericDataset,
+    collate_fn_obj: Callable,
+    model_save_dir: Path,
 ) -> float:
     """
     Initializes and runs the ModelTrainer for a single training process.
 
-    This function serves as a wrapper around the ModelTrainer class,
-    facilitating both standard training runs and individual trials
-    within a hyperparameter tuning session.
-
     Args:
-        trial: An Optuna Trial object if part of a tuning run, else None.
-        config: The configuration dictionary for this training run.
-        device: The PyTorch device (CPU or CUDA) to use for training.
-        dataset: The pre-loaded AtmosphericDataset instance.
-        collate_fn: The collate function for the DataLoader.
-        save_dir: The directory where model artifacts and logs will be saved.
+        optuna_trial_obj: An Optuna Trial object if part of a tuning run.
+        train_config: The configuration dictionary for this training run.
+        compute_device: The PyTorch device for training.
+        dataset_obj: The pre-loaded AtmosphericDataset instance.
+        collate_fn_obj: The collate function for DataLoaders.
+        model_save_dir: Directory where model artifacts are saved.
 
     Returns:
-        The best validation loss achieved during training.
+        The best validation loss achieved during this training run.
+    Raises:
+        RuntimeError: If ModelTrainer.train() does not return a float.
     """
     trainer = ModelTrainer(
-        config=config,
-        device=device,
-        save_dir=save_dir,
-        dataset=dataset,
-        collate_fn=collate_fn,
-        optuna_trial=trial,
+        config=train_config,
+        device=compute_device,
+        save_dir=model_save_dir,
+        dataset=dataset_obj,
+        collate_fn=collate_fn_obj,
+        optuna_trial=optuna_trial_obj,
     )
-    best = trainer.train()
-    if not isinstance(best, float):
-        raise RuntimeError("ModelTrainer did not return a float validation loss.")
-    return best
+    best_metric_from_train = trainer.train()
+    if not isinstance(best_metric_from_train, float):
+        error_msg = (
+            f"ModelTrainer.train() returned type {type(best_metric_from_train)} "
+            "instead of float. This indicates an issue in the training loop."
+        )
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+    return best_metric_from_train
 
 
-def _run_tuning(cfg: Dict[str, Any], data_dir: Path) -> bool:
+def _initiate_hyperparameter_tuning(
+    base_run_config: Dict[str, Any], data_directory: Path
+) -> bool:
     """
     Manages the hyperparameter tuning process using Optuna.
 
-    It sets up the tuning study and calls the `run_hyperparameter_search`
-    function.
-
     Args:
-        cfg: The base configuration dictionary.
-        data_dir: The root data directory.
+        base_run_config: The base configuration dictionary.
+        data_directory: The root data directory.
 
     Returns:
-        True if the tuning process completes and finds a best configuration,
-        False otherwise.
+        True if tuning completes successfully, False otherwise.
     """
-    num_trials = cfg.get("optuna_num_trials", DEFAULT_NUM_TRIALS)
-    logger.info("Starting hyper‑parameter search: %d trials", num_trials)
-    tuning_results_dir = data_dir / "tuning_results"
+    num_optuna_trials = base_run_config.get(
+        "optuna_num_trials", DEFAULT_OPTUNA_TRIALS
+    )
+    logger.info(
+        "Starting hyperparameter search with %d trials.", num_optuna_trials
+    )
+    tuning_output_dir = data_directory / "tuning_results"
+    ensure_dirs(tuning_output_dir)
 
-    def _train_wrapper(
-        trial: optuna.Trial,
-        trial_cfg: Dict[str, Any],
-        device: torch.device,
-        ds: AtmosphericDataset,
-        collate: Callable,
-        root: Path,
+    def optuna_objective_wrapper(
+        current_trial: optuna.Trial,
+        current_trial_config: Dict[str, Any],
+        device_for_trial: torch.device,
+        dataset_for_trial: AtmosphericDataset,
+        collate_for_trial: Callable,
+        trial_artifacts_root: Path,
     ) -> float:
-        """
-        A wrapper for `train_model` to match the signature expected by
-        `run_hyperparameter_search`.
-        """
-        return train_model(trial, trial_cfg, device, ds, collate, root)
+        return _execute_model_training(
+            current_trial, current_trial_config, device_for_trial,
+            dataset_for_trial, collate_for_trial, trial_artifacts_root
+        )
 
-    best_cfg = run_hyperparameter_search(
-        base_config=cfg,
-        data_dir=str(data_dir),
-        output_dir=str(tuning_results_dir),
-        setup_dataset_func=_setup_dataset,
-        train_model_func=_train_wrapper,
+    best_configuration_found = run_hyperparameter_search(
+        base_config=base_run_config,
+        data_dir=str(data_directory),
+        output_dir=str(tuning_output_dir),
+        setup_dataset_func=_initialize_dataset_and_collate,
+        train_model_func=optuna_objective_wrapper,
         setup_device_func=setup_device,
         save_config_func=save_json,
-        num_trials=num_trials,
+        num_trials=num_optuna_trials,
     )
-    return best_cfg is not None
+    return best_configuration_found is not None
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_command_line_args() -> argparse.Namespace:
     """
     Parses command-line arguments for the script.
 
     Returns:
-        An argparse.Namespace object containing the parsed arguments.
+        An argparse.Namespace object with parsed arguments.
     """
-    p = argparse.ArgumentParser(
-        description="Atmospheric‑flux transformer pipeline"
+    parser = argparse.ArgumentParser(
+        description="Atmospheric transformer modeling pipeline.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    p.add_argument(
-        "--normalize", action="store_true", help="Run data normalisation"
+    parser.add_argument(
+        "--config", type=Path, default=DEFAULT_CONFIG_PATH,
+        help="Path to the main configuration file (JSON or JSONC/JSON5)."
     )
-    p.add_argument(
-        "--train", action="store_true", help="Train a model using fixed config"
+    parser.add_argument(
+        "--data-dir", type=Path, default=DEFAULT_DATA_DIR_PATH,
+        help="Path to the root data directory."
     )
-    p.add_argument(
-        "--tune", action="store_true", help="Run Optuna hyper‑parameter search"
+    parser.add_argument(
+        "--normalize", action="store_true",
+        help="Run the data normalisation step using profiles in data-dir/profiles."
     )
-    args = p.parse_args()
-    if not (args.normalize or args.train or args.tune):
-        p.error("Specify at least one action: --normalize, --train, --tune")
-    return args
+    parser.add_argument(
+        "--train", action="store_true",
+        help="Train a model using the fixed configuration specified in the config file."
+    )
+    parser.add_argument(
+        "--tune", action="store_true",
+        help="Run Optuna hyperparameter search to find an optimal model configuration."
+    )
+    parsed_args = parser.parse_args()
+
+    if not (parsed_args.normalize or parsed_args.train or parsed_args.tune):
+        parser.error(
+            "No action specified. Please choose at least one: "
+            "--normalize, --train, or --tune."
+        )
+    return parsed_args
 
 
 def main() -> int:
     """
-    The main entry point for the script.
+    Main entry point for the script.
 
-    Orchestrates the selected actions (normalize, train, tune) based on
-    command-line arguments.
+    Orchestrates actions based on command-line arguments and configuration.
 
     Returns:
-        0 on successful completion, 1 on failure.
+        0 on success, 1 on failure.
     """
-    args = _parse_args()
-    setup_logging()
-    logger.info("Using configuration file: %s", CONFIG_PATH)
-    logger.info("Using data directory: %s", DATA_DIR_PATH)
+    cli_args = _parse_command_line_args()
+    setup_logging(level=logging.INFO)
 
-    cfg = load_config(CONFIG_PATH)
-    if cfg is None:
-        logger.error("Configuration load/validation failed. Exiting.")
+    logger.info("Using configuration file: %s", cli_args.config.resolve())
+    logger.info("Using data directory: %s", cli_args.data_dir.resolve())
+
+    main_config = load_config(cli_args.config)
+    if main_config is None:
+        logger.critical(
+            "Main configuration could not be loaded or validated from %s. Terminating.",
+            cli_args.config
+            )
         return 1
-    seed_everything(cfg.get("random_seed", 42))
+
+    seed_everything(main_config.get("random_seed", 42))
     ensure_dirs(
-        DATA_DIR_PATH / "profiles",
-        DATA_DIR_PATH / "normalized_profiles",
-        DATA_DIR_PATH / "model",
-        DATA_DIR_PATH / "tuning_results",
+        cli_args.data_dir / "profiles",
+        cli_args.data_dir / "normalized_profiles",
+        cli_args.data_dir / "model",
+        cli_args.data_dir / "tuning_results",
     )
 
-    if args.normalize:
-        logger.info("Starting data normalization...")
-        if not _normalize(cfg, DATA_DIR_PATH):
-            logger.error("Data normalization failed. Exiting.")
+    if cli_args.normalize:
+        logger.info("Starting data normalization process...")
+        if not _normalize_data(main_config, cli_args.data_dir):
+            logger.error("Data normalization step reported failure. Terminating.")
             return 1
-        logger.info("Data normalization finished.")
+        logger.info("Data normalization finished successfully.")
 
-    if args.train:
+    if cli_args.train:
         logger.info("Starting model training with fixed configuration...")
-        device = setup_device()
-        ds_info = _setup_dataset(cfg, DATA_DIR_PATH)
-        if ds_info is None:
+        selected_device = setup_device()
+        dataset_setup_result = _initialize_dataset_and_collate(
+            main_config, cli_args.data_dir
+        )
+        if dataset_setup_result is None:
+            logger.error("Failed to set up dataset for training. Terminating.")
             return 1
-        ds, coll = ds_info
+        main_dataset, main_collate_fn = dataset_setup_result
+
         try:
-            model_save_dir = DATA_DIR_PATH / "model"
-            train_model(None, cfg, device, ds, coll, model_save_dir)
-            logger.info(
-                "Model training finished. Artifacts saved in %s",
-                model_save_dir,
+            fixed_train_model_dir = cli_args.data_dir / "model"
+            ensure_dirs(fixed_train_model_dir)
+            _execute_model_training(
+                optuna_trial_obj=None,
+                train_config=main_config,
+                compute_device=selected_device,
+                dataset_obj=main_dataset,
+                collate_fn_obj=main_collate_fn,
+                model_save_dir=fixed_train_model_dir
             )
-        except Exception as exc:
+            logger.info(
+                "Fixed configuration model training finished. Artifacts saved in %s",
+                fixed_train_model_dir,
+            )
+        except Exception as e:
             logger.error(
-                "Training failed unexpectedly: %s", exc, exc_info=True
+                "Fixed configuration training failed unexpectedly: %s",
+                e, exc_info=True
             )
             return 1
 
-    if args.tune:
-        logger.info("Starting hyper-parameter tuning...")
-        if not _run_tuning(cfg, DATA_DIR_PATH):
-            logger.error("Hyper-parameter tuning failed.")
+    if cli_args.tune:
+        logger.info("Starting hyperparameter tuning process...")
+        if not _initiate_hyperparameter_tuning(main_config, cli_args.data_dir):
+            logger.error(
+                "Hyperparameter tuning process reported failure or was interrupted."
+            )
             return 1
+        logger.info("Hyperparameter tuning finished successfully.")
+
+    logger.info("All requested pipeline actions completed.")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        exit_code = main()
+        sys.exit(exit_code)
+    except SystemExit as e:
+        # Catch sys.exit to ensure the process terminates with the correct code
+        sys.exit(e.code)
+    except Exception as e:
+        # Fallback for any other unhandled exceptions from main()
+        logger.critical(
+            "An unhandled error occurred in main execution: %s", e, exc_info=True
+        )
+        sys.exit(1) # General error code for unhandled exceptions
