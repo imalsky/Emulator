@@ -397,7 +397,7 @@ class MultiEncoderTransformer(nn.Module):
         self,
         inputs: Dict[str, Tensor],
         input_masks: Optional[Dict[str, Tensor]] = None,
-        targets: Optional[torch.Tensor] = None
+        targets: Optional[torch.Tensor] = None # targets is not used in the computation graph
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -412,18 +412,20 @@ class MultiEncoderTransformer(nn.Module):
         pytorch_padding_masks: Dict[str, Tensor] = {} # True means PAD
         if input_masks:
             for seq_type, mask_true_is_valid in input_masks.items():
-                if seq_type in self.sequence_encoders:
+                if seq_type in self.sequence_encoders: # Only consider masks for existing encoders
                     pytorch_padding_masks[seq_type] = ~mask_true_is_valid
         else:
+            # This path is taken if input_masks argument is None
             logger.debug("No input_masks provided; generating PyTorch masks from padding_value.")
-            for seq_type in self.sequence_types:
-                if seq_type in inputs and inputs[seq_type].ndim == 3:
+            for seq_type in self.sequence_types: # Iterate over all configured sequence types
+                if seq_type in inputs and isinstance(inputs[seq_type], torch.Tensor) and inputs[seq_type].ndim == 3:
+                     # Ensure the input exists and is a tensor before generating mask
                     pytorch_padding_masks[seq_type] = \
                         self._generate_pytorch_padding_mask(inputs[seq_type])
 
         global_features_encoded = None
         if self.has_global and self.global_encoder is not None:
-            global_tensor = inputs['global']
+            global_tensor = inputs['global'] # Presence validated by _validate_inputs
             global_features_encoded = self.global_encoder(global_tensor)
 
         encoded_sequences: Dict[str, Optional[torch.Tensor]] = {}
@@ -433,52 +435,66 @@ class MultiEncoderTransformer(nn.Module):
                 encoded_sequences[seq_type] = None
                 continue
 
-            current_padding_mask = pytorch_padding_masks.get(seq_type)
+            current_padding_mask = pytorch_padding_masks.get(seq_type) # This can be None
             encoded = encoder(seq_input_tensor, current_padding_mask)
 
             if self.has_global and global_features_encoded is not None and \
-               self.film_layers and seq_type in self.film_layers:
+               self.film_layers and seq_type in self.film_layers: # Check film_layers is not None
                 encoded = self.film_layers[seq_type](encoded, global_features_encoded)
 
-            if current_padding_mask is not None:
+            if current_padding_mask is not None: # Apply padding mask to output of encoder/film
                 encoded = encoded.masked_fill(current_padding_mask.unsqueeze(-1), 0.0)
             encoded_sequences[seq_type] = encoded
-
-        active_encoded_sequences = {k:v for k,v in encoded_sequences.items() if v is not None}
+        
+        active_encoded_sequences = {k: v for k, v in encoded_sequences.items() if v is not None}
         if not active_encoded_sequences:
-            bs = next((t.size(0) for t in inputs.values() if isinstance(t, Tensor) and t.ndim > 0), 1)
+            # output_seq_type is a guaranteed key in inputs due to _validate_inputs
+            # and its presence in sequence_dims.
+            ref_input_tensor_for_shape = inputs[self.output_seq_type]
+            bs = ref_input_tensor_for_shape.size(0)
+            device_to_use = ref_input_tensor_for_shape.device
             logger.warning("No sequences encoded; returning zeros. Shape: (%d, %d, %d)",
                            bs, output_seq_padded_length, self.output_dim)
             return torch.zeros(
                 bs, output_seq_padded_length, self.output_dim,
-                device=next(self.parameters()).device
+                device=device_to_use
             )
 
-        if self.use_cross_attention and self.cross_attention:
+        if self.use_cross_attention and self.cross_attention: # Check cross_attention is not None
+            # This assumes self.sequence_types has at least 2 elements if use_cross_attention is True
             st0, st1 = self.sequence_types[0], self.sequence_types[1]
             enc0, enc1 = encoded_sequences.get(st0), encoded_sequences.get(st1)
+
             if enc0 is not None and enc1 is not None:
-                mask0_pad = pytorch_padding_masks.get(st0)
-                mask1_pad = pytorch_padding_masks.get(st1)
+                mask0_pad = pytorch_padding_masks.get(st0) # Optional
+                mask1_pad = pytorch_padding_masks.get(st1) # Optional
+                
+                # Ensure cross_attention keys exist, which they should if __init__ was successful
+                # and use_cross_attention is True.
                 encoded_sequences[st0] = self.cross_attention[f"{st0}_to_{st1}"](
-                    enc0, enc1, mask1_pad, mask0_pad)
+                    enc0, enc1, mask1_pad, mask0_pad
+                )
                 encoded_sequences[st1] = self.cross_attention[f"{st1}_to_{st0}"](
-                    enc1, enc0, mask0_pad, mask1_pad)
+                    enc1, enc0, mask0_pad, mask1_pad
+                )
             else:
-                logger.warning("Cross-attn skipped: one/both sequences ('%s', '%s') are None.", st0, st1)
+                logger.warning("Cross-attn skipped: one/both sequences ('%s', '%s') are None after encoding.", st0, st1)
+
 
         final_output_candidate = encoded_sequences.get(self.output_seq_type)
         if final_output_candidate is None:
-            bs = next((t.size(0) for t in inputs.values() if isinstance(t, Tensor) and t.ndim > 0), 1)
+            ref_input_tensor_for_shape = inputs[self.output_seq_type]
+            bs = ref_input_tensor_for_shape.size(0)
+            device_to_use = ref_input_tensor_for_shape.device
             logger.error("Output sequence '%s' is None after encoding. Returning zeros.", self.output_seq_type)
             return torch.zeros(
                 bs, output_seq_padded_length, self.output_dim,
-                device=next(self.parameters()).device
+                device=device_to_use
             )
 
         output = self.output_proj(final_output_candidate)
-        output_mask_pad = pytorch_padding_masks.get(self.output_seq_type)
-        if output_mask_pad is not None:
+        output_mask_pad = pytorch_padding_masks.get(self.output_seq_type) # Optional
+        if output_mask_pad is not None: # Apply padding to final output
             output = output.masked_fill(output_mask_pad.unsqueeze(-1), 0.0)
         return output
 

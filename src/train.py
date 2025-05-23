@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import optuna
+import optuna # type: ignore
 import torch
 from optuna.exceptions import TrialPruned
 from torch import nn, optim
@@ -17,7 +17,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Subset
 
 # Local imports
-from dataset import AtmosphericDataset
+from dataset import AtmosphericDataset # Assuming AtmosphericDataset is in dataset.py
 from hardware import configure_dataloader_settings
 from model import MultiEncoderTransformer, create_prediction_model
 from utils import save_json
@@ -88,10 +88,18 @@ def _split_dataset(
     )
 
     try:
-        test_filenames = dataset.get_profile_filenames_by_indices(test_indices)
+        # This method is assumed to exist on AtmosphericDataset for this script to work.
+        # If it doesn't, this will raise an AttributeError.
+        test_filenames = dataset.get_profile_filenames_by_indices(test_indices) # type: ignore
         if test_filenames:
             logger.info("First few test filenames: %s...",test_filenames[:min(3, len(test_filenames))])
-    except IndexError as e:
+    except AttributeError:
+        logger.critical(
+            "AtmosphericDataset does not have method 'get_profile_filenames_by_indices'. "
+            "This is required by the training script. Exiting."
+            )
+        sys.exit(1)
+    except IndexError as e: # Should not happen if indices are from randperm(n)
         logger.critical("Error retrieving test filenames by indices: %s. Exiting.", e)
         sys.exit(1)
 
@@ -139,7 +147,8 @@ class ModelTrainer:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.optuna_trial = optuna_trial
-        self.padding_value = float(self.cfg.get("padding_value", 0.0))
+        self.padding_value = float(self.cfg.get("padding_value", 0.0)) # Used by collate_fn indirectly
+        self.model: MultiEncoderTransformer # type: ignore[assignment] # Initialized in _build_model
 
         (
             self.train_ds,
@@ -161,7 +170,7 @@ class ModelTrainer:
             self.cfg.get("use_amp", False) and device.type == "cuda"
         )
         self.scaler: Optional[GradScaler] = (
-            GradScaler() if self.use_amp else None
+            GradScaler() if self.use_amp else None # Corrected GradScaler instantiation
         )
         if self.use_amp:
             logger.info("AMP enabled on CUDA.")
@@ -192,7 +201,7 @@ class ModelTrainer:
         # Use constant for num_workers, remove from config and hw_settings for this purpose
         num_w = DATALOADER_NUM_WORKERS
 
-        common_dl_args = dict(
+        common_dl_args: Dict[str, Any] = dict( # Added type hint for common_dl_args
             batch_size=batch_size,
             num_workers=num_w,
             pin_memory=hw_settings["pin_memory"], # Still use from hw_settings
@@ -217,7 +226,7 @@ class ModelTrainer:
         """Creates and initializes the prediction model."""
         # create_prediction_model handles device assignment and potential exits
         # for critical hyperparameter issues.
-        self.model: MultiEncoderTransformer = create_prediction_model(
+        self.model = create_prediction_model(
             self.cfg, device=self.device
         )
         if (
@@ -354,13 +363,31 @@ class ModelTrainer:
                         epoch_num, patience
                     )
                     break
-        else:
+        else: # Executed if the loop completes without a 'break'
             logger.info("Training completed %d epochs.", epochs)
-            completed_epochs = epochs
+            # completed_epochs is already epochs here
 
 
         self._checkpoint("final_model.pt", completed_epochs, current_validation_loss, final=True)
         self.test()
+
+        # --- JIT Save ---
+        try:
+            logger.info("Attempting to JIT save the model...")
+            # Ensure we get the underlying model if torch.compile was used
+            # self.model would have been updated by self.test() if a checkpoint was loaded
+            model_to_jit = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+            
+            # Script the model. No example_inputs are typically needed for torch.jit.script(nn.Module).
+            # JIT will analyze the forward method's code.
+            scripted_model = torch.jit.script(model_to_jit)
+            jit_save_path = self.save_dir / "model_jit.pt"
+            scripted_model.save(str(jit_save_path)) # Use str(Path) for compatibility
+            logger.info(f"Model JIT saved successfully to {jit_save_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to JIT save the model: {e}", exc_info=True)
+            
         return self.best_val_loss
 
     def _run_epoch(
@@ -392,13 +419,15 @@ class ModelTrainer:
                 dtype=torch.float16,
                 enabled=effective_use_amp
             )
-            if effective_use_amp
-            else contextlib.nullcontext()
+            # Removed else contextlib.nullcontext() for directness if not effective_use_amp
+            # The enabled=effective_use_amp flag handles this.
         )
 
         grad_context = torch.enable_grad() if train_phase else torch.no_grad()
         phase_str = "Train" if train_phase else "Val/Test"
-        log_interval = max(1, len(loader) // 5)
+        # Ensure len(loader) is not zero before division
+        log_interval = max(1, len(loader) // 5) if len(loader) > 0 else 1
+
 
         with grad_context:
             for batch_idx, batch_data in enumerate(loader):
@@ -441,7 +470,7 @@ class ModelTrainer:
                             epoch_num, phase_str, batch_idx, target_mask.shape, predictions.shape
                         )
                         # Attempt a common case: mask is (B, L) and loss is (B, L, F)
-                        if target_mask.shape == loss_unreduced.shape[:-1]:
+                        if target_mask.shape == loss_unreduced.shape[:-1]: # Check if dimensions match except last one
                              active_loss_mask = target_mask.unsqueeze(-1)
                         else: # Fallback: assume all elements contribute if unsure
                              active_loss_mask = torch.ones_like(loss_unreduced, dtype=torch.bool, device=self.device)
@@ -455,8 +484,9 @@ class ModelTrainer:
                     else:
                         # Avoid division by zero if no active elements (e.g. fully padded batch)
                         current_batch_loss = torch.tensor(
-                            0.0, device=self.device, requires_grad=train_phase
+                            0.0, device=self.device, dtype=predictions.dtype, requires_grad=train_phase
                         )
+
 
                 if not torch.isfinite(current_batch_loss):
                     logger.warning(
@@ -470,7 +500,7 @@ class ModelTrainer:
 
                 if train_phase:
                     self.optimizer.zero_grad(set_to_none=True)
-                    if self.scaler:
+                    if self.scaler: # This implies effective_use_amp is True and device is CUDA
                         self.scaler.scale(current_batch_loss).backward()
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(
@@ -478,7 +508,7 @@ class ModelTrainer:
                         )
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
-                    else:
+                    else: # Not using AMP or not on CUDA
                         current_batch_loss.backward()
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), self.max_grad_norm
@@ -492,7 +522,7 @@ class ModelTrainer:
                     logger.debug(
                         "Epoch %d [%s] Batch %d/%d AvgLossInBatch: %.4e",
                         epoch_num, phase_str, batch_idx, len(loader),
-                        current_batch_loss.item()
+                        current_batch_loss.item() # current_batch_loss is scalar here
                     )
 
         if total_active_elements == 0:
@@ -527,7 +557,7 @@ class ModelTrainer:
         # Ensure runtime nhead (if adjusted by create_prediction_model) is saved
         if hasattr(model_to_save, 'nhead') and isinstance(model_to_save.nhead, int):
             checkpoint_config['nhead'] = model_to_save.nhead
-        elif hasattr(self.model, 'nhead') and isinstance(self.model.nhead, int):
+        elif hasattr(self.model, 'nhead') and isinstance(self.model.nhead, int): # Fallback to self.model if model_to_save lacks it
             checkpoint_config['nhead'] = self.model.nhead
 
 
@@ -535,15 +565,18 @@ class ModelTrainer:
             "state_dict": model_to_save.state_dict(),
             "epoch": epoch,
             "val_loss": val_loss,
-            "config": checkpoint_config,
+            "config": checkpoint_config, # Use the (potentially updated by create_model) config
         }
         try:
             torch.save(checkpoint, save_path)
-            status_msg = "Final model" if final else "Checkpoint"
-            logger.info(
-                "%s saved (Epoch %d, Val Loss: %.4e) to %s",
-                status_msg, epoch, val_loss, save_path.name
-            )
+            # Log only if successful and for specific checkpoints for brevity
+            if filename == "best_model.pt":
+                logger.info("New best model saved to %s (Epoch %d, Val Loss %.4e)",
+                            save_path.name, epoch, val_loss)
+            elif final:
+                 logger.info("Final model saved to %s (Epoch %d, Val Loss %.4e)",
+                            save_path.name, epoch, val_loss)
+
         except IOError as e:
             logger.error(
                 "Failed to save checkpoint %s at epoch %d: %s",
@@ -561,38 +594,46 @@ class ModelTrainer:
         best_model_filename = "best_model.pt"
         best_model_path = self.save_dir / best_model_filename
         
-        config_for_testing = self.cfg.copy() # Start with current config
+        config_for_testing = self.cfg.copy() # Start with current config for the model instance
         model_was_loaded_from_checkpoint = False
         
         if best_model_path.exists():
             try:
+                # map_location ensures model loads to the correct device trainer is using
                 checkpoint = torch.load(best_model_path, map_location=self.device)
                 if 'config' in checkpoint:
-                    # Prioritize config from checkpoint for model architecture
+                    # Prioritize config from checkpoint for model architecture if different
+                    # This ensures the loaded state_dict matches the model structure.
                     config_for_testing = checkpoint['config']
                     logger.info(
                         "Using model configuration from checkpoint '%s' for testing.",
                         best_model_filename
                     )
+                else: # Should not happen if checkpointing is correct
+                    logger.warning("Checkpoint '%s' is missing 'config' key. Using current trainer config.", best_model_filename)
 
-                # Re-create model using the determined config
+
+                # Re-create model using the determined config for testing
+                # This ensures correct architecture before loading state_dict.
                 test_model = create_prediction_model(config_for_testing, device=self.device)
                 
+                # Apply torch.compile if it was configured for the loaded model config
                 if (
-                    config_for_testing.get("use_torch_compile", False)
+                    config_for_testing.get("use_torch_compile", False) # Use config from checkpoint
                     and self.device.type == "cuda"
                     and hasattr(torch, "compile")
                 ):
                     try:
                         test_model = torch.compile(test_model) # type: ignore
+                        logger.info("Test model compiled with torch.compile().")
                     except Exception as e:
                         logger.warning("torch.compile failed for test model: %s.", e)
 
                 # Load state dict into the potentially compiled model's underlying module
-                model_to_load_state = test_model._orig_mod if hasattr(test_model, '_orig_mod') else test_model
-                model_to_load_state.load_state_dict(checkpoint["state_dict"])
+                model_to_load_state_dict_into = test_model._orig_mod if hasattr(test_model, '_orig_mod') else test_model
+                model_to_load_state_dict_into.load_state_dict(checkpoint["state_dict"])
                 
-                self.model = test_model # Use this loaded model for testing
+                self.model = test_model # CRITICAL: Update self.model to the loaded one for JIT saving later
                 model_was_loaded_from_checkpoint = True
                 logger.info(
                     "Loaded best model from %s (Epoch %s, Val Loss: %.4e) for testing.",
@@ -601,28 +642,29 @@ class ModelTrainer:
                     checkpoint.get('val_loss', float('nan'))
                 )
             except FileNotFoundError: # Should be caught by exists(), but defensive
-                logger.warning("Best model checkpoint %s not found during load attempt.", best_model_path)
+                logger.warning("Best model checkpoint %s not found during load attempt. This should not happen if exists() check passed.", best_model_path)
             except Exception as e:
                 logger.error(
                     "Failed to load best model from %s: %s. "
                     "Testing with the model from the end of training if available.",
                     best_model_path, e, exc_info=True
                 )
-                # If loading best fails, self.model is already the final trained model (or initial if training failed early)
+                # If loading best fails, self.model is already the final trained model
+                # (or initial if training failed very early and self.model was never updated)
         else:
-            logger.warning(
+            logger.info( # Changed from warning to info as this is an expected path
                 "Best model checkpoint (%s) not found. "
                 "Testing with the model from the end of training.",
                 best_model_path
             )
-            # self.model is already the final trained model
+            # self.model is already the final trained model from the loop
 
-        if not model_was_loaded_from_checkpoint and self.model is None:
-            logger.error("No model available for testing. Test phase skipped.")
+        if self.model is None: # Should only happen if __init__ fails before _build_model
+            logger.error("No model available for testing (self.model is None). Test phase skipped.")
             return
 
 
-        test_loss = self._run_epoch(self.test_loader, train_phase=False, epoch_num=-1)
+        test_loss = self._run_epoch(self.test_loader, train_phase=False, epoch_num=-1) # epoch_num=-1 for test
         logger.info("Test Loss (on evaluated model): %.4e", test_loss)
         try:
             save_json(
@@ -635,6 +677,7 @@ class ModelTrainer:
         """Saves filenames of the test set profiles."""
         info_path = self.save_dir / "test_set_info.json"
         try:
+            # test_filenames should be strings
             save_json({"test_filenames": sorted(self.test_filenames)}, info_path)
             logger.info("Test set filenames saved to %s", info_path.name)
         except Exception as e:
