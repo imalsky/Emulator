@@ -3,8 +3,9 @@
   // DATA SPECIFICATION
   // Defines the structure and variables of the input and output data.
   // ════════════════════════════════════════════════════════════════
-  "input_variables": ["pressure","temperature"],
-  "target_variables": ["thermal_net_flux", "reflected_net_flux"],
+  "input_variables": ["wav"], // List of keys for input sequences/features from JSON profiles.
+  "target_variables": ["albedo"], // List of keys for target sequences/features from JSON profiles.
+
   /*
    * sequence_types: Defines groups of variables that share a common sequence structure.
    * Each key is a sequence type name (e.g., "spectral_data", "atmospheric_profile").
@@ -13,17 +14,16 @@
    * Different profiles can have different lengths for the same sequence type.
    */
   "sequence_types": {
-    "sequence1": ["pressure",
-      "temperature",
-      "thermal_net_flux",
-      "reflected_net_flux"]
+    "sequence1": ["wav", "albedo"]
   },
 
   /*
    * global_variables: List of keys for scalar features that apply globally to the profile.
    * These are typically single numeric values per JSON profile.
    */
-  "global_variables": ["orbital_sep"
+  "global_variables": [
+    "var1", "var2", "var3", "var4", "var5",
+    "var6", "var7", "var8", "var9", "var10"
   ],
 
   // output_seq_type: Specifies which sequence type in "sequence_types" dictates the
@@ -38,15 +38,11 @@
   // Configures how data variables are normalized before being fed to the model.
   // ════════════════════════════════════════════════════════════════
   "normalization": {
-    "key_methods": {
-      "pressure":           "log-min-max",
-      "thermal_net_flux":   "symlog",
-      "reflected_net_flux": "symlog"
-    },
-    "default_method":              "standard",
+    "key_methods": {"wav": "log-min-max"},
+    "default_method": "standard",
     "clip_outliers_before_scaling": false,
-    "symlog_percentile":            0.10,
-    "epsilon":                      0
+    "symlog_percentile": 0.10,
+    "epsilon": 1e-10
   },
 
   // ════════════════════════════════════════════════════════════════
@@ -54,9 +50,9 @@
   // Defines the architecture of the transformer model.
   // ════════════════════════════════════════════════════════════════
   "d_model": 128,               // Dimensionality of the model's embeddings and hidden states. Must be divisible by nhead.
-  "nhead": 2,                   // Number of heads in the multi-head attention mechanisms.
-  "num_encoder_layers": 2,      // Number of layers in the transformer encoder stack for each sequence type.
-  "dim_feedforward": 256,       // Dimensionality of the feedforward network within encoder layers.
+  "nhead": 4,                   // Number of heads in the multi-head attention mechanisms.
+  "num_encoder_layers": 4,      // Number of layers in the transformer encoder stack for each sequence type.
+  "dim_feedforward": 512,       // Dimensionality of the feedforward network within encoder layers.
   "dropout": 0.00,              // Dropout rate used in various parts of the model.
   "positional_encoding_type": "sine",
   "max_sequence_length": 1024,

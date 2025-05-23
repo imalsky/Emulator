@@ -1,62 +1,68 @@
 #!/usr/bin/env python3
 import math
-import logging
-import sys
-from typing import Dict, Optional, List, Set, Tuple, Any
+import sys # Used for critical error exits in the model factory function.
+from typing import Dict, Optional, List, Any, Tuple, Set 
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+import logging
 logger = logging.getLogger(__name__)
 
 
 class SinePositionalEncoding(nn.Module):
     """
-    Sinusoidal positional encoding module.
-
-    Generates fixed sinusoidal positional encoding and adds it to the input.
-    Expected input shape: [batch_size, seq_length, d_model].
-    The d_model must be an even number.
+    Implements sinusoidal positional encoding, adding time-step information to input sequences.
+    This technique helps the transformer model understand the order of elements in a sequence,
+    as the self-attention mechanism itself is permutation-invariant.
+    The encodings are pre-computed up to `max_len` and added to the input embeddings.
     """
-
     def __init__(self, d_model: int, max_len: int = 512):
         super().__init__()
-        if d_model % 2 != 0:
-            msg = (f"SinePositionalEncoding requires an even d_model, "f"got {d_model}.")
-            logger.critical(msg)
-            raise ValueError(msg)
-
+        # `d_model` must be even for sinusoidal encoding, as pairs of dimensions are used
+        # for sine and cosine components. This validation is handled by `create_prediction_model`.
+        
+        # Pre-allocate a tensor for positional encodings.
         pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float()* (-math.log(10000.0) / d_model))
+        # Create a tensor representing positions (0, 1, ..., max_len-1).
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        # Calculate the division term for the wavelengths of the sine/cosine functions.
+        # The wavelengths form a geometric progression from 2*pi to 10000*2*pi.
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        # Apply sine to even indices in the `d_model` dimension.
         pe[:, 0::2] = torch.sin(position * div_term)
+        # Apply cosine to odd indices in the `d_model` dimension.
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
+        
+        # Register `pe` as a buffer. Buffers are part of the model's state but not trained.
+        # `unsqueeze(0)` adds a batch dimension for broadcasting.
+        self.register_buffer("pe", pe.unsqueeze(0))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Adds positional encoding to the input tensor."""
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Adds positional encoding to the input tensor.
+        Args:
+            x: Input tensor of shape (batch_size, sequence_length, d_model).
+        Returns:
+            Tensor with added positional encodings, of the same shape as input.
+        """
         seq_len = x.size(1)
-        if seq_len > self.pe.size(1):
-            logger.error(
-                "Input sequence length (%d) exceeds PE table max_len (%d). "
-                "Adjust 'max_sequence_length' in config.",
-                seq_len, self.pe.size(1)
-            )
-            raise ValueError(
-                f"Input sequence length ({seq_len}) > PE max_len ({self.pe.size(1)})"
-            )
+        # Ensure the input sequence length does not exceed the pre-computed max_len.
+        # This check is important for JIT compilation and runtime safety.
+        torch._assert(seq_len <= self.pe.size(1), 
+                      f"Input sequence length {seq_len} exceeds PE table max_len {self.pe.size(1)}")
+        # Add the corresponding slice of positional encodings to the input.
         return x + self.pe[:, :seq_len, :]
 
 
 class SequenceEncoder(nn.Module):
     """
-    Bidirectional encoder for sequence data.
-
-    Projects inputs, optionally adds positional encodings, and processes
-    via TransformerEncoder.
+    A standard transformer encoder module for processing sequential data.
+    It consists of an input projection, optional positional encoding, and a stack
+    of transformer encoder layers.
     """
-
     def __init__(
         self,
         input_dim: int,
@@ -66,58 +72,32 @@ class SequenceEncoder(nn.Module):
         dim_feedforward: int,
         dropout: float = 0.1,
         norm_first: bool = False,
-        positional_encoding_type: Optional[str] = "sinusoidal",
-        max_len: int = 512
+        positional_encoding_module: Optional[SinePositionalEncoding] = None
     ):
         super().__init__()
+        # Project the input features to the model's dimension `d_model`.
         self.input_proj = nn.Linear(input_dim, d_model)
-        self.pos_encoder: Optional[nn.Module] = None
-        self.d_model = d_model
-
-        pe_type_lower = (
-            positional_encoding_type.lower()
-            if positional_encoding_type
-            else "none"
-        )
-
-        if pe_type_lower == "none":
-            self.pos_encoder = None
-        elif pe_type_lower in ["sinusoidal", "sine", "sin"]:
-            try:
-                self.pos_encoder = SinePositionalEncoding(d_model, max_len=max_len)
-            except ValueError as e:
-                logger.critical(
-                    "Failed to init SinePositionalEncoding for SequenceEncoder "
-                    "(d_model likely odd): %s. Exiting.", e
-                )
-                sys.exit(1)
-        else:
-            logger.critical(
-                "Unsupported positional_encoding_type: '%s'. Valid: "
-                "'sinusoidal' or 'none'. Exiting.", positional_encoding_type
-            )
-            sys.exit(1)
-
+        # Store the positional encoding module (e.g., SinePositionalEncoding).
+        self.pos_encoder = positional_encoding_module 
+        # Define a single transformer encoder layer. `norm_first=True` applies layer norm
+        # before self-attention and feedforward sub-layers, which can improve stability.
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
             dropout=dropout, batch_first=True, norm_first=norm_first,
-            activation='gelu'
+            activation='gelu' # GELU activation is common in transformers.
         )
+        # Stack multiple encoder layers to form the complete encoder.
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-    def forward(
-        self, x: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def forward(self, x: Tensor, src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
-        Forward pass for the sequence encoder.
-
+        Processes the input sequence through the encoder.
         Args:
-            x: Input tensor [batch_size, seq_length, input_dim].
-            src_key_padding_mask: Mask for padded tokens in x.
-                                  Shape [batch_size, seq_length],
-                                  True indicates a padded position.
+            x: Input sequence tensor (batch_size, seq_len, input_dim).
+            src_key_padding_mask: Optional mask indicating padded elements in `x`
+                                  (batch_size, seq_len), where True means PAD.
         Returns:
-            Encoded tensor [batch_size, seq_length, d_model].
+            Encoded sequence tensor (batch_size, seq_len, d_model).
         """
         x = self.input_proj(x)
         if self.pos_encoder is not None:
@@ -127,375 +107,353 @@ class SequenceEncoder(nn.Module):
 
 class GlobalEncoder(nn.Module):
     """
-    Encodes global features using an MLP.
-    Input: [batch_size, global_dim], Output: [batch_size, d_model].
+    Encodes global (non-sequential) features into a fixed-size representation.
+    This typically involves a few linear layers with activations and normalization.
     """
-
     def __init__(self, input_dim: int, d_model: int, dropout: float = 0.1):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, d_model * 2),
+            nn.Linear(input_dim, d_model * 2), # Expand dimensionality.
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model),
-            nn.LayerNorm(d_model)
+            nn.Linear(d_model * 2, d_model), # Project back to `d_model`.
+            nn.LayerNorm(d_model) # Normalize the output.
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Processes global features.
+        Args:
+            x: Global features tensor (batch_size, input_dim).
+        Returns:
+            Encoded global features tensor (batch_size, d_model).
+        """
         return self.encoder(x)
 
 
 class FiLMLayer(nn.Module):
     """
-    Feature-wise Linear Modulation (FiLM) layer.
-    Conditions a sequence with global features.
+    Implements Feature-wise Linear Modulation (FiLM).
+    FiLM layers adapt sequence representations based on a conditioning vector (e.g.,
+    encoded global features) by applying an affine transformation (scale and shift)
+    feature-wise.
     """
-
     def __init__(self, d_model: int):
         super().__init__()
+        # Linear layer to generate FiLM parameters (gamma and beta) from the condition.
+        # It outputs 2 * d_model, as gamma and beta each have d_model dimensions.
         self.film_proj = nn.Linear(d_model, d_model * 2)
 
-    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor, condition: Tensor) -> Tensor:
         """
+        Applies FiLM to the input sequence `x` using `condition`.
         Args:
-            x: Sequence tensor [batch_size, seq_length, d_model].
-            condition: Global condition tensor [batch_size, d_model].
+            x: Input sequence tensor (batch_size, seq_len, d_model).
+            condition: Conditioning tensor (batch_size, d_model).
         Returns:
-            Conditioned sequence tensor [batch_size, seq_length, d_model].
+            Modulated sequence tensor (batch_size, seq_len, d_model).
         """
+        # Generate gamma (scale) and beta (shift) parameters from the condition.
         film_params = self.film_proj(condition)
         gamma, beta = torch.chunk(film_params, 2, dim=-1)
+        # Apply the affine transformation: gamma * x + beta.
+        # Unsqueeze gamma and beta to allow broadcasting across the sequence length.
         return gamma.unsqueeze(1) * x + beta.unsqueeze(1)
 
 
 class CrossAttentionModule(nn.Module):
-    """Cross-attention module with Add & Norm."""
-
+    """
+    A module for performing cross-attention between two sequences, or between
+    a query sequence and a key-value sequence. It's a standard attention block
+    with residual connection and layer normalization.
+    """
     def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
         super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(
+        # Multi-head attention layer. `batch_first=True` means input/output tensors
+        # have batch dimension first.
+        self.attn = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=nhead, dropout=dropout,
             batch_first=True
         )
         self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout_layer = nn.Dropout(dropout) # Dropout for the residual connection.
 
     def forward(
         self,
-        query: torch.Tensor,
-        key_value: torch.Tensor,
-        key_value_padding_mask: Optional[torch.Tensor] = None,
-        query_padding_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        query: Tensor,
+        key_value: Tensor,
+        key_value_padding_mask: Optional[Tensor] = None, 
+        query_padding_mask: Optional[Tensor] = None      
+    ) -> Tensor:
         """
+        Performs cross-attention.
         Args:
-            query: Query sequence [B, query_len, D].
-            key_value: Key/Value sequence [B, kv_len, D].
-            key_value_padding_mask: Mask for key_value [B, kv_len], True=PAD.
-            query_padding_mask: Mask for query [B, query_len], True=PAD.
+            query: Query sequence (batch_size, query_len, d_model).
+            key_value: Key and Value sequence (batch_size, kv_len, d_model).
+            key_value_padding_mask: Mask for `key_value` (batch_size, kv_len), True means PAD.
+            query_padding_mask: Mask for `query` (batch_size, query_len), True means PAD.
+                                Used to zero out outputs at padded query positions.
         Returns:
-            Output tensor [B, query_len, D].
+            Output tensor after attention, residual connection, and normalization
+            (batch_size, query_len, d_model).
         """
-        attn_output, _ = self.multihead_attn(
-            query, key_value, key_value,
-            key_padding_mask=key_value_padding_mask
-        )
-        res_query = query + self.dropout(attn_output)
-        norm_output = self.norm(res_query)
-
+        # Compute attention output. `key_value` is used for both keys and values.
+        attn_out, _ = self.attn(query, key_value, key_value, key_padding_mask=key_value_padding_mask)
+        # Residual connection: add attention output to the original query.
+        res_query = query + self.dropout_layer(attn_out)
+        # Apply layer normalization.
+        out_norm = self.norm(res_query)
+        # If a query padding mask is provided, zero out the outputs at padded query positions.
+        # This ensures that padded parts of the query sequence do not carry meaningful information.
         if query_padding_mask is not None:
-            norm_output = norm_output.masked_fill(
-                query_padding_mask.unsqueeze(-1), 0.0
-            )
-        return norm_output
+            out_norm = out_norm.masked_fill(query_padding_mask.unsqueeze(-1), 0.0)
+        return out_norm
 
 
 class MultiEncoderTransformer(nn.Module):
     """
-    Encoder-only transformer for multi-sequence data with optional global
-    features and cross-attention.
+    A transformer model that can process multiple input sequences (up to 2) and
+    optional global features. It uses separate encoders for each sequence type,
+    can fuse information using FiLM layers if global features are present,
+    and can perform cross-attention between sequences if two are provided.
+    The final output is projected to the target dimension.
     """
-
     def __init__(
         self,
-        global_variables: List[str],
-        sequence_dims: Dict[str, Dict[str, int]],
+        sequence_input_dims_ref: Dict[str, int], 
+        global_input_dim: int,
         output_dim: int,
         d_model: int,
         nhead: int,
         num_encoder_layers: int,
         dim_feedforward: int,
-        output_seq_type: str, # Creator (create_prediction_model) ensures this is valid
+        ordered_active_seq_names: List[str], 
+        output_seq_processing_idx: int, 
+        pe_module: Optional[SinePositionalEncoding],
+        padding_value: float = 0.0,
         dropout: float = 0.1,
-        norm_first: bool = False,
-        max_sequence_length: int = 512,
-        positional_encoding_type: Optional[str] = "sinusoidal",
-        padding_value: float = 0.0
+        norm_first: bool = False
     ):
         super().__init__()
         self.d_model = d_model
-        self.padding_value = padding_value
-        self.output_dim = output_dim
-        self.nhead = nhead
+        self.padding_value = padding_value # Value used for padding in input data.
+        self.output_dim = output_dim # Dimension of the final output prediction.
+        # Index indicating which processed sequence (0 or 1) is used for the final output.
+        self.output_processing_idx = output_seq_processing_idx
+        
+        # Stores the input feature dimension for each active sequence type, used for validation.
+        self.sequence_input_dims_ref = sequence_input_dims_ref 
+        
+        self.num_active_sequences = len(ordered_active_seq_names)
+        # The factory `create_prediction_model` ensures 0 < num_active_sequences <= 2.
 
-        self.sequence_dims = sequence_dims
-        self.sequence_types = list(self.sequence_dims.keys())
-        self.global_variables = global_variables
-        self.has_global = bool(self.global_variables)
-        self.output_seq_type = output_seq_type
+        # Initialize components for the first sequence encoder (if active).
+        self.seq_name_0: Optional[str] = None
+        self.encoder_0: Optional[SequenceEncoder] = None
+        self.film_0: Optional[FiLMLayer] = None
+        
+        # Initialize components for the second sequence encoder (if active).
+        self.seq_name_1: Optional[str] = None
+        self.encoder_1: Optional[SequenceEncoder] = None
+        self.film_1: Optional[FiLMLayer] = None
 
-        self.sequence_encoders = nn.ModuleDict()
-        for seq_type, var_dict in self.sequence_dims.items():
-            if not var_dict:
-                 logger.warning(
-                    "Empty var_dict for seq_type '%s' in MultiEncoderTransformer __init__; "
-                    "encoder will not be created. This should be caught by create_prediction_model.",
-                    seq_type
-                 )
-                 continue
-            self.sequence_encoders[seq_type] = SequenceEncoder(
-                input_dim=len(var_dict), d_model=d_model, nhead=self.nhead,
-                num_layers=num_encoder_layers,
-                dim_feedforward=dim_feedforward, dropout=dropout,
-                norm_first=norm_first,
-                positional_encoding_type=positional_encoding_type,
-                max_len=max_sequence_length
+        if self.num_active_sequences >= 1:
+            self.seq_name_0 = ordered_active_seq_names[0]
+            self.encoder_0 = SequenceEncoder(
+                input_dim=self.sequence_input_dims_ref[self.seq_name_0],
+                d_model=d_model, nhead=nhead, num_layers=num_encoder_layers,
+                dim_feedforward=dim_feedforward, dropout=dropout, norm_first=norm_first,
+                positional_encoding_module=pe_module # Share PE module if applicable.
             )
-
+        
+        if self.num_active_sequences > 1:
+            self.seq_name_1 = ordered_active_seq_names[1]
+            # Internal consistency check, should be guaranteed by factory.
+            torch._assert(self.seq_name_1 is not None and self.seq_name_1 in self.sequence_input_dims_ref, 
+                          "Internal config error: seq_name_1 not in sequence_input_dims_ref.")
+            if self.seq_name_1 is not None : # Check for type checker.
+                 self.encoder_1 = SequenceEncoder(
+                    input_dim=self.sequence_input_dims_ref[self.seq_name_1],
+                    d_model=d_model, nhead=nhead, num_layers=num_encoder_layers,
+                    dim_feedforward=dim_feedforward, dropout=dropout, norm_first=norm_first,
+                    positional_encoding_module=pe_module # Share PE module.
+                )
+        
+        # Global feature encoder and FiLM layers are only created if global_input_dim > 0.
         self.global_encoder: Optional[GlobalEncoder] = None
-        self.film_layers: Optional[nn.ModuleDict] = None
-        if self.has_global:
-            self.global_encoder = GlobalEncoder(
-                input_dim=len(self.global_variables), d_model=d_model,
-                dropout=dropout
-            )
-            self.film_layers = nn.ModuleDict({
-                st: FiLMLayer(d_model) for st in self.sequence_types
-                if st in self.sequence_encoders
-            })
+        if global_input_dim > 0:
+            self.global_encoder = GlobalEncoder(global_input_dim, d_model, dropout)
+            # FiLM layers to modulate sequence encodings with global features.
+            if self.encoder_0 is not None: self.film_0 = FiLMLayer(d_model)
+            if self.encoder_1 is not None: self.film_1 = FiLMLayer(d_model)
+        
+        # Cross-attention modules are only created if there are two active sequences.
+        self.cross_attention_0_to_1: Optional[CrossAttentionModule] = None
+        self.cross_attention_1_to_0: Optional[CrossAttentionModule] = None
+        if self.num_active_sequences == 2:
+            self.cross_attention_0_to_1 = CrossAttentionModule(d_model, nhead, dropout)
+            self.cross_attention_1_to_0 = CrossAttentionModule(d_model, nhead, dropout)
 
-        self.cross_attention: Optional[nn.ModuleDict] = None
-        self.use_cross_attention = (
-            len(self.sequence_types) == 2 and
-            self.sequence_types[0] in self.sequence_encoders and
-            self.sequence_types[1] in self.sequence_encoders
-        )
-        if self.use_cross_attention:
-            st0, st1 = self.sequence_types[0], self.sequence_types[1]
-            self.cross_attention = nn.ModuleDict({
-                f"{st0}_to_{st1}": CrossAttentionModule(d_model, self.nhead, dropout),
-                f"{st1}_to_{st0}": CrossAttentionModule(d_model, self.nhead, dropout)
-            })
-        elif len(self.sequence_types) == 2:
-             logger.warning(
-                "Cross-attention intended (2 seq types) but one/both encoders "
-                "not initialized. Disabling cross-attention."
-            )
-
-        self.output_proj = nn.Linear(d_model, self.output_dim)
-        self._init_parameters()
-        logger.info(
-            "MultiEncoderTransformer initialized. Output dim: %d. "
-            "Cross-attention: %s.",
-            self.output_dim, self.use_cross_attention
-        )
+        # Final linear projection from `d_model` to the `output_dim`.
+        self.output_proj = nn.Linear(d_model, output_dim)
+        self._init_parameters() # Apply custom weight initialization.
 
     def _init_parameters(self):
-        """Initializes model parameters using common schemes."""
-        for name, p in self.named_parameters():
-            if p.dim() > 1:
+        """Applies custom weight initialization to model parameters."""
+        for n, p in self.named_parameters():
+            if p.dim() > 1: # For weight matrices (2D or higher).
                 nn.init.xavier_uniform_(p)
-            elif 'bias' in name:
+            elif 'bias' in n: # For bias terms.
                 nn.init.zeros_(p)
-            elif 'weight' in name:
-                if 'norm' in name.lower() and p.ndim == 1:
+            elif 'weight' in n: # For 1D weight vectors (e.g., LayerNorm weights).
+                if 'norm' in n.lower() and p.ndim == 1: # Specifically for LayerNorm weights.
                     nn.init.ones_(p)
-                else:
+                else: # Other 1D weights.
                     nn.init.uniform_(p, -0.1, 0.1)
+        # Initialize output projection layer with a smaller gain, as it's often beneficial
+        # for the final layer before a loss function.
+        nn.init.xavier_uniform_(self.output_proj.weight, gain=0.01)
+        if self.output_proj.bias is not None:
+            nn.init.zeros_(self.output_proj.bias)
 
-        if hasattr(self, 'output_proj'):
-            nn.init.xavier_uniform_(self.output_proj.weight, gain=0.01)
-            if self.output_proj.bias is not None:
-                nn.init.zeros_(self.output_proj.bias)
-
-    def _generate_pytorch_padding_mask(
-        self, seq_tensor: torch.Tensor
-    ) -> torch.Tensor:
-        """Generates PyTorch-style padding mask (True means PAD)."""
-        return torch.all(seq_tensor == self.padding_value, dim=-1)
-
-    def _validate_inputs(
-        self,
-        inputs: Dict[str, Tensor],
-        input_masks_true_is_valid: Optional[Dict[str, Tensor]] = None
-    ) -> Dict[str, int]:
+    def _generate_pytorch_padding_mask(self, x: Tensor) -> Tensor:
         """
-        Validates input structure for the forward pass.
-        Raises ValueError on critical inconsistencies.
+        Generates a padding mask where True indicates a padded element.
+        This is used if input_masks are not directly provided to the forward method.
+        A position is considered padded if all features at that position match self.padding_value.
+        Args:
+            x: Input tensor (batch_size, seq_len, features).
+        Returns:
+            Boolean mask tensor (batch_size, seq_len), True for PAD.
         """
-        if not isinstance(inputs, dict):
-            raise TypeError("Inputs must be a dictionary.")
-
-        sequence_padded_lengths: Dict[str, int] = {}
-        batch_size = -1
-
-        for seq_type in self.sequence_types:
-            if seq_type not in self.sequence_encoders:
-                # This indicates an internal setup error if this path is reached.
-                logger.error("Internal: No encoder for configured seq_type '%s'.", seq_type)
-                continue
-
-            if seq_type not in inputs:
-                raise ValueError(f"Missing input tensor for sequence type: '{seq_type}'.")
-
-            seq_tensor = inputs[seq_type]
-            if not isinstance(seq_tensor, torch.Tensor) or seq_tensor.ndim != 3:
-                raise ValueError(
-                    f"Input for '{seq_type}' must be a 3D Tensor (B, L, F)."
-                )
-
-            current_bs = seq_tensor.size(0)
-            if batch_size == -1: batch_size = current_bs
-            elif batch_size != current_bs:
-                raise ValueError("Inconsistent batch sizes across sequence inputs.")
-
-            # self.sequence_dims is guaranteed to have seq_type by __init__ if encoder exists
-            expected_features = len(self.sequence_dims[seq_type])
-            if seq_tensor.size(2) != expected_features:
-                raise ValueError(
-                    f"Feature dimension mismatch for '{seq_type}'. "
-                    f"Expected {expected_features}, got {seq_tensor.size(2)}."
-                )
-            sequence_padded_lengths[seq_type] = seq_tensor.size(1)
-
-            if input_masks_true_is_valid and seq_type in input_masks_true_is_valid:
-                mask = input_masks_true_is_valid[seq_type]
-                if mask.shape != seq_tensor.shape[:-1]:
-                    raise ValueError(
-                        f"Shape mismatch for input '{seq_type}': tensor is "
-                        f"{seq_tensor.shape[:-1]} but mask is {mask.shape}."
-                    )
-
-        if self.has_global:
-            if 'global' not in inputs:
-                raise ValueError("Missing 'global' input features when expected.")
-            global_tensor = inputs['global']
-            if global_tensor.ndim != 2:
-                raise ValueError("'global' input must be a 2D Tensor (B, F).")
-            if batch_size != -1 and global_tensor.size(0) != batch_size:
-                raise ValueError("Batch size mismatch: sequences vs global features.")
-            expected_global_features = len(self.global_variables)
-            if global_tensor.size(1) != expected_global_features:
-                raise ValueError(
-                    f"Global feature count mismatch. Expected {expected_global_features}, "
-                    f"got {global_tensor.size(1)}."
-                )
-        return sequence_padded_lengths
-
+        return torch.all(x == self.padding_value, dim=-1)
 
     def forward(
         self,
         inputs: Dict[str, Tensor],
-        input_masks: Optional[Dict[str, Tensor]] = None,
-        targets: Optional[torch.Tensor] = None # targets is not used in the computation graph
-    ) -> torch.Tensor:
+        input_masks: Optional[Dict[str, Tensor]] = None 
+    ) -> Tensor:
         """
-        Forward pass.
-        `input_masks` should have True for VALID data points (non-padded).
-        It will be inverted internally for PyTorch's True=PAD convention.
+        Forward pass of the MultiEncoderTransformer.
+        `input_masks` provided here should have True for VALID data points.
+        These are converted internally to PyTorch's convention (True for PADDED elements)
+        before being passed to attention mechanisms.
         """
-        sequence_padded_lengths = self._validate_inputs(
-            inputs, input_masks_true_is_valid=input_masks
-        )
-        output_seq_padded_length = sequence_padded_lengths[self.output_seq_type]
-
-        pytorch_padding_masks: Dict[str, Tensor] = {} # True means PAD
-        if input_masks:
-            for seq_type, mask_true_is_valid in input_masks.items():
-                if seq_type in self.sequence_encoders: # Only consider masks for existing encoders
-                    pytorch_padding_masks[seq_type] = ~mask_true_is_valid
-        else:
-            # This path is taken if input_masks argument is None
-            logger.debug("No input_masks provided; generating PyTorch masks from padding_value.")
-            for seq_type in self.sequence_types: # Iterate over all configured sequence types
-                if seq_type in inputs and isinstance(inputs[seq_type], torch.Tensor) and inputs[seq_type].ndim == 3:
-                     # Ensure the input exists and is a tensor before generating mask
-                    pytorch_padding_masks[seq_type] = \
-                        self._generate_pytorch_padding_mask(inputs[seq_type])
-
-        global_features_encoded = None
-        if self.has_global and self.global_encoder is not None:
-            global_tensor = inputs['global'] # Presence validated by _validate_inputs
-            global_features_encoded = self.global_encoder(global_tensor)
-
-        encoded_sequences: Dict[str, Optional[torch.Tensor]] = {}
-        for seq_type, encoder in self.sequence_encoders.items():
-            seq_input_tensor = inputs.get(seq_type)
-            if seq_input_tensor is None or seq_input_tensor.numel() == 0:
-                encoded_sequences[seq_type] = None
-                continue
-
-            current_padding_mask = pytorch_padding_masks.get(seq_type) # This can be None
-            encoded = encoder(seq_input_tensor, current_padding_mask)
-
-            if self.has_global and global_features_encoded is not None and \
-               self.film_layers and seq_type in self.film_layers: # Check film_layers is not None
-                encoded = self.film_layers[seq_type](encoded, global_features_encoded)
-
-            if current_padding_mask is not None: # Apply padding mask to output of encoder/film
-                encoded = encoded.masked_fill(current_padding_mask.unsqueeze(-1), 0.0)
-            encoded_sequences[seq_type] = encoded
+        # Determine which input sequence's shape will define the output sequence length.
+        # This is based on `output_seq_processing_idx`.
+        output_source_seq_name_for_shape: str = "" 
+        if self.output_processing_idx == 0:
+            torch._assert(self.seq_name_0 is not None, 
+                          "Output index 0 selected, but seq_name_0 is not configured.")
+            if self.seq_name_0 is not None : output_source_seq_name_for_shape = self.seq_name_0
+        elif self.output_processing_idx == 1:
+            torch._assert(self.seq_name_1 is not None, 
+                          "Output index 1 selected, but seq_name_1 is not configured.")
+            if self.seq_name_1 is not None : output_source_seq_name_for_shape = self.seq_name_1
+        else: # Should be caught by factory config validation.
+            torch._assert(False, f"Invalid output_processing_idx: {self.output_processing_idx}.") 
         
-        active_encoded_sequences = {k: v for k, v in encoded_sequences.items() if v is not None}
-        if not active_encoded_sequences:
-            # output_seq_type is a guaranteed key in inputs due to _validate_inputs
-            # and its presence in sequence_dims.
-            ref_input_tensor_for_shape = inputs[self.output_seq_type]
-            bs = ref_input_tensor_for_shape.size(0)
-            device_to_use = ref_input_tensor_for_shape.device
-            logger.warning("No sequences encoded; returning zeros. Shape: (%d, %d, %d)",
-                           bs, output_seq_padded_length, self.output_dim)
-            return torch.zeros(
-                bs, output_seq_padded_length, self.output_dim,
-                device=device_to_use
-            )
+        torch._assert(output_source_seq_name_for_shape in inputs, 
+                      f"Key '{output_source_seq_name_for_shape}' (for output shape) not in inputs dict.")
+        
+        # Get batch size, padded length, and device from the reference input tensor.
+        ref_input_for_shape = inputs[output_source_seq_name_for_shape]
+        batch_size = ref_input_for_shape.size(0)
+        output_padded_length = ref_input_for_shape.size(1) 
+        device = ref_input_for_shape.device
 
-        if self.use_cross_attention and self.cross_attention: # Check cross_attention is not None
-            # This assumes self.sequence_types has at least 2 elements if use_cross_attention is True
-            st0, st1 = self.sequence_types[0], self.sequence_types[1]
-            enc0, enc1 = encoded_sequences.get(st0), encoded_sequences.get(st1)
-
-            if enc0 is not None and enc1 is not None:
-                mask0_pad = pytorch_padding_masks.get(st0) # Optional
-                mask1_pad = pytorch_padding_masks.get(st1) # Optional
-                
-                # Ensure cross_attention keys exist, which they should if __init__ was successful
-                # and use_cross_attention is True.
-                encoded_sequences[st0] = self.cross_attention[f"{st0}_to_{st1}"](
-                    enc0, enc1, mask1_pad, mask0_pad
-                )
-                encoded_sequences[st1] = self.cross_attention[f"{st1}_to_{st0}"](
-                    enc1, enc0, mask0_pad, mask1_pad
-                )
+        # Prepare PyTorch-style padding mask for sequence 0 (True means PAD).
+        # If `input_masks` (True=VALID) are provided, invert them. Otherwise, generate from padding value.
+        mask_0_pytorch: Optional[Tensor] = None
+        if self.seq_name_0 is not None:
+            torch._assert(self.seq_name_0 in inputs, f"Input for sequence '{self.seq_name_0}' missing.")
+            input_seq_0 = inputs[self.seq_name_0]
+            # Validate feature dimension of input sequence 0.
+            expected_dim0 = self.sequence_input_dims_ref[self.seq_name_0]
+            torch._assert(input_seq_0.size(2) == expected_dim0, 
+                           f"Feature dim for {self.seq_name_0}. Expected {expected_dim0}, got {input_seq_0.size(2)}")
+            if input_masks is not None and self.seq_name_0 in input_masks:
+                mask_0_pytorch = ~input_masks[self.seq_name_0] # Invert: True=VALID to True=PAD.
             else:
-                logger.warning("Cross-attn skipped: one/both sequences ('%s', '%s') are None after encoding.", st0, st1)
+                mask_0_pytorch = self._generate_pytorch_padding_mask(input_seq_0)
+        
+        # Prepare PyTorch-style padding mask for sequence 1.
+        mask_1_pytorch: Optional[Tensor] = None
+        if self.seq_name_1 is not None:
+            torch._assert(self.seq_name_1 in inputs, f"Input for sequence '{self.seq_name_1}' missing.")
+            input_seq_1 = inputs[self.seq_name_1]
+            expected_dim1 = self.sequence_input_dims_ref[self.seq_name_1]
+            torch._assert(input_seq_1.size(2) == expected_dim1,
+                           f"Feature dim for {self.seq_name_1}. Expected {expected_dim1}, got {input_seq_1.size(2)}")
+            if input_masks is not None and self.seq_name_1 in input_masks:
+                mask_1_pytorch = ~input_masks[self.seq_name_1] # Invert.
+            else:
+                mask_1_pytorch = self._generate_pytorch_padding_mask(input_seq_1)
 
+        # Encode global features if the global encoder exists.
+        global_enc: Optional[Tensor] = None
+        if self.global_encoder is not None:
+            torch._assert('global' in inputs, "Input 'global' features missing when global_encoder is active.")
+            global_enc = self.global_encoder(inputs['global'])
 
-        final_output_candidate = encoded_sequences.get(self.output_seq_type)
-        if final_output_candidate is None:
-            ref_input_tensor_for_shape = inputs[self.output_seq_type]
-            bs = ref_input_tensor_for_shape.size(0)
-            device_to_use = ref_input_tensor_for_shape.device
-            logger.error("Output sequence '%s' is None after encoding. Returning zeros.", self.output_seq_type)
-            return torch.zeros(
-                bs, output_seq_padded_length, self.output_dim,
-                device=device_to_use
-            )
+        # Process sequence 0 through its encoder and optional FiLM layer.
+        encoded_0: Optional[Tensor] = None
+        if self.encoder_0 is not None and self.seq_name_0 is not None:
+            encoded_0 = self.encoder_0(inputs[self.seq_name_0], mask_0_pytorch)
+            if self.film_0 is not None and global_enc is not None:
+                encoded_0 = self.film_0(encoded_0, global_enc) # Modulate with global features.
+            if mask_0_pytorch is not None and encoded_0 is not None:
+                # Zero out padded positions after all processing for this sequence.
+                # The mask `mask_0_pytorch` should already be boolean. `unsqueeze` makes it broadcastable.
+                encoded_0 = encoded_0.masked_fill(mask_0_pytorch.unsqueeze(-1), 0.0)
+        
+        # Process sequence 1 similarly.
+        encoded_1: Optional[Tensor] = None
+        if self.encoder_1 is not None and self.seq_name_1 is not None:
+            encoded_1 = self.encoder_1(inputs[self.seq_name_1], mask_1_pytorch)
+            if self.film_1 is not None and global_enc is not None:
+                encoded_1 = self.film_1(encoded_1, global_enc)
+            if mask_1_pytorch is not None and encoded_1 is not None:
+                encoded_1 = encoded_1.masked_fill(mask_1_pytorch.unsqueeze(-1), 0.0)
 
-        output = self.output_proj(final_output_candidate)
-        output_mask_pad = pytorch_padding_masks.get(self.output_seq_type) # Optional
-        if output_mask_pad is not None: # Apply padding to final output
-            output = output.masked_fill(output_mask_pad.unsqueeze(-1), 0.0)
+        # Perform cross-attention if two sequences are active and encoders are defined.
+        if self.cross_attention_0_to_1 is not None and self.cross_attention_1_to_0 is not None:
+            torch._assert(encoded_0 is not None and encoded_1 is not None, 
+                          "Cross-attention is active, but required encoded sequences (0 and 1) are not available. Check inputs.")
+            if encoded_0 is not None and encoded_1 is not None : 
+                original_encoded_0 = encoded_0 
+                original_encoded_1 = encoded_1
+                # Sequence 0 attends to sequence 1.
+                encoded_0 = self.cross_attention_0_to_1(original_encoded_0, original_encoded_1, mask_1_pytorch, mask_0_pytorch)
+                # Sequence 1 attends to sequence 0.
+                encoded_1 = self.cross_attention_1_to_0(original_encoded_1, original_encoded_0, mask_0_pytorch, mask_1_pytorch)
+        
+        # Select the final sequence representation based on `output_processing_idx`.
+        final_processed_sequence: Optional[Tensor] = None
+        final_output_padding_mask: Optional[Tensor] = None # This mask is True=PAD.
+
+        if self.output_processing_idx == 0:
+            final_processed_sequence = encoded_0
+            final_output_padding_mask = mask_0_pytorch
+        elif self.output_processing_idx == 1: 
+            final_processed_sequence = encoded_1
+            final_output_padding_mask = mask_1_pytorch
+        
+        torch._assert(final_processed_sequence is not None, 
+                      "Selected output sequence (final_processed_sequence) is None. This indicates missing input for the designated output stream.")
+        
+        # Fallback for JIT if `final_processed_sequence` somehow ends up as None despite asserts.
+        if final_processed_sequence is None: 
+            return torch.zeros(batch_size, output_padded_length, self.output_dim, device=device, dtype=torch.float32)
+
+        # Project the chosen sequence representation to the final output dimension.
+        output = self.output_proj(final_processed_sequence)
+
+        # Zero out padded positions in the final output.
+        if final_output_padding_mask is not None:
+            # `final_output_padding_mask` is already boolean (True=PAD).
+            output = output.masked_fill(final_output_padding_mask.unsqueeze(-1), 0.0)
+            
         return output
 
 
@@ -503,167 +461,160 @@ def create_prediction_model(
     config: Dict[str, Any], device: Optional[torch.device] = None
 ) -> MultiEncoderTransformer:
     """
-    Factory function for MultiEncoderTransformer.
-    Performs critical config validations and exits on failure.
+    Factory function to create and configure the MultiEncoderTransformer model.
+    It performs extensive validation of the configuration related to model
+    architecture, input/output variables, and sequence types.
+    Exits with sys.exit(1) on critical configuration errors.
     """
+    # Validate presence of essential keys in the configuration.
     required_keys = [
         "input_variables", "target_variables", "sequence_types", "output_seq_type",
         "d_model", "nhead", "num_encoder_layers", "dim_feedforward"
     ]
     for key in required_keys:
         if key not in config:
-            logger.critical("Config missing required key: '%s'. Exiting.", key)
-            sys.exit(1)
+            logger.critical(f"Config missing required key: '{key}'. Exiting.")
+            sys.exit(1) 
 
-    input_vars = config["input_variables"]
-    target_vars = config["target_variables"]
-    seq_types_cfg = config["sequence_types"]
-    output_seq_type_cfg = config["output_seq_type"]
-    d_model = config["d_model"]
-    nhead_cfg = config["nhead"]
-    pos_enc_type = config.get("positional_encoding_type", "sinusoidal") # Default to sinusoidal
+    # Extract and validate core configuration values.
+    input_vars_cfg = config["input_variables"]
+    target_vars_cfg = config["target_variables"]
+    seq_types_from_config: Dict[str, List[str]] = config["sequence_types"] 
+    output_seq_type_from_config = config["output_seq_type"]
+    d_model_cfg = config["d_model"]
+    nhead_from_config = config["nhead"]
+    pos_enc_type_str = config.get("positional_encoding_type", "sinusoidal")
+    max_seq_len_for_pe = config.get("max_sequence_length", 512)
+    padding_val_cfg = float(config.get("padding_value", 0.0))
+    dropout_val = config.get("dropout", 0.1)
+    norm_first_val = config.get("norm_first", False)
+    num_encoder_layers_val = config["num_encoder_layers"]
+    dim_feedforward_val = config["dim_feedforward"]
 
-    # Validate types and non-emptiness for essential list/dict fields
-    if not (isinstance(input_vars, list) and input_vars):
-        logger.critical("'input_variables' must be a non-empty list. Exiting.")
-        sys.exit(1)
-    if not (isinstance(target_vars, list) and target_vars):
-        logger.critical("'target_variables' must be a non-empty list. Exiting.")
-        sys.exit(1)
-    if not (isinstance(seq_types_cfg, dict) and seq_types_cfg):
-        logger.critical("'sequence_types' must be a non-empty dict. Exiting.")
-        sys.exit(1)
-    if not isinstance(output_seq_type_cfg, str) or not output_seq_type_cfg:
-        logger.critical("'output_seq_type' must be a non-empty string. Exiting.")
-        sys.exit(1)
+    # Basic type and content validation for critical config items.
+    if not (isinstance(input_vars_cfg, list) and input_vars_cfg): logger.critical("'input_variables' must be non-empty list. Exiting."); sys.exit(1)
+    if not (isinstance(target_vars_cfg, list) and target_vars_cfg): logger.critical("'target_variables' must be non-empty list. Exiting."); sys.exit(1)
+    if not (isinstance(seq_types_from_config, dict) and seq_types_from_config): logger.critical("'sequence_types' must be non-empty dict. Exiting."); sys.exit(1)
+    if not isinstance(output_seq_type_from_config, str) or not output_seq_type_from_config:
+        logger.critical("'output_seq_type' must be non-empty string. Exiting."); sys.exit(1)
 
-    global_vars = config.get("global_variables", [])
-    if not isinstance(global_vars, list): # Allow empty list, but must be list
-        logger.critical("'global_variables' must be a list if provided. Exiting.")
-        sys.exit(1)
+    global_vars_cfg = config.get("global_variables", [])
+    if not isinstance(global_vars_cfg, list): logger.critical("'global_variables' must be a list. Exiting."); sys.exit(1)
 
-    # Process sequence_types to build sequence_dims and check for errors
-    processed_sequence_dims: Dict[str, Dict[str, int]] = {}
-    all_defined_vars: Set[str] = set(global_vars)
+    # Process `sequence_types` to determine active sequences, their input dimensions,
+    # and maintain a fixed order for consistency.
+    active_sequence_input_dims: Dict[str, int] = {} # Stores input_dim for each active sequence.
+    ordered_active_type_names: List[str] = [] # Maintains order of active sequences.
+    all_vars_in_active_sequences: Set[str] = set() # Tracks all variables used in sequences.
 
-    for seq_type, var_list in seq_types_cfg.items():
-        if not isinstance(var_list, list): # var_list must be a list
-            logger.critical("Var list for seq_type '%s' must be a list. Exiting.", seq_type)
-            sys.exit(1)
-        if not var_list: # Allow empty var_list for a seq_type, but it won't be used
-            logger.info("Seq_type '%s' has an empty variable list; it will be ignored.", seq_type)
-            continue # Skip this sequence type if its variable list is empty
+    # Iterate through sequence types in the order they appear in the config.
+    for seq_name_key in seq_types_from_config.keys():
+        var_name_list = seq_types_from_config[seq_name_key]
+        if not isinstance(var_name_list, list): logger.critical(f"Var list for seq type '{seq_name_key}' must be a list. Exiting."); sys.exit(1)
+        # Skip sequence types with no variables defined, as they cannot be processed.
+        if not var_name_list: 
+            logger.info(f"Sequence type '{seq_name_key}' has an empty variable list in config; it will be ignored for model construction.")
+            continue 
 
-        if len(set(var_list)) != len(var_list): # Check for duplicates within a list
-            logger.critical("Duplicate vars in seq_type '%s'. Exiting.", seq_type)
-            sys.exit(1)
-        if overlap := set(var_list).intersection(all_defined_vars): # Check for overlap with already defined
-            logger.critical("Var '%s' in seq_type '%s' overlaps with globals or another seq_type. Exiting.",
-                           next(iter(overlap)), seq_type) # Show one overlapping var
-            sys.exit(1)
-        all_defined_vars.update(var_list)
-        processed_sequence_dims[seq_type] = {var: i for i, var in enumerate(var_list)}
+        # Ensure no duplicate variables within a single sequence type.
+        if len(set(var_name_list)) != len(var_name_list): logger.critical(f"Duplicate vars in seq type '{seq_name_key}'. Exiting."); sys.exit(1)
+        
+        current_type_vars = set(var_name_list)
+        # Ensure variables are not shared across different active sequence types.
+        if not current_type_vars.isdisjoint(all_vars_in_active_sequences):
+            overlap = current_type_vars.intersection(all_vars_in_active_sequences)
+            logger.critical(f"Variable overlap ({overlap}) with other active sequence types for '{seq_name_key}'. Exiting."); sys.exit(1)
+        # Ensure sequence variables do not overlap with global variables.
+        if not current_type_vars.isdisjoint(set(global_vars_cfg)):
+            overlap = current_type_vars.intersection(set(global_vars_cfg))
+            logger.critical(f"Variable overlap ({overlap}) between seq type '{seq_name_key}' and global variables. Exiting."); sys.exit(1)
+        
+        all_vars_in_active_sequences.update(current_type_vars)
+        ordered_active_type_names.append(seq_name_key)
+        active_sequence_input_dims[seq_name_key] = len(var_name_list)
 
-    if not processed_sequence_dims: # Must have at least one valid sequence type
-        logger.critical("No valid, non-empty sequence types defined in config. Exiting.")
-        sys.exit(1)
-    if output_seq_type_cfg not in processed_sequence_dims:
-        logger.critical("Config 'output_seq_type' ('%s') not among valid sequence types %s. Exiting.",
-                        output_seq_type_cfg, list(processed_sequence_dims.keys()))
-        sys.exit(1)
+    # The model requires at least one active sequence type.
+    if not ordered_active_type_names: logger.critical("No sequence types with actual variables defined. Model requires at least one. Exiting."); sys.exit(1)
+    # This specific implementation supports a maximum of two active sequence types.
+    if len(ordered_active_type_names) > 2: logger.critical(f"Model configured for {len(ordered_active_type_names)} active sequence types. Supports max 2. Exiting."); sys.exit(1)
 
-    # Validate that all input and target variables are covered
-    if unassigned_in := set(input_vars) - all_defined_vars:
-        logger.critical("Input vars %s not in any seq_type or global_variables. Exiting.", unassigned_in)
-        sys.exit(1)
-    if unassigned_tgt := set(target_vars) - all_defined_vars:
-        logger.critical("Target vars %s not in any seq_type or global_variables. Exiting.", unassigned_tgt)
-        sys.exit(1)
+    # Ensure the specified `output_seq_type` is one of the active sequence types.
+    if output_seq_type_from_config not in active_sequence_input_dims:
+        logger.critical(f"'output_seq_type' ('{output_seq_type_from_config}') is not among the active sequence types with variables: {ordered_active_type_names}. Exiting."); sys.exit(1)
 
-    # Ensure all non-global target variables belong to the output_seq_type for consistent length handling
-    output_seq_type_vars = processed_sequence_dims.get(output_seq_type_cfg, {})
-    for tv in target_vars:
-        if tv not in global_vars and tv not in output_seq_type_vars:
-            logger.critical(
-                "Target variable '%s' is a sequence variable but not part of the "
-                "designated 'output_seq_type' ('%s'). This is required for consistent "
-                "target length determination. Exiting.", tv, output_seq_type_cfg
-            )
-            sys.exit(1)
+    # Determine the index of the output sequence type in the ordered list.
+    output_processing_idx_val = ordered_active_type_names.index(output_seq_type_from_config)
 
+    # Validate that all declared `input_variables` and `target_variables` are assigned
+    # to either global features or one of the active sequence types.
+    all_vars_defined_in_model = set(global_vars_cfg).union(all_vars_in_active_sequences)
+    if unassigned_in := set(input_vars_cfg) - all_vars_defined_in_model:
+        logger.critical(f"Input variables {unassigned_in} not defined in global or any active sequence type. Exiting."); sys.exit(1)
+    if unassigned_tgt := set(target_vars_cfg) - all_vars_defined_in_model:
+        logger.critical(f"Target variables {unassigned_tgt} not defined in global or any active sequence type. Exiting."); sys.exit(1)
 
-    # Validate model dimensions and PE compatibility
-    if not (isinstance(d_model, int) and d_model > 0):
-        logger.critical("'d_model' (%s) must be a positive integer. Exiting.", d_model)
-        sys.exit(1)
-    # Check d_model parity specifically if sinusoidal PE is chosen
-    # SequenceEncoder will also check this, but good to catch early.
-    pe_type_lower_check = pos_enc_type.lower() if pos_enc_type else "none"
-    if pe_type_lower_check in ["sinusoidal", "sine", "sin"] and d_model % 2 != 0:
-        logger.critical("Sinusoidal PE selected, but 'd_model' (%d) is odd. Must be even. Exiting.", d_model)
-        sys.exit(1)
+    # Validate transformer core dimensions.
+    if not (isinstance(d_model_cfg, int) and d_model_cfg > 0): logger.critical("d_model must be > 0. Exiting."); sys.exit(1)
+    if not (isinstance(nhead_from_config, int) and nhead_from_config > 0): logger.critical("nhead must be > 0. Exiting."); sys.exit(1)
+    
+    # Adjust `nhead` if `d_model` is not divisible by the configured `nhead`.
+    # It finds the largest divisor of `d_model` that is less than or equal to the original `nhead`.
+    final_nhead_val = nhead_from_config
+    if d_model_cfg % nhead_from_config != 0:
+        original_nhead = nhead_from_config
+        for potential_nhead in range(original_nhead -1, 0, -1): 
+            if d_model_cfg % potential_nhead == 0: final_nhead_val = potential_nhead; break
+        else: 
+             if d_model_cfg % original_nhead != 0: 
+                logger.critical(f"d_model ({d_model_cfg}) is not divisible by any nhead <= {original_nhead}. Adjust config. Exiting."); sys.exit(1)
+        logger.warning(f"d_model ({d_model_cfg}) not divisible by nhead ({original_nhead}). Adjusted nhead to {final_nhead_val}.")
+        config["nhead"] = final_nhead_val # Update config in-place for consistency if used later.
 
-    if not (isinstance(nhead_cfg, int) and nhead_cfg > 0):
-        logger.critical("'nhead' (%s) must be a positive integer. Exiting.", nhead_cfg)
-        sys.exit(1)
+    # Instantiate the positional encoding module if specified.
+    pe_module_instance: Optional[SinePositionalEncoding] = None
+    _pe_type_lower = pos_enc_type_str.lower() if pos_enc_type_str else "none"
+    if _pe_type_lower in ["sinusoidal", "sine", "sin"]:
+        # Sinusoidal PE requires `d_model` to be even.
+        if d_model_cfg % 2 != 0: logger.critical(f"SinePE requires even d_model, got {d_model_cfg}. Exiting."); sys.exit(1)
+        if max_seq_len_for_pe <=0 : logger.critical(f"max_sequence_length for PE table must be > 0, got {max_seq_len_for_pe}. Exiting."); sys.exit(1)
+        pe_module_instance = SinePositionalEncoding(d_model_cfg, max_len=max_seq_len_for_pe)
+    elif _pe_type_lower != "none": # Only 'sinusoidal' or 'none' are supported.
+        logger.critical(f"Unsupported positional_encoding_type: '{pos_enc_type_str}'. Valid: 'sinusoidal' or 'none'. Exiting."); sys.exit(1)
 
-    final_nhead = nhead_cfg
-    if d_model % nhead_cfg != 0:
-        original_nhead = nhead_cfg
-        for potential_nhead in range(original_nhead, 0, -1): # Find largest divisor <= original
-            if d_model % potential_nhead == 0:
-                final_nhead = potential_nhead
-                break
-        logger.warning(
-            "Config 'd_model' (%d) is not divisible by 'nhead' (%d). "
-            "Adjusting nhead to %d for model compatibility.",
-            d_model, original_nhead, final_nhead
-        )
-        config["nhead"] = final_nhead # Update config dict for checkpoint consistency
+    # Create the MultiEncoderTransformer instance with validated and processed parameters.
+    model = MultiEncoderTransformer(
+        sequence_input_dims_ref=active_sequence_input_dims,
+        global_input_dim=len(global_vars_cfg),
+        output_dim=len(target_vars_cfg),
+        d_model=d_model_cfg,
+        nhead=final_nhead_val,
+        num_encoder_layers=num_encoder_layers_val,
+        dim_feedforward=dim_feedforward_val,
+        ordered_active_seq_names=ordered_active_type_names,
+        output_seq_processing_idx=output_processing_idx_val,
+        pe_module=pe_module_instance,
+        padding_value=padding_val_cfg,
+        dropout=dropout_val,
+        norm_first=norm_first_val
+    )
+    
+    logger.info("MultiEncoderTransformer instance created successfully by factory.")
 
-    # Instantiate the model
-    try:
-        model_instance = MultiEncoderTransformer(
-            global_variables=global_vars,
-            sequence_dims=processed_sequence_dims,
-            output_dim=len(target_vars),
-            d_model=d_model,
-            nhead=final_nhead,
-            num_encoder_layers=config["num_encoder_layers"],
-            dim_feedforward=config["dim_feedforward"],
-            output_seq_type=output_seq_type_cfg,
-            dropout=config.get("dropout", 0.1),
-            norm_first=config.get("norm_first", False),
-            max_sequence_length=config.get("max_sequence_length", 512),
-            positional_encoding_type=pos_enc_type,
-            padding_value=float(config.get("padding_value", 0.0))
-        )
-    except Exception as e:
-        logger.critical("Failed to instantiate MultiEncoderTransformer: %s. Exiting.", e, exc_info=True)
-        sys.exit(1)
-
-    model_instance.input_vars = list(input_vars) # Store for reference
-    model_instance.target_vars = list(target_vars) # Store for reference
-
-    logger.info("Model created successfully with d_model=%d, nhead=%d.", d_model, final_nhead)
-
+    # Move the model to the specified device if provided.
     if device is not None:
-        if isinstance(device, str):
-            try:
-                device = torch.device(device)
-            except RuntimeError as e: # Catch invalid device string
-                logger.critical("Invalid device string '%s': %s. Exiting.", device, e)
-                sys.exit(1)
-        # Ensure device is actually a torch.device object before model.to()
-        if not isinstance(device, torch.device):
-            logger.critical("Device argument must be a torch.device instance or valid string. Exiting.")
-            sys.exit(1)
+        actual_device = device
+        if isinstance(device, str): # Convert string device name to torch.device object.
+            try: actual_device = torch.device(device)
+            except RuntimeError as e: logger.critical(f"Invalid device string '{device}': {e}. Exiting."); sys.exit(1)
+        
+        if not isinstance(actual_device, torch.device): 
+             logger.critical("Device must be torch.device instance or valid string. Exiting."); sys.exit(1)
         try:
-            model_instance = model_instance.to(device)
-            logger.info("Model moved to device: %s.", device)
-        except Exception as e: # Catch errors from model.to(device)
-            logger.critical("Failed to move model to device '%s': %s. Exiting.", device, e, exc_info=True)
-            sys.exit(1)
-    return model_instance
+            model = model.to(actual_device)
+            logger.info(f"Model moved to device: {actual_device}")
+        except Exception as e: # Catch any errors during model transfer.
+            logger.critical(f"Failed to move model to device '{actual_device}': {e}. Exiting.", exc_info=True); sys.exit(1)
+            
+    return model
 
 __all__ = ["MultiEncoderTransformer", "create_prediction_model"]
