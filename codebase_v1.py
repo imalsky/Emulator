@@ -262,6 +262,7 @@ def _load_and_restore_chunk(
         if var not in hf_file:
             logger.error(f"Critical error: Variable '{var}' not found in HDF5 file.")
             return None
+        
         # 1. Load data in sorted order (efficient)
         data_sorted = hf_file[var][sorted_indices]
         # 2. Restore original order (correctness)
@@ -474,6 +475,7 @@ def preprocess_data(
                 with h5py.File(file_map[file_stem], "r") as hf_raw:
                     for i in range(0, len(indices), HDF5_READ_CHUNK_SIZE):
                         chunk_idx = np.array(indices[i : i + HDF5_READ_CHUNK_SIZE])
+                        
                         # Pass max_seq_len to enforce truncation
                         input_data = _load_and_restore_chunk(
                             hf_raw, input_vars, chunk_idx, max_seq_len
@@ -734,7 +736,7 @@ class FiLMLayer(nn.Module):
         # Optional clamping for stability (soft bound to prevent extreme scaling early on)
         if self.clamp_gamma is not None:
             delta_gamma = torch.clamp(delta_gamma, -self.clamp_gamma, self.clamp_gamma)
-            beta = torch.clamp(beta, -self.clamp_gamma, self.clamp_gamma)  # Optionally clamp beta too
+            beta = torch.clamp(beta, -self.clamp_gamma, self.clamp_gamma)
 
         # Expand for sequence dimension (broadcastable)
         delta_gamma = delta_gamma.unsqueeze(1)  # [batch, 1, feature_dim]
@@ -796,7 +798,7 @@ class PredictionModel(nn.Module):
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
                 activation="gelu",
-                norm_first=True,  # Pre-normalization for stability
+                norm_first=True,
                 batch_first=True,
             )
             self.layers.append(encoder_layer)
@@ -825,7 +827,7 @@ class PredictionModel(nn.Module):
         """Initialize weights for all layers except FiLM (which self-initializes)."""
         for module in self.modules():
             if isinstance(module, FiLMLayer):
-                continue  # FiLM layers initialize themselves
+                continue 
             elif isinstance(module, nn.Linear):
                 nn.init.kaiming_normal_(
                     module.weight, mode="fan_in", nonlinearity="relu"
@@ -890,7 +892,7 @@ def create_prediction_model(
         dim_feedforward=model_params.get("dim_feedforward", 1024),
         dropout=float(model_params.get("dropout", 0.1)),
         padding_value=float(data_spec.get("padding_value", PADDING_VALUE)),
-        film_clamp=1.0,  # Enable clamping by default for safety
+        film_clamp=1.0,
     )
 
     model.to(device=device)
@@ -939,22 +941,14 @@ def export_model(
     save_dir = save_path.parent
     model_name = save_path.stem
 
-    # --------------------------------------------------------------------- #
-    #                         Guard via config flag                         #
-    # --------------------------------------------------------------------- #
-    if config is not None and not config.get(
-        "miscellaneous_settings", {}
-    ).get("torch_export", True):
+    if config is not None and not config.get("miscellaneous_settings", {}).get("torch_export", True):
         logger.info("Model export disabled in config – skipping.")
         return
 
-    # --------------------------------------------------------------------- #
-    #                    Fix ONNX Runtime thread affinity                   #
-    # --------------------------------------------------------------------- #
     # Set environment variables to prevent ONNX runtime thread affinity issues
-    os.environ['OMP_NUM_THREADS'] = '1'  # Disable OpenMP threading
-    os.environ['MKL_NUM_THREADS'] = '1'  # Disable MKL threading
-    os.environ['ORT_DISABLE_THREAD_AFFINITY'] = '1'  # Disable ONNX Runtime thread affinity
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['ORT_DISABLE_THREAD_AFFINITY'] = '1'
     
     model.eval()
 
@@ -967,9 +961,6 @@ def export_model(
         logger.info("Extracting original model from compiled wrapper")
         model = model._orig_mod
 
-    # --------------------------------------------------------------------- #
-    #                         Prepare example arguments                     #
-    # --------------------------------------------------------------------- #
     # Move example inputs to CPU to avoid device mismatch in fake tensors
     sequence = example_input["sequence"].to('cpu')
     global_features = example_input.get("global_features")
@@ -998,10 +989,8 @@ def export_model(
     if dummy_sequence_mask is not None:
         kwargs["sequence_mask"] = dummy_sequence_mask
 
-    # --------------------------------------------------------------------- #
-    #                torch.export with dynamic batch dimension              #
-    # --------------------------------------------------------------------- #
-    batch = Dim("batch", min=1, max=128)  # Adjust max based on your use case (e.g., hardware limits)
+    # Adjust max based on your use case (e.g., hardware limits)
+    batch = Dim("batch", min=1, max=128)  
     
     dynamic_shapes: Dict[str, Any] = {
         "sequence": {0: batch}
@@ -1045,7 +1034,9 @@ def export_model(
         out = prog.module()(**kwargs)
         if not torch.allclose(ref, out, rtol=1e-4, atol=1e-5):
             logger.warning("Exported (torch.export) output differs from original")
-
+    
+    return
+    """
     # --------------------------------------------------------------------- #
     #                         ONNX dynamic‑batch export                     #
     # --------------------------------------------------------------------- #
@@ -1110,7 +1101,7 @@ def export_model(
         if 'ORT_DISABLE_THREAD_AFFINITY' in os.environ:
             del os.environ['ORT_DISABLE_THREAD_AFFINITY']
 
-    # Model is already on CPU, no need to move back
+    """
 
 __all__ = ["PredictionModel", "create_prediction_model", "export_model"]
 
@@ -1215,7 +1206,7 @@ class AtmosphericDataset(Dataset):
         # Account for all data types (seq + targets + globals)
         total_bytes_per_sample = bytes_per_sample * 2  # seq + targets
         if self.has_globals:
-            total_bytes_per_sample += bytes_per_sample / self.sequence_length  # globals are smaller
+            total_bytes_per_sample += bytes_per_sample / self.sequence_length
         
         total_bytes_needed = total_bytes_per_sample * len(self.indices)
         total_gb_needed = total_bytes_needed / (1024**3)
@@ -1405,12 +1396,12 @@ class AtmosphericDataset(Dataset):
             shard_data = self._load_shard(shard_idx)
             
             # Extract the specific sample
-            # IMPORTANT: For memory-mapped arrays, indexing returns a view
+            # For memory-mapped arrays, indexing returns a view
             # We need to copy to ensure the tensor owns its memory
             seq_in_np = shard_data["sequence_inputs"][within_shard_idx]
             tgt_np = shard_data["targets"][within_shard_idx]
             
-            # FIXED: Always copy from memory-mapped arrays to ensure tensor owns memory
+            # Always copy from memory-mapped arrays to ensure tensor owns memory
             if hasattr(seq_in_np, 'base') and seq_in_np.base is not None:
                 # This is a view into a memory-mapped array
                 seq_in_np = seq_in_np.copy()
@@ -1447,10 +1438,11 @@ def pad_collate(
     padding_value: float = PADDING_VALUE,
     padding_epsilon: float = 1e-6,
 ):
-    """FIX: Use safe padding comparison instead of exact equality."""
+    """Use safe padding comparison instead of exact equality."""
     inputs, targets = zip(*batch)
 
     seq = torch.stack([d["sequence"] for d in inputs])
+
     # Safe padding comparison
     seq_mask = (torch.abs(seq - padding_value) < padding_epsilon).all(dim=-1)
 
