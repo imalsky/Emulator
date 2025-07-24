@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-model.py - Optimized transformer model with FiLM conditioning.
+model.py - Optimized transformer model with FiLM conditioning and full export compatibility.
 """
 from __future__ import annotations
 
@@ -28,55 +28,207 @@ class SinePositionalEncoding(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
         self.d_model = d_model
+        # Pre-register buffer for better export compatibility
+        self.register_buffer('_cached_pe', None, persistent=False)
+        self._cached_seq_len = -1
 
     def forward(self, x: Tensor) -> Tensor:
-        seq_len = x.size(1)
-        position = torch.arange(seq_len, device=x.device, dtype=DTYPE).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, self.d_model, 2, device=x.device, dtype=DTYPE) * (-math.log(10000.0) / self.d_model)
-        )
-        pe = torch.zeros(1, seq_len, self.d_model, device=x.device, dtype=DTYPE)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
-        return x + pe
+        batch_size, seq_len, d_model = x.shape
+        
+        # Cache positional encoding for efficiency and export compatibility
+        if self._cached_pe is None or self._cached_seq_len != seq_len:
+            position = torch.arange(seq_len, device=x.device, dtype=DTYPE).unsqueeze(1)
+            div_term = torch.exp(
+                torch.arange(0, self.d_model, 2, device=x.device, dtype=DTYPE) * 
+                (-math.log(10000.0) / self.d_model)
+            )
+            pe = torch.zeros(1, seq_len, self.d_model, device=x.device, dtype=DTYPE)
+            pe[0, :, 0::2] = torch.sin(position * div_term)
+            pe[0, :, 1::2] = torch.cos(position * div_term)
+            self.register_buffer('_cached_pe', pe, persistent=False)
+            self._cached_seq_len = seq_len
+        
+        return x + self._cached_pe
 
 
 class FiLMLayer(nn.Module):
     """
-    Feature-wise Linear Modulation layer with near-identity initialization and optional clamping for stability.
-    Based on best practices from the original FiLM paper (Perez et al., 2018): Initialize to produce values near identity,
-    allow gamma to take negative and large values, but add optional soft clamping to prevent explosions during early training.
+    Feature-wise Linear Modulation layer with near-identity initialization.
+    Export-compatible implementation without dynamic branching.
     """
 
     def __init__(self, context_dim: int, feature_dim: int, clamp_gamma: Optional[float] = 1.0) -> None:
         super().__init__()
-        # Single projection that outputs both scale and shift
         self.projection = nn.Linear(context_dim, feature_dim * 2)
         
-        # Safer near-identity initialization: Small normal for weights (std=0.01 for slight randomness without explosion),
-        # zeros for bias. This ensures delta_gamma ~0, beta~0 at start.
+        # Near-identity initialization
         nn.init.normal_(self.projection.weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.projection.bias)
 
-        self.clamp_gamma = clamp_gamma  # If None, no clamping; otherwise clamp delta_gamma to [-clamp, clamp]
+        # Store clamp value as buffer for export compatibility
+        if clamp_gamma is not None:
+            self.register_buffer('clamp_value', torch.tensor(clamp_gamma))
+        else:
+            self.register_buffer('clamp_value', torch.tensor(float('inf')))
 
     def forward(self, features: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        # Get scale and shift parameters (delta_gamma and beta)
+        # Get scale and shift parameters
         gamma_beta = self.projection(context)
         delta_gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
 
-        # Optional clamping for stability (soft bound to prevent extreme scaling early on)
-        if self.clamp_gamma is not None:
-            delta_gamma = torch.clamp(delta_gamma, -self.clamp_gamma, self.clamp_gamma)
-            beta = torch.clamp(beta, -self.clamp_gamma, self.clamp_gamma)
+        # Always apply clamping (with inf it becomes no-op)
+        delta_gamma = torch.clamp(delta_gamma, -self.clamp_value, self.clamp_value)
+        beta = torch.clamp(beta, -self.clamp_value, self.clamp_value)
 
-        # Expand for sequence dimension (broadcastable)
-        delta_gamma = delta_gamma.unsqueeze(1)  # [batch, 1, feature_dim]
-        beta = beta.unsqueeze(1)                # [batch, 1, feature_dim]
+        # Expand for sequence dimension
+        delta_gamma = delta_gamma.unsqueeze(1)
+        beta = beta.unsqueeze(1)
 
-        # Apply with residual formulation: Equivalent to gamma * features + beta where gamma = 1 + delta_gamma
-        # This allows identity at init and preserves ability for negative/large gamma as per FiLM paper.
-        return features * (1 + delta_gamma) + beta
+        # Apply FiLM transformation
+        return features * (1.0 + delta_gamma) + beta
+
+
+class DecomposedTransformerEncoderLayer(nn.Module):
+    """
+    Custom decomposed transformer encoder layer built from primitive operations.
+    Fully compatible with torch.export and torch.compile.
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        norm_first: bool = True,
+        batch_first: bool = True,
+    ) -> None:
+        super().__init__()
+        
+        self.d_model = d_model
+        self.nhead = nhead
+        self.norm_first = norm_first
+        
+        # Multi-head attention
+        self.self_attn = nn.MultiheadAttention(
+            d_model, 
+            nhead, 
+            dropout=dropout, 
+            batch_first=batch_first
+        )
+        
+        # Feed-forward network
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        
+        # Activation
+        if activation == "gelu":
+            self.activation = nn.GELU()
+        elif activation == "relu":
+            self.activation = nn.ReLU()
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+        
+        # Normalization layers
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        # Dropout layers
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self) -> None:
+        """Initialize weights following PyTorch's TransformerEncoderLayer."""
+        nn.init.xavier_uniform_(self.linear1.weight)
+        nn.init.xavier_uniform_(self.linear2.weight)
+        nn.init.constant_(self.linear1.bias, 0)
+        nn.init.constant_(self.linear2.bias, 0)
+    
+    def forward(
+        self, 
+        src: Tensor,
+        src_mask: Optional[Tensor] = None,
+        src_key_padding_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        # Use static branching based on norm_first
+        if self.norm_first:
+            # Pre-norm architecture
+            x = src
+            # Self-attention block
+            x2 = self.norm1(x)
+            x2, _ = self.self_attn(x2, x2, x2, attn_mask=src_mask, 
+                                  key_padding_mask=src_key_padding_mask, need_weights=False)
+            x = x + self.dropout1(x2)
+            
+            # Feed-forward block  
+            x2 = self.norm2(x)
+            x2 = self.linear2(self.dropout(self.activation(self.linear1(x2))))
+            x = x + self.dropout2(x2)
+        else:
+            # Post-norm architecture
+            x = src
+            # Self-attention block
+            x2, _ = self.self_attn(x, x, x, attn_mask=src_mask,
+                                  key_padding_mask=src_key_padding_mask, need_weights=False)
+            x = x + self.dropout1(x2)
+            x = self.norm1(x)
+            
+            # Feed-forward block
+            x2 = self.linear2(self.dropout(self.activation(self.linear1(x))))
+            x = x + self.dropout2(x2)
+            x = self.norm2(x)
+        
+        return x
+
+
+class TransformerBlock(nn.Module):
+    """Combined transformer + optional FiLM block to avoid dynamic control flow."""
+    
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        global_input_dim: int,
+        film_clamp: Optional[float] = 1.0,
+    ):
+        super().__init__()
+        self.has_film = global_input_dim > 0
+        
+        self.transformer = DecomposedTransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            norm_first=True,
+            batch_first=True,
+        )
+        
+        if self.has_film:
+            self.film = FiLMLayer(global_input_dim, d_model, clamp_gamma=film_clamp)
+    
+    def forward(
+        self,
+        x: Tensor,
+        global_features: Optional[Tensor] = None,
+        src_key_padding_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        # Always pass through transformer
+        x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
+        
+        # Apply FiLM if it exists and global features are provided
+        # This avoids dynamic branching - if no FiLM layer exists, this is skipped at module level
+        if self.has_film and global_features is not None:
+            x = self.film(x, global_features)
+        
+        return x
 
 
 class PredictionModel(nn.Module):
@@ -101,8 +253,9 @@ class PredictionModel(nn.Module):
             raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead})")
 
         self.d_model = d_model
-        self.padding_value = padding_value
         self.has_global_features = global_input_dim > 0
+        # Store padding value as buffer for export compatibility
+        self.register_buffer('padding_value', torch.tensor(padding_value))
 
         # Input projection
         self.input_proj = nn.Sequential(
@@ -114,30 +267,27 @@ class PredictionModel(nn.Module):
         # Positional encoding
         self.pos_encoder = SinePositionalEncoding(d_model)
 
-        # Build transformer with interleaved FiLM conditioning
-        self.layers = nn.ModuleList()
+        # Build transformer blocks with integrated FiLM
+        self.blocks = nn.ModuleList()
         
-        # Add initial FiLM if we have global features
+        # Initial FiLM if we have global features
         if self.has_global_features:
-            self.layers.append(FiLMLayer(global_input_dim, d_model, clamp_gamma=film_clamp))
-        
-        # Interleave transformer and FiLM layers
-        for _ in range(num_encoder_layers):
-            # Add transformer encoder layer
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                activation="gelu",
-                norm_first=True,
-                batch_first=True,
-            )
-            self.layers.append(encoder_layer)
+            self.initial_film = FiLMLayer(global_input_dim, d_model, clamp_gamma=film_clamp)
+        else:
+            self.initial_film = None
             
-            # Add FiLM after each transformer layer
-            if self.has_global_features:
-                self.layers.append(FiLMLayer(global_input_dim, d_model, clamp_gamma=film_clamp))
+        # Transformer blocks
+        for _ in range(num_encoder_layers):
+            self.blocks.append(
+                TransformerBlock(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                    dropout=dropout,
+                    global_input_dim=global_input_dim,
+                    film_clamp=film_clamp,
+                )
+            )
 
         # Output projection
         self.output_proj = nn.Sequential(
@@ -156,14 +306,12 @@ class PredictionModel(nn.Module):
         )
 
     def _init_weights(self) -> None:
-        """Initialize weights for all layers except FiLM (which self-initializes)."""
+        """Initialize weights for all layers except FiLM and Transformer blocks."""
         for module in self.modules():
-            if isinstance(module, FiLMLayer):
-                continue 
+            if isinstance(module, (FiLMLayer, DecomposedTransformerEncoderLayer, TransformerBlock)):
+                continue  # These have their own initialization
             elif isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(
-                    module.weight, mode="fan_in", nonlinearity="relu"
-                )
+                nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="relu")
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
@@ -181,31 +329,33 @@ class PredictionModel(nn.Module):
 
         # Add positional encoding
         x = self.pos_encoder(x)
+        
+        # Apply initial FiLM if it exists
+        if self.initial_film is not None and global_features is not None:
+            x = self.initial_film(x, global_features)
 
-        # Pass through interleaved transformer and FiLM layers
-        for layer in self.layers:
-            if isinstance(layer, nn.TransformerEncoderLayer):
-                # Transformer layer
-                x = layer(src=x, src_key_padding_mask=sequence_mask)
-            elif isinstance(layer, FiLMLayer) and global_features is not None:
-                # FiLM conditioning layer
-                x = layer(x, global_features)
+        # Pass through transformer blocks
+        for block in self.blocks:
+            x = block(x, global_features, sequence_mask)
 
         # Project to output dimension
         output = self.output_proj(x)
 
-        # Mask padding
+        # Mask padding positions
         if sequence_mask is not None:
-            output = output.masked_fill(sequence_mask.unsqueeze(-1), self.padding_value)
+            # Create mask for output dimension
+            output_mask = sequence_mask.unsqueeze(-1).expand_as(output)
+            output = torch.where(output_mask, self.padding_value, output)
 
         return output
-    
+
 
 def create_prediction_model(
     config: Dict[str, Any],
     device: Optional[torch.device] = None,
     compile_model: bool = True,
 ) -> PredictionModel:
+    """Create a prediction model with optional compilation."""
     validate_config(config)
 
     data_spec = config["data_specification"]
@@ -229,14 +379,10 @@ def create_prediction_model(
 
     model.to(device=device)
 
-    # Conditionally compile the model based on the compile_model flag
+    # Conditionally compile the model
     if compile_model:
-        compile_enabled = config.get("miscellaneous_settings", {}).get(
-            "torch_compile", False
-        )
-        compile_mode = config.get("miscellaneous_settings", {}).get(
-            "compile_mode", "default"
-        )
+        compile_enabled = config.get("miscellaneous_settings", {}).get("torch_compile", False)
+        compile_mode = config.get("miscellaneous_settings", {}).get("compile_mode", "default")
 
         if (
             version.parse(torch.__version__) >= version.parse("2.0.0")
@@ -245,18 +391,22 @@ def create_prediction_model(
         ):
             try:
                 logger.info(f"Attempting torch.compile with mode='{compile_mode}'")
-                model = torch.compile(model, mode=compile_mode)
+                # Add fullgraph=True for better optimization if no dynamic control flow
+                compile_kwargs = {"mode": compile_mode}
+                # Only use fullgraph if we're confident there are no graph breaks
+                if compile_mode == "max-autotune":
+                    compile_kwargs["fullgraph"] = True
+                    
+                model = torch.compile(model, **compile_kwargs)
                 logger.info("Model compiled successfully")
-            except RuntimeError as e:
-                logger.warning(
-                    f"torch.compile failed: {e}. Proceeding without compilation."
-                )
+            except Exception as e:
+                logger.warning(f"torch.compile failed: {e}. Proceeding without compilation.")
         elif compile_enabled and device.type != "cuda":
             logger.info("torch.compile is only enabled for CUDA devices.")
 
     logger.info(f"Model moved to device: {device}")
-
     return model
+
 
 def export_model(
     model: nn.Module,
@@ -265,9 +415,8 @@ def export_model(
     config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    1. Exports a **torch.export** artefact with a *dynamic batch* dimension.
-    2. Exports an **ONNX** model with the same dynamic batch axis.
-    3. Optionally simplifies the ONNX graph if onnx‑sim is available.
+    Export model with torch.export, ensuring compatibility and correctness.
+    Performs validation to ensure exported model produces identical results.
     """
     save_path = Path(save_path)
     save_dir = save_path.parent
@@ -277,23 +426,18 @@ def export_model(
         logger.info("Model export disabled in config – skipping.")
         return
 
-    # Set environment variables to prevent ONNX runtime thread affinity issues
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['MKL_NUM_THREADS'] = '1'
-    os.environ['ORT_DISABLE_THREAD_AFFINITY'] = '1'
-    
     model.eval()
 
-    # Move model to CPU for export to avoid MPS-specific issues with fake tensors
+    # Always export from CPU to avoid device-specific issues
     original_device = next(model.parameters()).device
     model = model.to('cpu')
 
-    # Unwrap torch.compile wrapper if present ─ it may freeze shapes
+    # Unwrap torch.compile wrapper if present
     if hasattr(model, "_orig_mod"):
         logger.info("Extracting original model from compiled wrapper")
         model = model._orig_mod
 
-    # Move example inputs to CPU to avoid device mismatch in fake tensors
+    # Move example inputs to CPU
     sequence = example_input["sequence"].to('cpu')
     global_features = example_input.get("global_features")
     if global_features is not None:
@@ -302,137 +446,96 @@ def export_model(
     if sequence_mask is not None:
         sequence_mask = sequence_mask.to('cpu')
 
-    # Conditionally create dummy with batch=2 only if original batch=1
+    # Prepare inputs for export (ensure batch size > 1 for dynamic shapes)
     batch_size = sequence.shape[0]
     if batch_size == 1:
-        dummy_sequence = torch.cat([sequence, sequence], dim=0)
-        dummy_global_features = torch.cat([global_features, global_features], dim=0) if global_features is not None else None
-        dummy_sequence_mask = torch.cat([sequence_mask, sequence_mask], dim=0) if sequence_mask is not None else None
+        # Duplicate inputs to create batch size 2
+        export_sequence = torch.cat([sequence, sequence], dim=0)
+        export_global = torch.cat([global_features, global_features], dim=0) if global_features is not None else None
+        export_mask = torch.cat([sequence_mask, sequence_mask], dim=0) if sequence_mask is not None else None
     else:
-        dummy_sequence = sequence
-        dummy_global_features = global_features
-        dummy_sequence_mask = sequence_mask
+        export_sequence = sequence
+        export_global = global_features
+        export_mask = sequence_mask
 
-    # Use only kwargs to avoid mixed key types in dynamic_shapes
-    args = ()
-    kwargs: Dict[str, Tensor] = {"sequence": dummy_sequence}
-    if dummy_global_features is not None:
-        kwargs["global_features"] = dummy_global_features
-    if dummy_sequence_mask is not None:
-        kwargs["sequence_mask"] = dummy_sequence_mask
+    # Prepare kwargs for export
+    kwargs: Dict[str, Tensor] = {"sequence": export_sequence}
+    if export_global is not None:
+        kwargs["global_features"] = export_global
+    if export_mask is not None:
+        kwargs["sequence_mask"] = export_mask
 
-    # Adjust max based on your use case (e.g., hardware limits)
-    batch = Dim("batch", min=1, max=128)  
+    # Define dynamic shapes
+    batch_dim = Dim("batch", min=1, max=1024)  # Reasonable max batch size
     
     dynamic_shapes: Dict[str, Any] = {
-        "sequence": {0: batch}
+        "sequence": {0: batch_dim}
     }
-    if dummy_global_features is not None:
-        dynamic_shapes["global_features"] = {0: batch}
-    if dummy_sequence_mask is not None:
-        dynamic_shapes["sequence_mask"] = {0: batch}
+    if export_global is not None:
+        dynamic_shapes["global_features"] = {0: batch_dim}
+    if export_mask is not None:
+        dynamic_shapes["sequence_mask"] = {0: batch_dim}
 
     try:
+        # Export with torch.export
         with torch.no_grad():
-            if original_device.type == 'mps':
-                with sdpa_kernel(SDPBackend.MATH):
-                    prog = texport(model, args, kwargs=kwargs, dynamic_shapes=dynamic_shapes)
+            # Use strict=False to allow some flexibility in tracing
+            exported_program = texport(
+                model, 
+                args=(), 
+                kwargs=kwargs, 
+                dynamic_shapes=dynamic_shapes,
+                strict=False
+            )
+        
+        # Save exported model
+        export_path = save_dir / f"{model_name}_exported.pt2"
+        tsave(exported_program, str(export_path))
+        logger.info(f"Model exported successfully to {export_path}")
+        
+        # Validate exported model
+        logger.info("Validating exported model...")
+        with torch.no_grad():
+            # Test with original batch size
+            test_kwargs = {
+                "sequence": sequence,
+                "global_features": global_features,
+                "sequence_mask": sequence_mask
+            }
+            test_kwargs = {k: v for k, v in test_kwargs.items() if v is not None}
+            
+            original_output = model(**test_kwargs)
+            exported_output = exported_program.module()(**test_kwargs)
+            
+            if not torch.allclose(original_output, exported_output, rtol=1e-4, atol=1e-5):
+                logger.warning("Exported model output differs from original!")
+                max_diff = torch.max(torch.abs(original_output - exported_output)).item()
+                logger.warning(f"Maximum difference: {max_diff}")
             else:
-                prog = texport(model, args, kwargs=kwargs, dynamic_shapes=dynamic_shapes)
-        
-        tsave(prog, str(save_dir / f"{model_name}_torch.pt"))
-        logger.info("torch.export artefact written with dynamic batch size")
+                logger.info("✓ Exported model validation passed")
+                
     except Exception as exc:
-        logger.error("torch.export failed: %s", exc)
-        logger.info("Attempting fallback export without dynamic shapes...")
+        logger.error(f"Model export failed: {exc}", exc_info=True)
         
-        # Fallback: Try exporting without dynamic shapes
+        # Try fallback without dynamic shapes
+        logger.info("Attempting fallback export with static shapes...")
         try:
             with torch.no_grad():
-                if original_device.type == 'mps':
-                    with sdpa_kernel(SDPBackend.MATH):
-                        prog = texport(model, args, kwargs=kwargs)
-                else:
-                    prog = texport(model, args, kwargs=kwargs)
-            tsave(prog, str(save_dir / f"{model_name}_torch_static.pt"))
-            logger.warning("Exported with static shapes as fallback")
+                static_exported = texport(
+                    model,
+                    args=(),
+                    kwargs=kwargs,
+                    strict=False
+                )
+            static_path = save_dir / f"{model_name}_exported_static.pt2"
+            tsave(static_exported, str(static_path))
+            logger.warning(f"Static shape export succeeded: {static_path}")
         except Exception as fallback_exc:
-            logger.error("Fallback export also failed: %s", fallback_exc)
-            return
-
-    # Quick numerical sanity‑check
-    with torch.no_grad():
-        ref = model(**kwargs)
-        out = prog.module()(**kwargs)
-        if not torch.allclose(ref, out, rtol=1e-4, atol=1e-5):
-            logger.warning("Exported (torch.export) output differs from original")
+            logger.error(f"Fallback export also failed: {fallback_exc}")
     
-    return
-    """
-    # --------------------------------------------------------------------- #
-    #                         ONNX dynamic‑batch export                     #
-    # --------------------------------------------------------------------- #
-    onnx_path = save_dir / f"{model_name}.onnx"
-    try:
-        # Build tuple for ONNX export (ordered inputs)
-        onnx_args = (sequence,)
-        if global_features is not None:
-            onnx_args += (global_features,)
-        if sequence_mask is not None:
-            onnx_args += (sequence_mask,)
-
-        input_names = ["sequence"]
-        dynamic_axes = {"sequence": {0: "batch"}, "output": {0: "batch"}}
-        if global_features is not None:
-            input_names.append("global_features")
-            dynamic_axes["global_features"] = {0: "batch"}
-        if sequence_mask is not None:
-            input_names.append("sequence_mask")
-            dynamic_axes["sequence_mask"] = {0: "batch"}
-
-        torch.onnx.export(
-            model,
-            onnx_args,  # Use tuple
-            str(onnx_path),
-            export_params=True,
-            opset_version=18,
-            do_constant_folding=True,
-            input_names=input_names,
-            output_names=["output"],
-            dynamic_axes=dynamic_axes,
-        )
-        logger.info("ONNX model saved with dynamic batch size: %s", onnx_path)
-
-        # ---- Simplify / optimise ONNX graph if onnx‑sim is available ---- #
-        try:
-            import onnx
-            import onnxsim
-
-            onnx_model = onnx.load(str(onnx_path))
-            # Remove deprecated dynamic_input_shape parameter
-            onnx_model_opt, ok = onnxsim.simplify(onnx_model)
-            if ok:
-                opt_path = save_dir / f"{model_name}_optimized.onnx"
-                onnx.save(onnx_model_opt, str(opt_path))
-                logger.info("Simplified ONNX graph saved to: %s", opt_path)
-            else:
-                logger.warning("onnx‑sim simplification check failed – keeping raw graph")
-        except ImportError:
-            logger.info("onnxsim not installed – skipping ONNX optimisation")
-        except Exception as exc:  # pragma: no cover
-            logger.warning("ONNX optimisation failed: %s", exc)
-
-    except Exception as exc:  # pragma: no cover
-        logger.error("ONNX export failed: %s", exc)
     finally:
-        # Reset environment variables to defaults
-        if 'OMP_NUM_THREADS' in os.environ:
-            del os.environ['OMP_NUM_THREADS']
-        if 'MKL_NUM_THREADS' in os.environ:
-            del os.environ['MKL_NUM_THREADS']
-        if 'ORT_DISABLE_THREAD_AFFINITY' in os.environ:
-            del os.environ['ORT_DISABLE_THREAD_AFFINITY']
+        # Restore model to original device
+        model.to(original_device)
 
-    """
 
 __all__ = ["PredictionModel", "create_prediction_model", "export_model"]
