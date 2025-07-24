@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+utils.py - Helper functions for configuration, logging, and data handling.
+
+This module provides utilities for:
+- Configuration file loading and validation
+- Logging setup
+- Random seed management
+- Dataset split generation and loading
+- JSON serialization with custom handlers
+- Hash computation for data integrity checks
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import random
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Union
+import h5py
+
+import numpy as np
+import torch
+
+try:
+    import json5 as _json_backend
+
+    _HAS_JSON5 = True
+except ImportError:
+    _json_backend = json
+    _HAS_JSON5 = False
+
+DTYPE = torch.float32
+PADDING_VALUE = -9999.0
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s - %(message)s"
+DEFAULT_SEED = 42
+METADATA_FILENAME = "normalization_metadata.json"
+UTF8_ENCODING = "utf-8"
+UTF8_SIG_ENCODING = "utf-8-sig"
+HASH_ALGORITHM = "sha256"
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(
+    level: int = logging.INFO,
+    log_file: Union[str, Path, None] = None,
+    force: bool = False,
+) -> None:
+    root_logger = logging.getLogger()
+
+    if force:
+        while root_logger.handlers:
+            handler = root_logger.handlers.pop()
+            handler.close()
+
+    root_logger.setLevel(level)
+    formatter = logging.Formatter(LOG_FORMAT)
+
+    if not root_logger.handlers:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+
+    if log_file:
+        try:
+            log_file_path = Path(log_file)
+            log_file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(
+                log_file_path, mode="a", encoding=UTF8_ENCODING
+            )
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
+            print(f"Logging to console and file: {log_file_path.resolve()}")
+        except OSError as e:
+            print(
+                f"Error setting up file logging for {log_file}: {e}. Using console only."
+            )
+    else:
+        print("Logging to console only.")
+
+
+def load_config(path: Union[str, Path]) -> Dict[str, Any]:
+    config_path = Path(path)
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+
+    try:
+        with open(config_path, "r", encoding=UTF8_SIG_ENCODING) as f:
+            if _HAS_JSON5:
+                config_dict = _json_backend.load(f)
+            else:
+                logger.warning(
+                    "JSON5 not available; comments in config will cause errors."
+                )
+                config_dict = json.load(f)
+
+        validate_config(config_dict)
+
+        backend = "JSON5" if _HAS_JSON5 else "JSON"
+        logger.info(f"Loaded and validated {backend} config from {config_path}.")
+        return config_dict
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Failed to parse JSON from {config_path}: {e}") from e
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load or validate config {config_path}: {e}"
+        ) from e
+
+
+def validate_config(config: Dict[str, Any]) -> None:
+    data_spec = config.get("data_specification")
+    if not isinstance(data_spec, dict):
+        raise ValueError(
+            "Config section 'data_specification' is missing or not a dictionary."
+        )
+    if not data_spec.get("input_variables"):
+        raise ValueError("'input_variables' must be a non-empty list.")
+    if not data_spec.get("target_variables"):
+        raise ValueError("'target_variables' must be a non-empty list.")
+
+    model_params = config.get("model_hyperparameters")
+    if not isinstance(model_params, dict):
+        raise ValueError(
+            "Config section 'model_hyperparameters' is missing or not a dictionary."
+        )
+
+    d_model = model_params.get("d_model", 0)
+    nhead = model_params.get("nhead", 0)
+    if not isinstance(d_model, int) or d_model <= 0:
+        raise ValueError("'d_model' must be a positive integer.")
+    if not isinstance(nhead, int) or nhead <= 0:
+        raise ValueError("'nhead' must be a positive integer.")
+    if d_model % nhead != 0:
+        raise ValueError(
+            f"'d_model' ({d_model}) must be divisible by 'nhead' ({nhead})."
+        )
+
+
+def ensure_dirs(*paths: Union[str, Path, None]) -> bool:
+    try:
+        for path in paths:
+            if path is not None:  # Skip None paths
+                Path(path).mkdir(parents=True, exist_ok=True)
+        return True
+    except OSError as e:
+        logger.error(f"Failed to create directories {paths}: {e}")
+        return False
+
+
+def _json_serializer(obj: Any) -> Any:
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, Path):
+        return str(obj.resolve())
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable.")
+
+
+def save_json(data: Dict[str, Any], path: Union[str, Path]) -> bool:
+    try:
+        json_path = Path(path)
+        ensure_dirs(json_path.parent)
+
+        with json_path.open("w", encoding=UTF8_ENCODING) as f:
+            json.dump(data, f, indent=2, default=_json_serializer, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+
+    except (OSError, TypeError) as e:
+        logger.error(f"Failed to save JSON to {path}: {e}", exc_info=True)
+        return False
+
+
+def seed_everything(seed: int = DEFAULT_SEED) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    logger.info(f"Global random seed set to {seed}.")
+
+
+def generate_dataset_splits(
+    raw_hdf5_paths: List[Path],
+    val_frac: float = 0.15,
+    test_frac: float = 0.15,
+    random_seed: int = DEFAULT_SEED,
+) -> Dict[str, List[Tuple[str, int]]]:
+    if not (0 < val_frac < 1 and 0 < test_frac < 1 and val_frac + test_frac < 1):
+        raise ValueError(f"Invalid split fractions: val={val_frac}, test={test_frac}")
+
+    all_indices = []
+    total_profiles = 0
+
+    for h5_path in raw_hdf5_paths:
+        if not h5_path.is_file():
+            logger.warning(f"Skipping missing HDF5 file: {h5_path}")
+            continue
+        try:
+            with h5py.File(h5_path, "r") as hf:
+                if not hf.keys():
+                    continue
+                first_key = next(iter(hf.keys()))
+                n_profiles = hf[first_key].shape[0]
+                assert all(
+                    d.shape[0] == n_profiles for d in hf.values()
+                ), "Inconsistent leading dimensions in HDF5"
+                file_stem = h5_path.stem
+                all_indices.extend([(file_stem, i) for i in range(n_profiles)])
+                total_profiles += n_profiles
+        except (OSError, AssertionError) as e:
+            logger.warning(f"Failed to read {h5_path}: {e}. Skipping.")
+
+    if total_profiles == 0:
+        raise RuntimeError("No profiles found across all HDF5 files. Exiting.")
+
+    n_val = max(1, int(round(total_profiles * val_frac)))
+    n_test = max(1, int(round(total_profiles * test_frac)))
+    n_train = total_profiles - n_val - n_test
+    if n_train <= 0:
+        raise ValueError(f"Training split empty. Reduce val/test fractions.")
+
+    rng = random.Random(random_seed)
+    rng.shuffle(all_indices)
+
+    splits = {
+        "train": all_indices[:n_train],
+        "validation": all_indices[n_train : n_train + n_val],
+        "test": all_indices[n_train + n_val :],
+    }
+
+    logger.info(
+        f"Generated splits from {total_profiles} profiles across {len(raw_hdf5_paths)} files: "
+        f"train={len(splits['train'])} ({len(splits['train'])/total_profiles:.1%}), "
+        f"val={len(splits['validation'])} ({len(splits['validation'])/total_profiles:.1%}), "
+        f"test={len(splits['test'])} ({len(splits['test'])/total_profiles:.1%})"
+    )
+
+    return splits
+
+
+def get_config_str(config: Dict[str, Any], section: str, key: str, op_desc: str) -> str:
+    if section not in config or not isinstance(config[section], dict):
+        raise ValueError(
+            f"Config section '{section}' missing or invalid for {op_desc}."
+        )
+
+    path_val = config[section].get(key)
+    if not isinstance(path_val, str) or not path_val.strip():
+        raise ValueError(
+            f"Config key '{key}' in '{section}' missing or empty for {op_desc}."
+        )
+
+    return path_val.strip()
+
+
+def load_or_generate_splits(
+    config: Dict[str, Any],
+    data_root_dir: Path,
+    raw_hdf5_paths: List[Path],
+    model_save_dir: Path,
+) -> Tuple[Dict[str, List[Tuple[str, int]]], Path]:
+    splits_path = None
+
+    try:
+        splits_filename = get_config_str(
+            config, "data_paths_config", "dataset_splits_filename", "dataset splits"
+        )
+        splits_path = data_root_dir / splits_filename
+
+        logger.info(f"Loading dataset splits from: {splits_path}")
+
+        if not splits_path.exists():
+            raise FileNotFoundError(f"Splits file not found: {splits_path}")
+
+        with open(splits_path, "r", encoding=UTF8_ENCODING) as f:
+            splits = json.load(f)
+
+        required_keys = {"train", "validation", "test"}
+        if not required_keys.issubset(splits.keys()):
+            raise ValueError(f"Splits file must contain keys: {required_keys}")
+
+        for key in required_keys:
+            if not isinstance(splits[key], list) or not splits[key]:
+                raise ValueError(f"Split '{key}' must be a non-empty list")
+
+        for split in splits.values():
+            for i, item in enumerate(split):
+                if isinstance(item, list) and len(item) == 2:
+                    split[i] = tuple(item)
+
+        logger.info(f"Loaded splits from {splits_path}")
+        logger.info(
+            f"Split sizes: {len(splits['train'])} train, "
+            f"{len(splits['validation'])} val, {len(splits['test'])} test."
+        )
+        return splits, splits_path
+
+    except (KeyError, ValueError, FileNotFoundError, json.JSONDecodeError) as e:
+        logger.info(f"Could not load splits file. Reason: {e}. Generating new splits.")
+
+    logger.info("Generating new dataset splits...")
+
+    train_params = config.get("training_hyperparameters", {})
+    val_frac = train_params.get("val_frac", 0.15)
+    test_frac = train_params.get("test_frac", 0.15)
+
+    misc_settings = config.get("miscellaneous_settings", {})
+    random_seed = misc_settings.get("random_seed", DEFAULT_SEED)
+
+    splits = generate_dataset_splits(
+        raw_hdf5_paths=raw_hdf5_paths,
+        val_frac=val_frac,
+        test_frac=test_frac,
+        random_seed=random_seed,
+    )
+
+    new_splits_path = model_save_dir / f"splits_generated.json"  # Simplified name
+    if save_json(splits, new_splits_path):
+        logger.info(f"Saved generated splits to {new_splits_path}")
+    else:
+        logger.warning("Failed to save generated splits")
+
+    return splits, new_splits_path
+
+
+def compute_data_hash(config: Dict[str, Any], raw_hdf5_paths: List[Path]) -> str:
+    hasher = hashlib.new(HASH_ALGORITHM)
+    hasher.update(json.dumps(config, sort_keys=True).encode(UTF8_ENCODING))
+    for path in sorted(raw_hdf5_paths):
+        hasher.update(str(path).encode(UTF8_ENCODING))
+
+    return hasher.hexdigest()
+
+
+__all__ = [
+    "DTYPE",
+    "PADDING_VALUE",
+    "LOG_FORMAT",
+    "DEFAULT_SEED",
+    "METADATA_FILENAME",
+    "setup_logging",
+    "load_config",
+    "validate_config",
+    "ensure_dirs",
+    "save_json",
+    "seed_everything",
+    "generate_dataset_splits",
+    "get_config_str",
+    "load_or_generate_splits",
+    "compute_data_hash",
+]

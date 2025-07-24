@@ -1,0 +1,202 @@
+{
+// ════════════════════════════════════════════════════════════════
+// ║                1.  GENERAL / MISCELLANEOUS                   ║
+// ════════════════════════════════════════════════════════════════
+// Settings that affect the whole pipeline.
+"miscellaneous_settings": {
+  // Reproducibility seed for Python, NumPy, Torch, etc.
+  "random_seed": 42,                         // int ≥ 0
+  // Data‑loader worker processes (0 = main thread).
+  // FIX: Increased for A100
+  "num_workers": 4,                         // int ≥ 0
+  // Turn on PyTorch's anomaly detection (debug only; slows training).
+  "detect_anomaly": false,                   // bool
+  // Number of samples per NPY shard in processed data.
+  "shard_size": 2048,                        // int ≥ 1
+  // Enable torch.compile for model optimization (requires PyTorch 2.0+)
+  // FIX: Disabled by default due to overhead
+  "torch_compile": true,                    // bool
+  // Compile mode if torch_compile is enabled
+  "compile_mode": "default",         // "default", "reduce-overhead", "max-autotune"
+  // Enable torch.export for model export
+  "torch_export": true                       // bool
+},
+
+// ════════════════════════════════════════════════════════════════
+// ║                 2.  DATA PATHS & SPLITS                      ║
+// ════════════════════════════════════════════════════════════════
+"data_paths_config": {
+  // HDF5 files sitting in data/raw/.
+  // Multiple files supported; order doesn't matter.
+  "hdf5_dataset_filename": [
+    "picaso_results_1.h5",
+    "picaso_results_2.h5",
+    //"picaso_results_3.h5",
+    //"picaso_results_4.h5",
+    //"picaso_results_5.h5",
+    //"picaso_results_6.h5",
+    //"picaso_results_7.h5",
+    //"picaso_results_8.h5",
+    //"picaso_results_9.h5",
+    //"picaso_results_10.h5"
+  ],
+
+  // Optional pre‑made JSON of train/val/test indices.
+  // If missing, code auto‑generates new splits.
+  "dataset_splits_filename": "dataset_splits.json"
+},
+
+// ════════════════════════════════════════════════════════════════
+// ║                 3.  DATA SPECIFICATION                       ║
+// ════════════════════════════════════════════════════════════════
+"data_specification": {
+  // Per‑layer sequence inputs (T×features).
+  "input_variables": [
+    "pressure_bar",
+    "temperature_k"
+  ],
+
+  // Optional per‑profile scalars (FiLM conditioning).
+  "global_variables": [
+    "orbital_distance_m"
+  ],
+
+  // Targets (the model predicts these).
+  "target_variables": [
+    "net_thermal_flux",
+    "net_reflected_flux"
+  ],
+
+  // Pad value for variable‑length sequences; masked out in loss.
+  "padding_value": -9999.0                  // float
+},
+
+// ════════════════════════════════════════════════════════════════
+// ║                 4.  NORMALISATION                            ║
+// ════════════════════════════════════════════════════════════════
+"normalization": {
+  // Per‑key method (falls back to default_method if unspecified).
+  // Supported: "standard", "log-standard", "symlog", "log-min-max",
+  // "iqr", "max-out", "signed-log", "scaled_signed_offset_log",
+  // "bool", "none".
+  "key_methods": {
+    "pressure_bar":     "log-min-max",
+    "temperature_k":    "standard",
+    "orbital_distance_m":"log-standard",
+    "net_thermal_flux": "symlog",
+    "net_reflected_flux":"symlog"
+  },
+
+  // Fallback for any variable missing above.
+  "default_method": "standard",
+
+  // Numerical epsilon for log ops.
+  "epsilon": 1e-9,                          // float > 0
+
+  // Max values kept in RAM for quantile/IQR computations.
+  "quantile_max_values_in_memory": 10000000, // int ≥ 1
+
+  // Absolute‑percentile that defines linear→log switch in symlog.
+  "symlog_percentile": 0.25                 // 0 ≤ float ≤ 1
+},
+
+// ════════════════════════════════════════════════════════════════
+// ║                 5.  MODEL HYPERPARAMETERS                    ║
+// ════════════════════════════════════════════════════════════════
+"model_hyperparameters": {
+  // Hidden dimension of transformer embeddings.
+  "d_model": 256,                            // int, power of 2 recommended
+  // Attention heads (must divide d_model exactly).
+  "nhead": 4,                                // int
+  // Encoder layer count.
+  "num_encoder_layers": 3,                   // int
+  // FFN inner dimension (often 4×d_model).
+  "dim_feedforward": 1024,                   // int
+  // Drop‑out applied inside encoder & projection layers.
+  "dropout": 0.0,                           // 0‑1 float
+  // Maximum sequence length your data can reach.
+  "max_sequence_length": 256                 // int ≥ max observed seq len
+},
+
+// ════════════════════════════════════════════════════════════════
+// ║                 6.  TRAINING HYPERPARAMETERS                 ║
+// ════════════════════════════════════════════════════════════════
+"training_hyperparameters": {
+  // Epoch budget.
+  "epochs": 100,                             // int ≥ 1
+  // Mini‑batch size per GPU.
+  // FIX: Increased for A100
+  "batch_size": 512,                         // int ≥ 1
+  // Initial learning rate.
+  "learning_rate": 1e-4,                     // float > 0
+  // L2 weight decay.
+  "weight_decay": 1e-5,                      // float ≥ 0
+  // Optimiser: choose "adamw", "adam", or "sgd".
+  "optimizer": "adamw",
+  // Gradient clipping (0 disables).
+  "gradient_clip_val": 1.0,                  // float ≥ 0
+  // Gradient accumulation steps for large effective batch.
+  "gradient_accumulation_steps": 1,          // int ≥ 1
+
+  // ─── Scheduler settings ──────────────────────────────────────
+  // "reduce_on_plateau"  → ReduceLROnPlateau
+  // "cosine"             → CosineAnnealingLR (+ optional warm‑up)
+  "scheduler_type": "reduce_on_plateau",
+
+  // Parameters used **only** for ReduceLROnPlateau
+  "lr_patience": 3,                          // epochs without improvement
+  "lr_factor": 0.5,                          // new_lr = old_lr * factor
+
+  // Parameters used **only** for CosineAnnealingLR
+  "warmup_epochs": 0,                        // linear warm‑up before cosine
+
+  // Minimum LR clamp for either scheduler.
+  "min_lr": 1e-8,
+
+  // ─── Early‑stopping ───────────────────────────────────────────
+  "early_stopping_patience": 20,             // epochs
+  "min_delta": 1e-8,                         // significant improvement
+
+  // ─── Mixed precision & dataset frac ───────────────────────────
+  // FIX: Enable AMP for A100
+  "use_amp": true,                           // Automatic Mixed Precision
+  // If you need a quick run on small subset.
+  "dataset_fraction_to_use": 1.0,            // 0‑1 float
+
+  // Validation/Test split fractions if splits file absent.
+  "val_frac": 0.15,
+  "test_frac": 0.15,
+
+  // Abort epoch if too many batches fail (e.g., all‑NaN).
+  "max_batch_failure_rate": 0.10             // 0‑1 float
+},
+
+// ════════════════════════════════════════════════════════════════
+// ║                 7.  OUTPUT / SAVING                          ║
+// ════════════════════════════════════════════════════════════════
+"output_paths_config": {
+  // Folder name under models/ where checkpoints & logs go.
+  "fixed_model_foldername": "trained_model"
+},
+
+// ════════════════════════════════════════════════════════════════
+// ║                 8.  HYPERPARAMETER SEARCH SPACE              ║
+// ════════════════════════════════════════════════════════════════
+// Bounds supplied to Optuna in hyperparam_search.py.
+"hyperparameter_search": {
+  // Categorical choices – transformer size.
+  "d_model": [128, 256, 512],
+  "nhead_divisors": [4, 8, 16],              // nhead must divide d_model
+  "num_encoder_layers": [3, 8],              // low & high inclusive
+  "dim_feedforward": [512, 1024, 2048],
+
+  // Continuous ranges (Optuna floats).
+  "dropout":      { "low": 0.0, "high": 0.1 },
+  "learning_rate":{ "low": 1e-4, "high": 5e-4, "log": true },
+  "weight_decay": { "low": 1e-6, "high": 1e-4, "log": true },
+
+  // Batch sizes to try.
+  // FIX: Increased for A100
+  "batch_size": [128, 256, 512]
+}
+}
