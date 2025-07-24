@@ -68,7 +68,7 @@ class FiLMLayer(nn.Module):
         # Optional clamping for stability (soft bound to prevent extreme scaling early on)
         if self.clamp_gamma is not None:
             delta_gamma = torch.clamp(delta_gamma, -self.clamp_gamma, self.clamp_gamma)
-            beta = torch.clamp(beta, -self.clamp_gamma, self.clamp_gamma)  # Optionally clamp beta too
+            beta = torch.clamp(beta, -self.clamp_gamma, self.clamp_gamma)
 
         # Expand for sequence dimension (broadcastable)
         delta_gamma = delta_gamma.unsqueeze(1)  # [batch, 1, feature_dim]
@@ -130,7 +130,7 @@ class PredictionModel(nn.Module):
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
                 activation="gelu",
-                norm_first=True,  # Pre-normalization for stability
+                norm_first=True,
                 batch_first=True,
             )
             self.layers.append(encoder_layer)
@@ -159,7 +159,7 @@ class PredictionModel(nn.Module):
         """Initialize weights for all layers except FiLM (which self-initializes)."""
         for module in self.modules():
             if isinstance(module, FiLMLayer):
-                continue  # FiLM layers initialize themselves
+                continue 
             elif isinstance(module, nn.Linear):
                 nn.init.kaiming_normal_(
                     module.weight, mode="fan_in", nonlinearity="relu"
@@ -224,7 +224,7 @@ def create_prediction_model(
         dim_feedforward=model_params.get("dim_feedforward", 1024),
         dropout=float(model_params.get("dropout", 0.1)),
         padding_value=float(data_spec.get("padding_value", PADDING_VALUE)),
-        film_clamp=1.0,  # Enable clamping by default for safety
+        film_clamp=1.0,
     )
 
     model.to(device=device)
@@ -273,22 +273,14 @@ def export_model(
     save_dir = save_path.parent
     model_name = save_path.stem
 
-    # --------------------------------------------------------------------- #
-    #                         Guard via config flag                         #
-    # --------------------------------------------------------------------- #
-    if config is not None and not config.get(
-        "miscellaneous_settings", {}
-    ).get("torch_export", True):
+    if config is not None and not config.get("miscellaneous_settings", {}).get("torch_export", True):
         logger.info("Model export disabled in config – skipping.")
         return
 
-    # --------------------------------------------------------------------- #
-    #                    Fix ONNX Runtime thread affinity                   #
-    # --------------------------------------------------------------------- #
     # Set environment variables to prevent ONNX runtime thread affinity issues
-    os.environ['OMP_NUM_THREADS'] = '1'  # Disable OpenMP threading
-    os.environ['MKL_NUM_THREADS'] = '1'  # Disable MKL threading
-    os.environ['ORT_DISABLE_THREAD_AFFINITY'] = '1'  # Disable ONNX Runtime thread affinity
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['ORT_DISABLE_THREAD_AFFINITY'] = '1'
     
     model.eval()
 
@@ -301,9 +293,6 @@ def export_model(
         logger.info("Extracting original model from compiled wrapper")
         model = model._orig_mod
 
-    # --------------------------------------------------------------------- #
-    #                         Prepare example arguments                     #
-    # --------------------------------------------------------------------- #
     # Move example inputs to CPU to avoid device mismatch in fake tensors
     sequence = example_input["sequence"].to('cpu')
     global_features = example_input.get("global_features")
@@ -332,10 +321,8 @@ def export_model(
     if dummy_sequence_mask is not None:
         kwargs["sequence_mask"] = dummy_sequence_mask
 
-    # --------------------------------------------------------------------- #
-    #                torch.export with dynamic batch dimension              #
-    # --------------------------------------------------------------------- #
-    batch = Dim("batch", min=1, max=128)  # Adjust max based on your use case (e.g., hardware limits)
+    # Adjust max based on your use case (e.g., hardware limits)
+    batch = Dim("batch", min=1, max=128)  
     
     dynamic_shapes: Dict[str, Any] = {
         "sequence": {0: batch}
@@ -379,7 +366,9 @@ def export_model(
         out = prog.module()(**kwargs)
         if not torch.allclose(ref, out, rtol=1e-4, atol=1e-5):
             logger.warning("Exported (torch.export) output differs from original")
-
+    
+    return
+    """
     # --------------------------------------------------------------------- #
     #                         ONNX dynamic‑batch export                     #
     # --------------------------------------------------------------------- #
@@ -444,6 +433,6 @@ def export_model(
         if 'ORT_DISABLE_THREAD_AFFINITY' in os.environ:
             del os.environ['ORT_DISABLE_THREAD_AFFINITY']
 
-    # Model is already on CPU, no need to move back
+    """
 
 __all__ = ["PredictionModel", "create_prediction_model", "export_model"]

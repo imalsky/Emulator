@@ -57,6 +57,7 @@ def _load_and_restore_chunk(
         if var not in hf_file:
             logger.error(f"Critical error: Variable '{var}' not found in HDF5 file.")
             return None
+        
         # 1. Load data in sorted order (efficient)
         data_sorted = hf_file[var][sorted_indices]
         # 2. Restore original order (correctness)
@@ -269,6 +270,7 @@ def preprocess_data(
                 with h5py.File(file_map[file_stem], "r") as hf_raw:
                     for i in range(0, len(indices), HDF5_READ_CHUNK_SIZE):
                         chunk_idx = np.array(indices[i : i + HDF5_READ_CHUNK_SIZE])
+                        
                         # Pass max_seq_len to enforce truncation
                         input_data = _load_and_restore_chunk(
                             hf_raw, input_vars, chunk_idx, max_seq_len

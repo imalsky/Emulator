@@ -98,7 +98,7 @@ class AtmosphericDataset(Dataset):
         # Account for all data types (seq + targets + globals)
         total_bytes_per_sample = bytes_per_sample * 2  # seq + targets
         if self.has_globals:
-            total_bytes_per_sample += bytes_per_sample / self.sequence_length  # globals are smaller
+            total_bytes_per_sample += bytes_per_sample / self.sequence_length
         
         total_bytes_needed = total_bytes_per_sample * len(self.indices)
         total_gb_needed = total_bytes_needed / (1024**3)
@@ -288,12 +288,12 @@ class AtmosphericDataset(Dataset):
             shard_data = self._load_shard(shard_idx)
             
             # Extract the specific sample
-            # IMPORTANT: For memory-mapped arrays, indexing returns a view
+            # For memory-mapped arrays, indexing returns a view
             # We need to copy to ensure the tensor owns its memory
             seq_in_np = shard_data["sequence_inputs"][within_shard_idx]
             tgt_np = shard_data["targets"][within_shard_idx]
             
-            # FIXED: Always copy from memory-mapped arrays to ensure tensor owns memory
+            # Always copy from memory-mapped arrays to ensure tensor owns memory
             if hasattr(seq_in_np, 'base') and seq_in_np.base is not None:
                 # This is a view into a memory-mapped array
                 seq_in_np = seq_in_np.copy()
@@ -330,10 +330,11 @@ def pad_collate(
     padding_value: float = PADDING_VALUE,
     padding_epsilon: float = 1e-6,
 ):
-    """FIX: Use safe padding comparison instead of exact equality."""
+    """Use safe padding comparison instead of exact equality."""
     inputs, targets = zip(*batch)
 
     seq = torch.stack([d["sequence"] for d in inputs])
+
     # Safe padding comparison
     seq_mask = (torch.abs(seq - padding_value) < padding_epsilon).all(dim=-1)
 

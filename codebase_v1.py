@@ -229,29 +229,8 @@ from utils import compute_data_hash, ensure_dirs, save_json
 
 logger = logging.getLogger(__name__)
 
-# --- Configuration Constants ---
-# Chunk size for reading data from HDF5 files at a time.
-# Optimized for A100 with plenty of memory
-def _get_optimal_chunk_size() -> int:
-    """Determine optimal chunk size based on available hardware."""
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        if "A100" in gpu_name:
-            return 65536  # 64k samples for A100
-        elif "V100" in gpu_name:
-            return 32768  # 32k samples for V100
-        else:
-            return 16384  # 16k samples for other GPUs
-    return 8192  # Default for CPU
 
-HDF5_READ_CHUNK_SIZE = _get_optimal_chunk_size()
-
-# H5PY cache settings for better performance
-H5PY_CACHE_SIZE = 1024 * 1024 * 1024  # 1GB cache
-H5PY_CACHE_SLOTS = 100003  # Prime number for better hash distribution
-
-# --- Helper Functions ---
-
+HDF5_READ_CHUNK_SIZE = 131072
 
 def _group_indices_by_file(indices: List[Tuple[str, int]]) -> Dict[str, List[int]]:
     """Groups a list of (file_stem, index) tuples by file_stem."""
@@ -355,18 +334,18 @@ def _save_preprocessing_summary(
 
     try:
         content = f"""# Preprocessing Summary
-- Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-- Data Hash: {data_hash}
+                    - Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                    - Data Hash: {data_hash}
 
---- Data Specification ---
-- Input Variables: {config['data_specification']['input_variables']}
-- Global Variables: {config['data_specification'].get('global_variables', 'None')}
-- Target Variables: {config['data_specification']['target_variables']}
-- Padding Value: {config['data_specification']['padding_value']}
-- Max Sequence Length: {config['model_hyperparameters']['max_sequence_length']}
+                    --- Data Specification ---
+                    - Input Variables: {config['data_specification']['input_variables']}
+                    - Global Variables: {config['data_specification'].get('global_variables', 'None')}
+                    - Target Variables: {config['data_specification']['target_variables']}
+                    - Padding Value: {config['data_specification']['padding_value']}
+                    - Max Sequence Length: {config['model_hyperparameters']['max_sequence_length']}
 
---- Data Splits ---
-"""
+                    --- Data Splits ---
+                    """
         shard_size = config.get("miscellaneous_settings", {}).get("shard_size", 1000)
         for name, indices in all_splits.items():
             count = len(indices)
@@ -492,10 +471,7 @@ def preprocess_data(
                     pbar.update(len(indices))
                     continue
 
-                # Open with optimized cache settings
-                with h5py.File(file_map[file_stem], "r", 
-                             rdcc_nbytes=H5PY_CACHE_SIZE,
-                             rdcc_nslots=H5PY_CACHE_SLOTS) as hf_raw:
+                with h5py.File(file_map[file_stem], "r") as hf_raw:
                     for i in range(0, len(indices), HDF5_READ_CHUNK_SIZE):
                         chunk_idx = np.array(indices[i : i + HDF5_READ_CHUNK_SIZE])
                         # Pass max_seq_len to enforce truncation
@@ -685,6 +661,7 @@ def preprocess_data(
 
 
 __all__ = ["preprocess_data"]
+
 
 ===== /Users/imalsky/Desktop/Problemulator/src/model.py =====
 #!/usr/bin/env python3
@@ -1147,8 +1124,6 @@ from __future__ import annotations
 import json
 import logging
 import psutil
-import concurrent.futures
-from collections import defaultdict
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
@@ -1233,14 +1208,6 @@ class AtmosphericDataset(Dataset):
         if len(self.seq_shards) == 0:
             raise RuntimeError(f"No shard files found in {seq_dir}")
         
-        # Check if running on A100
-        is_a100 = False
-        if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0)
-            is_a100 = "A100" in gpu_name
-            if is_a100:
-                logger.info("A100 GPU detected - optimizing for high-performance loading")
-        
         # Estimate memory requirements
         sample_shard = np.load(self.seq_shards[0], mmap_mode='r')
         bytes_per_sample = sample_shard.itemsize * np.prod(sample_shard.shape[1:])
@@ -1257,20 +1224,8 @@ class AtmosphericDataset(Dataset):
         available_memory = psutil.virtual_memory().available
         available_gb = available_memory / (1024**3)
         
-        # For A100, be more aggressive with memory usage
-        if is_a100:
-            safe_memory_fraction = 0.9  # Use 90% for A100
-            # Force RAM loading for A100 unless explicitly disabled
-            if not self.force_disk_loading:
-                logger.info("A100 detected - forcing RAM loading for optimal performance")
-                logger.info(f"Loading {total_gb_needed:.2f} GB into RAM...")
-                self._load_all_to_ram_parallel()
-                self.ram_mode = True
-                return
-        else:
-            safe_memory_fraction = 0.8
-        
-        safe_available_gb = available_gb * safe_memory_fraction
+        # Safety margin - use only 80% of available memory
+        safe_available_gb = available_gb * 0.8
         
         logger.info(
             f"Memory estimate: {total_gb_needed:.2f} GB needed, "
@@ -1280,7 +1235,7 @@ class AtmosphericDataset(Dataset):
         # Decide loading strategy
         if not self.force_disk_loading and total_gb_needed < safe_available_gb:
             logger.info("Loading entire dataset into RAM...")
-            self._load_all_to_ram_parallel()
+            self._load_all_to_ram()
             self.ram_mode = True
         else:
             if total_gb_needed >= safe_available_gb:
@@ -1292,87 +1247,44 @@ class AtmosphericDataset(Dataset):
             self._setup_disk_cache()
             self.ram_mode = False
     
-    def _load_all_to_ram_parallel(self) -> None:
-        """Load entire dataset into RAM using parallel I/O for maximum performance."""
-        n_samples = len(self.indices)
-        
+    def _load_all_to_ram(self) -> None:
+        """Load entire dataset into RAM for maximum performance."""
         # Pre-allocate arrays
-        logger.info(f"Pre-allocating arrays for {n_samples} samples...")
+        n_samples = len(self.indices)
         seq_shape = (n_samples, self.sequence_length, len(self.input_variables))
         tgt_shape = (n_samples, self.sequence_length, len(self.target_variables))
         
-        self.ram_sequences = np.empty(seq_shape, dtype=np.float32)
-        self.ram_targets = np.empty(tgt_shape, dtype=np.float32)
+        self.ram_sequences = np.zeros(seq_shape, dtype=np.float32)
+        self.ram_targets = np.zeros(tgt_shape, dtype=np.float32)
         
         if self.has_globals:
             glb_shape = (n_samples, len(self.global_variables))
-            self.ram_globals = np.empty(glb_shape, dtype=np.float32)
-        
-        # Group indices by shard for efficient loading
-        shard_groups = defaultdict(list)
-        for ram_idx, original_idx in enumerate(self.indices):
-            shard_idx = original_idx // self.shard_size
-            within_idx = original_idx % self.shard_size
-            shard_groups[shard_idx].append((ram_idx, within_idx))
-        
-        logger.info(f"Loading {len(shard_groups)} shards in parallel...")
-        
-        # Function to load and assign data from a single shard
-        def load_and_assign_shard(shard_idx):
-            indices = shard_groups[shard_idx]
-            shard_name = f"shard_{shard_idx:06d}.npy"
-            
-            # Load all data for this shard at once
-            seq_path = self.dir_path / "sequence_inputs" / shard_name
-            tgt_path = self.dir_path / "targets" / shard_name
-            
-            # Load entire arrays (not memory-mapped for speed)
-            seq_data = np.load(seq_path)
-            tgt_data = np.load(tgt_path)
-            
-            # Extract indices we need
-            ram_indices = np.array([idx[0] for idx in indices])
-            within_indices = np.array([idx[1] for idx in indices])
-            
-            # Batch assignment is much faster than individual assignments
-            self.ram_sequences[ram_indices] = seq_data[within_indices]
-            self.ram_targets[ram_indices] = tgt_data[within_indices]
-            
-            if self.has_globals:
-                glb_path = self.dir_path / "globals" / shard_name
-                glb_data = np.load(glb_path)
-                self.ram_globals[ram_indices] = glb_data[within_indices]
-            
-            return len(indices)
-        
-        # Determine optimal number of workers
-        n_workers = min(16, len(shard_groups), psutil.cpu_count(logical=False))
-        if torch.cuda.is_available() and "A100" in torch.cuda.get_device_name(0):
-            n_workers = min(32, n_workers * 2)  # More workers for A100 systems
-        
-        # Load shards in parallel
-        completed_samples = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {
-                executor.submit(load_and_assign_shard, shard_idx): shard_idx 
-                for shard_idx in shard_groups
-            }
-            
-            # Process results as they complete
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    n_loaded = future.result()
-                    completed_samples += n_loaded
-                    if completed_samples % 100000 == 0 or completed_samples == n_samples:
-                        logger.info(f"Loaded {completed_samples:,}/{n_samples:,} samples")
-                except Exception as e:
-                    shard_idx = futures[future]
-                    logger.error(f"Error loading shard {shard_idx}: {e}")
-                    raise
+            self.ram_globals = np.zeros(glb_shape, dtype=np.float32)
         
         # Create index mapping
-        self.ram_index_map = {i: idx for i, idx in enumerate(self.indices)}
-        logger.info(f"Successfully loaded all {n_samples:,} samples into RAM")
+        self.ram_index_map = {}
+        
+        # Load all data
+        for idx, original_idx in enumerate(self.indices):
+            shard_idx = original_idx // self.shard_size
+            within_shard_idx = original_idx % self.shard_size
+            
+            # Load shard if not already loaded
+            shard_name = f"shard_{shard_idx:06d}.npy"
+            seq_data = np.load(self.dir_path / "sequence_inputs" / shard_name)
+            tgt_data = np.load(self.dir_path / "targets" / shard_name)
+            
+            self.ram_sequences[idx] = seq_data[within_shard_idx]
+            self.ram_targets[idx] = tgt_data[within_shard_idx]
+            
+            if self.has_globals:
+                glb_data = np.load(self.dir_path / "globals" / shard_name)
+                self.ram_globals[idx] = glb_data[within_shard_idx]
+            
+            self.ram_index_map[idx] = original_idx
+            
+            if (idx + 1) % 10000 == 0:
+                logger.info(f"Loaded {idx + 1}/{n_samples} samples into RAM")
     
     def _setup_disk_cache(self) -> None:
         """Setup disk caching with proper memory mapping."""
@@ -1388,35 +1300,16 @@ class AtmosphericDataset(Dataset):
         
         self._shard_cache = {}
         self._mmap_cache = {} 
-        
-        # Increase cache size for A100
-        if torch.cuda.is_available() and "A100" in torch.cuda.get_device_name(0):
-            self._cache_size = min(len(self.seq_shards), 500)
-        else:
-            self._cache_size = min(len(self.seq_shards), 200)
-            
+        self._cache_size = min(len(self.seq_shards), 200)
         self._cache_order = []
         
-        # Pre-load shards in parallel
+        # Pre-load first N shards
+        logger.info(f"Pre-loading up to {self._cache_size} shards into cache...")
         unique_shard_indices = sorted(set(idx[1] for idx in self.effective_indices))
-        shards_to_preload = unique_shard_indices[:self._cache_size]
-        
-        if shards_to_preload:
-            logger.info(f"Pre-loading {len(shards_to_preload)} shards into cache...")
-            
-            # Use parallel loading for initial cache population
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                futures = [
-                    executor.submit(self._load_shard, shard_idx) 
-                    for shard_idx in shards_to_preload
-                ]
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    try:
-                        future.result()
-                        if (i + 1) % 50 == 0:
-                            logger.info(f"Pre-loaded {i + 1}/{len(shards_to_preload)} shards")
-                    except Exception as e:
-                        logger.error(f"Error pre-loading shard: {e}")
+        for i, shard_idx in enumerate(unique_shard_indices[:self._cache_size]):
+            self._load_shard(shard_idx)
+            if (i + 1) % 20 == 0:
+                logger.info(f"Pre-loaded {i + 1} shards")
 
     def _load_shard(self, shard_idx: int) -> Dict[str, np.ndarray]:
         """Load a shard with proper memory mapping for efficient disk access."""
@@ -2599,24 +2492,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_EPSILON = 1e-9
 DEFAULT_QUANTILE_MEMORY_LIMIT = 1_000_000
 DEFAULT_SYMLOG_PERCENTILE = 0.5
+STATS_CHUNK_SIZE = 8192
 NORMALIZED_VALUE_CLAMP = 50.0
-
-
-def _get_optimal_chunk_size(device: torch.device) -> int:
-    """Determine optimal chunk size based on available hardware."""
-    if device.type == "cuda":
-        # Get GPU memory
-        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        
-        if gpu_memory_gb >= 80:  # A100 80GB
-            return 131072  # 128k samples
-        elif gpu_memory_gb >= 40:  # A100 40GB or A40
-            return 65536   # 64k samples
-        elif gpu_memory_gb >= 32:  # V100 32GB
-            return 32768   # 32k samples
-        else:
-            return 16384   # 16k samples
-    return 8192  # Default for CPU
 
 
 class DataNormalizer:
@@ -2641,9 +2518,7 @@ class DataNormalizer:
         self.eps = float(self.norm_config.get("epsilon", DEFAULT_EPSILON))
         self.keys_to_process, self.key_methods = self._get_keys_and_methods()
         self._approximated_quantile_keys = set()
-        # Set optimal chunk size based on hardware
-        self.stats_chunk_size = _get_optimal_chunk_size(self.device)
-        logger.info(f"DataNormalizer initialized on device '{self.device}' with chunk size {self.stats_chunk_size:,}.")
+        logger.info(f"DataNormalizer initialized on device '{self.device}'.")
 
     def _get_keys_and_methods(self) -> Tuple[Set[str], Dict[str, str]]:
         spec = self.config.get("data_specification", {})
@@ -2667,7 +2542,7 @@ class DataNormalizer:
         self, raw_hdf5_paths: List[Path], train_indices: List[Tuple[str, int]]
     ) -> Dict[str, Any]:
         logger.info(
-            f"Starting statistics calculation from {len(train_indices):,} training samples..."
+            f"Starting statistics calculation from {len(train_indices)} training samples..."
         )
         start_time = time.time()
 
@@ -2698,56 +2573,42 @@ class DataNormalizer:
         }
 
         grouped_indices = self._group_indices_by_file(train_indices)
-        
-        # Single progress bar for all samples
-        total_samples_to_process = len(train_indices)
-        samples_processed = 0
-        
-        with tqdm(total=total_samples_to_process, 
-                  desc="Calculating statistics", 
-                  unit="samples",
-                  unit_scale=True) as overall_pbar:
-            
-            for file_stem, indices in grouped_indices.items():
-                if file_stem not in file_map:
-                    logger.warning(f"Skipping unknown file stem '{file_stem}' in indices.")
-                    overall_pbar.update(len(indices))
-                    continue
+        for file_stem, indices in grouped_indices.items():
+            if file_stem not in file_map:
+                logger.warning(f"Skipping unknown file stem '{file_stem}' in indices.")
+                continue
 
-                h5_path = file_map[file_stem]
-                # Open with optimized cache settings for better performance
-                with h5py.File(h5_path, "r", swmr=True, libver="latest",
-                               rdcc_nbytes=1024*1024*1024,  # 1GB chunk cache
-                               rdcc_nslots=100003) as hf:  # Prime number for better hash distribution
-                    
-                    for i in range(0, len(indices), self.stats_chunk_size):
-                        chunk_indices = indices[i : i + self.stats_chunk_size]
+            h5_path = file_map[file_stem]
+            with h5py.File(h5_path, "r", swmr=True, libver="latest") as hf:
+                num_chunks = (len(indices) + STATS_CHUNK_SIZE - 1) // STATS_CHUNK_SIZE
 
-                        # Sort indices for efficient h5py reading
-                        chunk_indices_np = np.array(chunk_indices)
-                        sorter = np.argsort(chunk_indices_np)
-                        sorted_indices = chunk_indices_np[sorter].tolist()
+                for i in tqdm(
+                    range(0, len(indices), STATS_CHUNK_SIZE),
+                    desc=f"Stats for {file_stem}",
+                    total=num_chunks,
+                    leave=False,
+                ):
+                    chunk_indices = indices[i : i + STATS_CHUNK_SIZE]
 
-                        batch_of_tensors = {}
-                        for key in keys_to_load:
-                            if key in hf:
-                                data_chunk_np = hf[key][sorted_indices]
-                                # For stats calculation, order doesn't matter
-                                batch_of_tensors[key] = torch.from_numpy(data_chunk_np).to(
-                                    device=self.device, dtype=DTYPE
-                                )
+                    # Sort indices for efficient h5py reading
+                    chunk_indices_np = np.array(chunk_indices)
+                    sorter = np.argsort(chunk_indices_np)
+                    sorted_indices = chunk_indices_np[sorter].tolist()
 
-                        self._update_accumulators_with_batch(
-                            batch_of_tensors, accumulators, dataset_metadata
-                        )
-                        
-                        # Update progress bar
-                        overall_pbar.update(len(chunk_indices))
-                        samples_processed += len(chunk_indices)
+                    batch_of_tensors = {}
+                    for key in keys_to_load:
+                        if key in hf:
+                            data_chunk_np = hf[key][sorted_indices]
+                            # For stats calculation, order doesn't matter
+                            batch_of_tensors[key] = torch.from_numpy(data_chunk_np).to(
+                                device=self.device, dtype=DTYPE
+                            )
 
-        logger.info(
-            f"Finished statistics calculation in {time.time() - start_time:.2f}s."
-        )
+                    self._update_accumulators_with_batch(
+                        batch_of_tensors, accumulators, dataset_metadata
+                    )
+
+        logger.info(f"Finished statistics calculation in {time.time() - start_time:.2f}s.")
 
         computed_stats = self._finalize_stats(accumulators)
         if not computed_stats:
@@ -2834,11 +2695,6 @@ class DataNormalizer:
         memory_limit = self.norm_config.get(
             "quantile_max_values_in_memory", DEFAULT_QUANTILE_MEMORY_LIMIT
         )
-        
-        # For A100, increase memory limit
-        if self.device.type == "cuda" and "A100" in torch.cuda.get_device_name(0):
-            memory_limit = memory_limit * 10  # 10x more for A100
-            
         for key, data_batch in batch.items():
             if key not in accumulators:
                 continue
@@ -2971,11 +2827,6 @@ class DataNormalizer:
         """Compute quantile-based statistics with improved numerical stability."""
         stats: Dict[str, float] = {}
 
-        # For very large tensors on A100, use chunked computation
-        if values.numel() > 10_000_000 and self.device.type == "cuda" and "A100" in torch.cuda.get_device_name(0):
-            logger.info(f"Using chunked quantile computation for '{key}' with {values.numel():,} values")
-            return self._compute_quantile_stats_chunked(values, key, method)
-
         def _robust_quantile(tensor: Tensor, q_values: Union[float, Tensor]) -> Tensor:
             try:
                 return torch.quantile(tensor, q_values)
@@ -2996,9 +2847,7 @@ class DataNormalizer:
                 raise e
 
         if method == "iqr":
-            q_tensor = torch.tensor(
-                [0.25, 0.5, 0.75], dtype=DTYPE, device=values.device
-            )
+            q_tensor = torch.tensor([0.25, 0.5, 0.75], dtype=DTYPE, device=values.device)
             q_vals = _robust_quantile(values, q_tensor)
             q1, med, q3 = q_vals[0].item(), q_vals[1].item(), q_vals[2].item()
             iqr = max(q3 - q1, self.eps)
@@ -3014,64 +2863,19 @@ class DataNormalizer:
                 "symlog_percentile", DEFAULT_SYMLOG_PERCENTILE
             )
             thr = _robust_quantile(torch.abs(values), percentile).item()
-            # FIX: Ensure threshold is sufficiently large for numerical stability
-            thr = max(thr, self.eps * 100)  # Use 100*epsilon as minimum threshold
+            thr = max(thr, self.eps * 100)
             
             abs_v = torch.abs(values)
             mask = abs_v > thr
             transformed = torch.zeros_like(values)
             
             # Safe division with larger threshold ensures numerical stability
-            transformed[mask] = torch.sign(values[mask]) * (
-                torch.log10(abs_v[mask] / thr) + 1
-            )
+            transformed[mask] = torch.sign(values[mask]) * (torch.log10(abs_v[mask] / thr) + 1)
             transformed[~mask] = values[~mask] / thr
 
             sf = transformed.abs().max().item() if transformed.numel() > 0 else 1.0
             stats.update({"threshold": thr, "scale_factor": max(sf, 1.0)})
 
-        return stats
-
-    def _compute_quantile_stats_chunked(self, values: Tensor, key: str, method: str) -> dict:
-        """Compute quantile statistics in chunks for very large arrays."""
-        stats: Dict[str, float] = {}
-        chunk_size = 5_000_000
-        
-        if method == "iqr":
-            # Compute quantiles in chunks and aggregate
-            q_values = []
-            for i in range(0, values.numel(), chunk_size):
-                chunk = values.flatten()[i:i+chunk_size]
-                q_tensor = torch.tensor([0.25, 0.5, 0.75], dtype=DTYPE, device=values.device)
-                q_vals = torch.quantile(chunk, q_tensor)
-                q_values.append(q_vals)
-            
-            # Aggregate results
-            all_q = torch.stack(q_values)
-            q1 = torch.quantile(all_q[:, 0], 0.5).item()
-            med = torch.quantile(all_q[:, 1], 0.5).item()
-            q3 = torch.quantile(all_q[:, 2], 0.5).item()
-            iqr = max(q3 - q1, self.eps)
-            stats.update({"median": med, "iqr": iqr})
-            
-        elif method == "log-min-max":
-            # Process min/max in chunks
-            min_vals = []
-            max_vals = []
-            for i in range(0, values.numel(), chunk_size):
-                chunk = values.flatten()[i:i+chunk_size]
-                log_chunk = torch.log10(torch.clamp(chunk, min=self.eps))
-                min_vals.append(log_chunk.min())
-                max_vals.append(log_chunk.max())
-            
-            min_v = torch.stack(min_vals).min().item()
-            max_v = torch.stack(max_vals).max().item()
-            stats.update({"min": min_v, "max": max(max_v, min_v + self.eps)})
-            
-        elif method == "symlog":
-            # Use fallback to regular computation for symlog
-            return self._compute_quantile_stats(values[:chunk_size], key, method)
-            
         return stats
 
     @staticmethod
@@ -3266,6 +3070,7 @@ class DataNormalizer:
 
 
 __all__ = ["DataNormalizer"]
+
 
 ===== /Users/imalsky/Desktop/Problemulator/src/main.py =====
 #!/usr/bin/env python3

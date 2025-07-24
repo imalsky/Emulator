@@ -2446,3 +2446,50 @@ Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especiall
 2025-07-23 15:45:06,051 | INFO     | train - Using ReduceLROnPlateau scheduler.
 2025-07-23 15:45:06,051 | INFO     | train - Effective batch size: 512 (accumulation: 1)
 2025-07-23 15:45:06,090 | INFO     | train - Training for 100 epochs.
+2025-07-23 18:20:41,090 | INFO     | utils - Loading dataset splits from: data/dataset_splits.json
+2025-07-23 18:20:41,090 | INFO     | utils - Could not load splits file. Reason: Splits file not found: data/dataset_splits.json. Generating new splits.
+2025-07-23 18:20:41,090 | INFO     | utils - Generating new dataset splits...
+2025-07-23 18:20:41,155 | INFO     | utils - Generated splits from 200000 profiles across 2 files: train=140000 (70.0%), val=30000 (15.0%), test=30000 (15.0%)
+2025-07-23 18:20:41,378 | INFO     | utils - Saved generated splits to models/trained_model/splits_generated.json
+2025-07-23 18:20:41,379 | INFO     | preprocess - Processed data is up-to-date based on configuration hash. Skipping preprocessing.
+2025-07-23 18:20:41,607 | INFO     | dataset - Creating dataset from data/processed/train...
+2025-07-23 18:20:41,621 | INFO     | dataset - Memory estimate: 0.54 GB needed, 15.24 GB safely available
+2025-07-23 18:20:41,621 | INFO     | dataset - Loading entire dataset into RAM...
+2025-07-23 18:20:51,175 | INFO     | dataset - Loaded 10000/140000 samples into RAM
+2025-07-23 18:20:59,812 | INFO     | dataset - Loaded 20000/140000 samples into RAM
+2025-07-23 18:21:08,755 | INFO     | dataset - Loaded 30000/140000 samples into RAM
+2025-07-23 18:21:17,446 | INFO     | dataset - Loaded 40000/140000 samples into RAM
+2025-07-23 18:21:26,171 | INFO     | dataset - Loaded 50000/140000 samples into RAM
+2025-07-23 18:21:34,392 | INFO     | dataset - Loaded 60000/140000 samples into RAM
+2025-07-23 18:21:42,255 | INFO     | dataset - Loaded 70000/140000 samples into RAM
+2025-07-23 18:21:50,380 | INFO     | dataset - Loaded 80000/140000 samples into RAM
+2025-07-23 18:21:58,334 | INFO     | dataset - Loaded 90000/140000 samples into RAM
+2025-07-23 18:22:06,530 | INFO     | dataset - Loaded 100000/140000 samples into RAM
+2025-07-23 18:22:16,477 | INFO     | dataset - Loaded 110000/140000 samples into RAM
+2025-07-23 18:22:26,272 | INFO     | dataset - Loaded 120000/140000 samples into RAM
+2025-07-23 18:22:35,548 | INFO     | dataset - Loaded 130000/140000 samples into RAM
+2025-07-23 18:22:44,187 | INFO     | dataset - Loaded 140000/140000 samples into RAM
+2025-07-23 18:22:44,187 | INFO     | dataset - AtmosphericDataset initialized: 140000 samples from data/processed/train (mode: RAM)
+2025-07-23 18:22:44,187 | INFO     | dataset - Creating dataset from data/processed/val...
+2025-07-23 18:22:44,193 | INFO     | dataset - Memory estimate: 0.11 GB needed, 14.52 GB safely available
+2025-07-23 18:22:44,193 | INFO     | dataset - Loading entire dataset into RAM...
+2025-07-23 18:22:52,440 | INFO     | dataset - Loaded 10000/30000 samples into RAM
+2025-07-23 18:23:00,842 | INFO     | dataset - Loaded 20000/30000 samples into RAM
+2025-07-23 18:23:09,597 | INFO     | dataset - Loaded 30000/30000 samples into RAM
+2025-07-23 18:23:09,597 | INFO     | dataset - AtmosphericDataset initialized: 30000 samples from data/processed/val (mode: RAM)
+2025-07-23 18:23:09,597 | INFO     | dataset - Creating dataset from data/processed/test...
+2025-07-23 18:23:09,613 | INFO     | dataset - Memory estimate: 0.11 GB needed, 14.55 GB safely available
+2025-07-23 18:23:09,614 | INFO     | dataset - Loading entire dataset into RAM...
+2025-07-23 18:23:19,376 | INFO     | dataset - Loaded 10000/30000 samples into RAM
+2025-07-23 18:23:29,168 | INFO     | dataset - Loaded 20000/30000 samples into RAM
+2025-07-23 18:23:38,810 | INFO     | dataset - Loaded 30000/30000 samples into RAM
+2025-07-23 18:23:38,810 | INFO     | dataset - AtmosphericDataset initialized: 30000 samples from data/processed/test (mode: RAM)
+2025-07-23 18:23:38,810 | INFO     | train - Datasets ready – train:140,000  val:30,000  test:30,000
+2025-07-23 18:23:38,810 | INFO     | train - Using DevicePrefetchLoader for MPS transfers
+2025-07-23 18:23:38,830 | INFO     | model - PredictionModel created with 2,440,962 trainable parameters. Architecture: d_model=256, nhead=4, layers=3
+2025-07-23 18:23:38,851 | INFO     | model - torch.compile is only enabled for CUDA devices.
+2025-07-23 18:23:38,851 | INFO     | model - Model moved to device: mps
+2025-07-23 18:23:39,466 | INFO     | train - Optimizer: adamw  lr=1.00e-04  wd=1.00e-05
+2025-07-23 18:23:39,467 | INFO     | train - Using ReduceLROnPlateau scheduler.
+2025-07-23 18:23:39,467 | INFO     | train - Effective batch size: 512 (accumulation: 1)
+2025-07-23 18:23:39,505 | INFO     | train - Training for 100 epochs.
