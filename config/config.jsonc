@@ -8,11 +8,11 @@
   "random_seed": 42,                         // int ≥ 0
   // Data‑loader worker processes (0 = main thread).
   // FIX: Increased for A100
-  "num_workers": 4,                         // int ≥ 0
+  "num_workers": 8,                         // int ≥ 0
   // Turn on PyTorch's anomaly detection (debug only; slows training).
   "detect_anomaly": false,                   // bool
   // Number of samples per NPY shard in processed data.
-  "shard_size": 2048,                        // int ≥ 1
+  "shard_size": 4096,                        // int ≥ 1
   // Enable torch.compile for model optimization (requires PyTorch 2.0+)
   // FIX: Disabled by default due to overhead
   "torch_compile": true,                    // bool
@@ -30,7 +30,7 @@
   // Multiple files supported; order doesn't matter.
   "hdf5_dataset_filename": [
     "picaso_results_1.h5",
-    "picaso_results_2.h5",
+    //"picaso_results_2.h5",
     //"picaso_results_3.h5",
     //"picaso_results_4.h5",
     //"picaso_results_5.h5",
@@ -123,7 +123,7 @@
 // ════════════════════════════════════════════════════════════════
 "training_hyperparameters": {
   // Epoch budget.
-  "epochs": 100,                             // int ≥ 1
+  "epochs": 200,                             // int ≥ 1
   // Mini‑batch size per GPU.
   // FIX: Increased for A100
   "batch_size": 512,                         // int ≥ 1
@@ -141,14 +141,14 @@
   // ─── Scheduler settings ──────────────────────────────────────
   // "reduce_on_plateau"  → ReduceLROnPlateau
   // "cosine"             → CosineAnnealingLR (+ optional warm‑up)
-  "scheduler_type": "reduce_on_plateau",
+  "scheduler_type": "cosine",
 
   // Parameters used **only** for ReduceLROnPlateau
   "lr_patience": 3,                          // epochs without improvement
   "lr_factor": 0.5,                          // new_lr = old_lr * factor
 
   // Parameters used **only** for CosineAnnealingLR
-  "warmup_epochs": 0,                        // linear warm‑up before cosine
+  "warmup_epochs": 5,                        // linear warm‑up before cosine
 
   // Minimum LR clamp for either scheduler.
   "min_lr": 1e-8,
