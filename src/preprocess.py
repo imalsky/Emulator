@@ -20,7 +20,8 @@ import torch
 from tqdm import tqdm
 
 from normalizer import DataNormalizer
-from utils import compute_data_hash, ensure_dirs, save_json
+from utils import compute_data_hash_with_stats, ensure_dirs, save_json
+
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,7 @@ def _save_preprocessing_summary(
         logger.error(f"Could not write preprocessing summary: {e}")
 
 
+# Replace the existing preprocess_data function with this updated version:
 def preprocess_data(
     config: Dict[str, Any],
     raw_hdf5_paths: List[Path],
@@ -181,7 +183,8 @@ def preprocess_data(
     
     max_seq_len = config["model_hyperparameters"]["max_sequence_length"]
     
-    current_hash = compute_data_hash(config, raw_hdf5_paths)
+    # Compute hash including file modification times and sizes
+    current_hash = compute_data_hash_with_stats(config, raw_hdf5_paths)
     hash_path = processed_dir / "data_hash.txt"
     metadata_path = processed_dir / "normalization_metadata.json"
 
@@ -198,12 +201,13 @@ def preprocess_data(
         and metadata_path.exists()
     ):
         logger.info(
-            "Processed data is up-to-date based on configuration hash. Skipping preprocessing."
+            "Processed data is up-to-date based on configuration and file stats. "
+            "Skipping preprocessing."
         )
         return True
 
     logger.info(
-        "Configuration has changed or processed data not found. Starting preprocessing..."
+        "Configuration or source files have changed. Starting preprocessing..."
     )
     preprocessing_start_time = time.time()
 
@@ -416,6 +420,8 @@ def preprocess_data(
                             )
                             num_samples_in_buffer -= shard_size
 
+
+        """
         if num_samples_in_buffer > 0:
             final_seq = np.concatenate(shard_buffers["sequence_inputs"], axis=0)
             final_tgt = np.concatenate(shard_buffers["targets"], axis=0)
@@ -443,6 +449,24 @@ def preprocess_data(
                 final_buffers["globals"] = [final_glb]
 
             _save_shard(final_buffers, seq_dir, tgt_dir, glb_dir, current_shard_idx)
+            """
+
+
+        # If there are any remaining samples in the buffers, save them to a final shard.
+        # This final shard may be smaller than the standard shard_size. No padding is applied.
+        if num_samples_in_buffer > 0:
+            logger.info(
+                f"Saving final shard for '{split_name}' with {num_samples_in_buffer} samples."
+            )
+            # The buffers are already lists of numpy arrays. _save_shard will concatenate them.
+            # We can pass the buffers directly.
+            _save_shard(
+                shard_buffers, 
+                seq_dir, 
+                tgt_dir, 
+                glb_dir, 
+                current_shard_idx
+            )
 
         logger.info(
             f"Completed {split_name} split in {time.time() - split_start_time:.2f}s."
@@ -455,6 +479,5 @@ def preprocess_data(
     total_time = time.time() - preprocessing_start_time
     logger.info(f"Preprocessing completed successfully in {total_time:.2f}s.")
     return True
-
 
 __all__ = ["preprocess_data"]

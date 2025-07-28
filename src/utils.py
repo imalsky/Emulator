@@ -342,10 +342,44 @@ def compute_data_hash(config: Dict[str, Any], raw_hdf5_paths: List[Path]) -> str
 
     return hasher.hexdigest()
 
+def compute_data_hash_with_stats(config: Dict[str, Any], raw_hdf5_paths: List[Path]) -> str:
+    """
+    Compute hash including file modification times and sizes for better integrity checking.
+    
+    This is more robust than compute_data_hash as it will detect if files are modified
+    in-place, not just if their paths change.
+    
+    Args:
+        config: Configuration dictionary
+        raw_hdf5_paths: List of HDF5 file paths
+        
+    Returns:
+        Hexadecimal hash string
+    """
+    hasher = hashlib.new(HASH_ALGORITHM)
+    
+    # Hash the config
+    hasher.update(json.dumps(config, sort_keys=True).encode(UTF8_ENCODING))
+    
+    # Hash file paths, sizes, and modification times
+    for path in sorted(raw_hdf5_paths):
+        hasher.update(str(path).encode(UTF8_ENCODING))
+        if path.is_file():
+            stat = path.stat()
+            # Include file size
+            hasher.update(str(stat.st_size).encode(UTF8_ENCODING))
+            # Include modification time (nanoseconds for precision)
+            hasher.update(str(stat.st_mtime_ns).encode(UTF8_ENCODING))
+        else:
+            # Mark missing files explicitly
+            hasher.update(b"missing")
+    
+    return hasher.hexdigest()
 
+# Also update the __all__ export list to include the new function:
 __all__ = [
     "DTYPE",
-    "PADDING_VALUE",
+    "PADDING_VALUE", 
     "LOG_FORMAT",
     "DEFAULT_SEED",
     "METADATA_FILENAME",
@@ -359,4 +393,5 @@ __all__ = [
     "get_config_str",
     "load_or_generate_splits",
     "compute_data_hash",
+    "compute_data_hash_with_stats",  # Add this
 ]

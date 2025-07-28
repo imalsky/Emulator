@@ -115,18 +115,20 @@ class AtmosphericDataset(Dataset):
             f"{safe_available_gb:.2f} GB safely available"
         )
         
-        # Decide loading strategy
-        if not self.force_disk_loading and total_gb_needed < safe_available_gb:
+        # Decide loading strategy - respect force_disk_loading parameter
+        if self.force_disk_loading:
+            logger.info("Force disk loading enabled - using disk cache mode")
+            self._setup_disk_cache()
+            self.ram_mode = False
+        elif total_gb_needed < safe_available_gb:
             logger.info("Loading entire dataset into RAM...")
             self._load_all_to_ram()
             self.ram_mode = True
         else:
-            if total_gb_needed >= safe_available_gb:
-                logger.warning(
-                    f"Dataset too large for RAM ({total_gb_needed:.2f} GB > "
-                    f"{safe_available_gb:.2f} GB available). Using disk cache mode."
-                )
-            logger.info("Using disk cache mode with aggressive caching...")
+            logger.warning(
+                f"Dataset too large for RAM ({total_gb_needed:.2f} GB > "
+                f"{safe_available_gb:.2f} GB available). Using disk cache mode."
+            )
             self._setup_disk_cache()
             self.ram_mode = False
     

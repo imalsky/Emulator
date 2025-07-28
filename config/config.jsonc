@@ -7,14 +7,12 @@
   // Reproducibility seed for Python, NumPy, Torch, etc.
   "random_seed": 42,                         // int ≥ 0
   // Data‑loader worker processes (0 = main thread).
-  // FIX: Increased for A100
   "num_workers": 8,                         // int ≥ 0
   // Turn on PyTorch's anomaly detection (debug only; slows training).
   "detect_anomaly": false,                   // bool
   // Number of samples per NPY shard in processed data.
   "shard_size": 4096,                        // int ≥ 1
   // Enable torch.compile for model optimization (requires PyTorch 2.0+)
-  // FIX: Disabled by default due to overhead
   "torch_compile": true,                    // bool
   // Compile mode if torch_compile is enabled
   "compile_mode": "default",         // "default", "reduce-overhead", "max-autotune"
@@ -125,7 +123,6 @@
   // Epoch budget.
   "epochs": 200,                             // int ≥ 1
   // Mini‑batch size per GPU.
-  // FIX: Increased for A100
   "batch_size": 512,                         // int ≥ 1
   // Initial learning rate.
   "learning_rate": 1e-4,                     // float > 0
@@ -158,7 +155,6 @@
   "min_delta": 1e-8,                         // significant improvement
 
   // ─── Mixed precision & dataset frac ───────────────────────────
-  // FIX: Enable AMP for A100
   "use_amp": true,                           // Automatic Mixed Precision
   // If you need a quick run on small subset.
   "dataset_fraction_to_use": 1.0,            // 0‑1 float
@@ -196,7 +192,6 @@
   "weight_decay": { "low": 1e-6, "high": 1e-4, "log": true },
 
   // Batch sizes to try.
-  // FIX: Increased for A100
   "batch_size": [128, 256, 512]
 }
 }

@@ -430,14 +430,16 @@ def export_model(
 
     # Always export from CPU to avoid device-specific issues
     original_device = next(model.parameters()).device
-    model = model.to('cpu')
-
+    
     # Unwrap torch.compile wrapper if present
     if hasattr(model, "_orig_mod"):
         logger.info("Extracting original model from compiled wrapper")
         model = model._orig_mod
+    
+    # Move model to CPU first
+    model = model.to('cpu')
 
-    # Move example inputs to CPU
+    # Then move example inputs to CPU
     sequence = example_input["sequence"].to('cpu')
     global_features = example_input.get("global_features")
     if global_features is not None:
@@ -534,8 +536,9 @@ def export_model(
             logger.error(f"Fallback export also failed: {fallback_exc}")
     
     finally:
-        # Restore model to original device
-        model.to(original_device)
+        # Model is already on CPU, so just restore to original device if needed
+        if original_device.type != 'cpu':
+            model.to(original_device)
 
 
 __all__ = ["PredictionModel", "create_prediction_model", "export_model"]
