@@ -105,8 +105,19 @@ class FiLMLayer(nn.Module):
         nn.init.xavier_uniform_(self.projection.weight, gain=0.1)
         nn.init.zeros_(self.projection.bias)
         
-        # Store clamp value as Python float for dtype flexibility
-        self.clamp_gamma = clamp_gamma if clamp_gamma is not None else float('inf')
+        # Register clamp value as a buffer for proper export
+        if clamp_gamma is not None:
+            self.register_buffer(
+                'clamp_gamma', 
+                torch.tensor(clamp_gamma, dtype=torch.float32),
+                persistent=False
+            )
+        else:
+            self.register_buffer(
+                'clamp_gamma', 
+                torch.tensor(float('inf'), dtype=torch.float32),
+                persistent=False
+            )
     
     def forward(self, features: Tensor, context: Tensor) -> Tensor:
         """
@@ -123,11 +134,11 @@ class FiLMLayer(nn.Module):
         gamma_beta = self.projection(context)
         delta_gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
         
-        # Apply clamping with correct dtype
-        if self.clamp_gamma != float('inf'):
-            clamp_val = torch.tensor(self.clamp_gamma, dtype=features.dtype, device=features.device)
-            delta_gamma = torch.clamp(delta_gamma, -clamp_val, clamp_val)
-            beta = torch.clamp(beta, -clamp_val, clamp_val)
+        # Always apply clamping (when clamp_gamma is inf, this has no effect)
+        # This avoids data-dependent conditionals for torch.export compatibility
+        clamp_val = self.clamp_gamma.to(features.dtype)
+        delta_gamma = torch.clamp(delta_gamma, -clamp_val, clamp_val)
+        beta = torch.clamp(beta, -clamp_val, clamp_val)
         
         # Expand for sequence dimension
         delta_gamma = delta_gamma.unsqueeze(1)
@@ -743,7 +754,7 @@ def export_model(
                 max_diff = torch.max(torch.abs(original_output - exported_output)).item()
                 logger.warning(f"Maximum difference: {max_diff}")
             else:
-                logger.info("✓ Exported model validation passed")
+                logger.info("Exported model validation passed")
                 
     except Exception as exc:
         logger.error(f"Model export failed: {exc}", exc_info=True)

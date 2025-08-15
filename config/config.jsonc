@@ -28,14 +28,14 @@
   "detect_anomaly": false,                   // bool
   
   // Number of samples per NPY shard in processed data.
-  "shard_size": 4096,                        // int ≥ 1
+  "shard_size": 50000,                        // int ≥ 1
   
   // Enable torch.compile for model optimization (requires PyTorch 2.0+)
   "torch_compile": true,                     // bool
   
   // Compile mode if torch_compile is enabled
   // CHANGED: max-autotune for best performance on modern GPUs
-  "compile_mode": "max-autotune",            // "default", "reduce-overhead", "max-autotune"
+  "compile_mode": "default",            // "default", "reduce-overhead", "max-autotune"
   
   // Enable torch.export for model export
   "torch_export": true                       // bool
@@ -134,7 +134,7 @@
 
   // Percentile that defines linear→log switch in symlog.
   // CHANGED: Increased for better handling of near-zero values
-  "symlog_percentile": 0.5                  // 0 ≤ float ≤ 1
+  "symlog_percentile": 0.25                  // 0 ≤ float ≤ 1
 },
 
 // ════════════════════════════════════════════════════════════════
@@ -143,27 +143,27 @@
 "model_hyperparameters": {
   // Hidden dimension of transformer embeddings.
   // CHANGED: Increased from 256 to 512 for better capacity
-  "d_model": 512,                            // int, power of 2 recommended
+  "d_model": 256,                            // int, power of 2 recommended
   
   // Attention heads (must divide d_model exactly).
   // CHANGED: Increased to 8 (512/8 = 64 dims per head, standard)
-  "nhead": 8,                                // int
+  "nhead": 4,                                // int
   
   // Number of transformer encoder layers.
   // CHANGED: Increased from 3 to 6 for deeper model
-  "num_encoder_layers": 6,                   // int
+  "num_encoder_layers": 4,                   // int
   
   // FFN inner dimension (typically 4×d_model).
   // CHANGED: Set to 4×d_model (2048) following transformer standard
-  "dim_feedforward": 2048,                   // int
+  "dim_feedforward": 1024,                   // int
   
   // Dropout applied inside encoder & projection layers.
   // CHANGED: Set to 0.1 for regularization (0.0 can overfit)
-  "dropout": 0.1,                            // 0-1 float
+  "dropout": 0.00,                            // 0-1 float
   
   // NEW: Separate dropout for attention layers
   // Often beneficial to have different dropout for attention
-  "attention_dropout": 0.1,                  // 0-1 float
+  "attention_dropout": 0.0,                  // 0-1 float
   
   // NEW: FiLM layer clamping value
   // Controls how much global features can modulate the model
@@ -172,7 +172,7 @@
   // Maximum sequence length your data can reach.
   // Sequences longer than this will be truncated.
   // Sequences shorter than this will be right-padded.
-  "max_sequence_length": 256                 // int ≥ max observed seq len
+  "max_sequence_length": 75                 // int ≥ max observed seq len
 },
 
 // ════════════════════════════════════════════════════════════════
@@ -225,7 +225,7 @@
   // CHANGED: Increased patience for better convergence
   "early_stopping_patience": 30,             // epochs without improvement
   // CHANGED: More sensitive to improvements
-  "min_delta": 1e-6,                         // minimum improvement threshold
+  "min_delta": 1e-7,                         // minimum improvement threshold
 
   // ─── Mixed Precision & Data Fraction ─────────────────────────
   "use_amp": true,                           // Automatic Mixed Precision (faster on modern GPUs)

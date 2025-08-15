@@ -1,24 +1,16 @@
 #!/bin/bash
-#SBATCH -J ChemulatorJob                # Job name
-#SBATCH -o ChemulatorJob.o%j            # Standard output file
-#SBATCH -e ChemulatorJob.e%j            # Standard error file
-#SBATCH -p gpu                          # Specify the GPU partition
-
-
-####SBATCH --clusters=edge                 # Target the edge nodes
-###SBATCH -N 1                            # Request a single node
-####SBATCH -n 1                            # Run a single task
-####SBATCH --gpus=1                        # Request one full GPU
-####SBATCH --cpus-per-task=16              # Request 32 CPU cores
-#####SBATCH --mem=40G                      # Request 100 GB of CPU RAM
+#SBATCH -J Transformer
+#SBATCH -o Transformer.o%j
+#SBATCH -e Transformer.e%j
+#SBATCH -p gpu
+#SBATCH --clusters=edge
+#SBATCH -N 1
+#SBATCH -n 1
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=40G
 #SBATCH -A exoweather
-
-
-#SBATCH -p gpu-mig
-#SBATCH --gres=gpu:2g.20gb:1
-
-
-#SBATCH -t 1:00:00                     # Set a 24-hour runtime limit
+#SBATCH -t 24:00:00
 
 cd "$SLURM_SUBMIT_DIR"
 
@@ -27,30 +19,24 @@ CONDA_EXE=$(command -v conda)
 if [ -z "$CONDA_EXE" ]; then
     echo "Error: Conda executable not found. Exiting." >&2; exit 1;
 fi
+
 CONDA_BASE=$(dirname $(dirname "$CONDA_EXE"))
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate nn || { echo "Error: Failed to activate Conda environment 'nn'." >&2; exit 1; }
 
-# Load CUDA module
-module load cuda/11.8 2>/dev/null || echo "Warning: Failed to load CUDA module."
+# Try to load any available CUDA module
+echo "Looking for available CUDA modules..."
+module avail cuda 2>&1 | grep -i cuda || echo "No CUDA modules found via module system"
 
-# --- Print Job Configuration to Log File ---
-echo "------------------------------------------------"
-echo "JOB CONFIGURATION"
-echo "SLURM Job ID: $SLURM_JOB_ID"
-echo "CPU cores requested: $SLURM_CPUS_PER_TASK"
-nvidia-smi
-echo "------------------------------------------------"
+# Try different common CUDA versions
+for cuda_version in cuda/12.7 cuda/12.6 cuda/12.5 cuda/12.4 cuda/12.0 cuda/11.8 cuda/11.7 cuda; do
+    if module load "$cuda_version" 2>/dev/null; then
+        echo "Successfully loaded $cuda_version"
+        break
+    fi
+done
 
-# --- Run the Application ---
+echo "------------------------------------------------"
 echo "Starting Python application..."
-# Preprocess data
-###python main.py normalize --config config/config.jsonc
-
-# Train model
-###python main.py train --config config/config.jsonc
-
-# Hyperparameter tuning
-###python main.py tune --config config/config.jsonc --num-trials 50
-
+python -u src/main.py train 2>&1
 echo "Job completed successfully."
