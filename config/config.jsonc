@@ -1,21 +1,39 @@
 {
 // ════════════════════════════════════════════════════════════════
+// ║           ATMOSPHERIC PROFILE TRANSFORMER CONFIG             ║
+// ║                                                              ║
+// ║  PADDING & MASKING CONVENTION:                              ║
+// ║  - Padding value: -9999.0 (unlikely in atmospheric data)    ║
+// ║  - Mask convention: True = padding, False = valid           ║
+// ║  - Follows PyTorch's key_padding_mask standard              ║
+// ║  - Sequences are right-padded (padding at the end)          ║
+// ║  - Loss computation excludes padding positions              ║
+// ║  - Model outputs are NOT overwritten (industry standard)    ║
+// ════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════
 // ║                1.  GENERAL / MISCELLANEOUS                   ║
 // ════════════════════════════════════════════════════════════════
 // Settings that affect the whole pipeline.
 "miscellaneous_settings": {
   // Reproducibility seed for Python, NumPy, Torch, etc.
   "random_seed": 42,                         // int ≥ 0
-  // Data‑loader worker processes (0 = main thread).
-  "num_workers": 8,                         // int ≥ 0
+  
+  // Data-loader worker processes (0 = main thread).
+  "num_workers": 8,                          // int ≥ 0
+  
   // Turn on PyTorch's anomaly detection (debug only; slows training).
   "detect_anomaly": false,                   // bool
+  
   // Number of samples per NPY shard in processed data.
   "shard_size": 4096,                        // int ≥ 1
+  
   // Enable torch.compile for model optimization (requires PyTorch 2.0+)
-  "torch_compile": true,                    // bool
+  "torch_compile": true,                     // bool
+  
   // Compile mode if torch_compile is enabled
-  "compile_mode": "default",         // "default", "reduce-overhead", "max-autotune"
+  "compile_mode": "default",                 // "default", "reduce-overhead", "max-autotune"
+  
   // Enable torch.export for model export
   "torch_export": true                       // bool
 },
@@ -27,7 +45,8 @@
   // HDF5 files sitting in data/raw/.
   // Multiple files supported; order doesn't matter.
   "hdf5_dataset_filename": [
-    "picaso_results_1.h5",
+    "picaso_results_1.h5"
+    // Uncomment to add more files:
     //"picaso_results_2.h5",
     //"picaso_results_3.h5",
     //"picaso_results_4.h5",
@@ -39,8 +58,8 @@
     //"picaso_results_10.h5"
   ],
 
-  // Optional pre‑made JSON of train/val/test indices.
-  // If missing, code auto‑generates new splits.
+  // Optional pre-made JSON of train/val/test indices.
+  // If missing, code auto-generates new splits.
   "dataset_splits_filename": "dataset_splits.json"
 },
 
@@ -48,53 +67,69 @@
 // ║                 3.  DATA SPECIFICATION                       ║
 // ════════════════════════════════════════════════════════════════
 "data_specification": {
-  // Per‑layer sequence inputs (T×features).
+  // Per-layer sequence inputs (T×features).
+  // These are the atmospheric profile features at each altitude level.
   "input_variables": [
-    "pressure_bar",
-    "temperature_k"
+    "pressure_bar",      // Atmospheric pressure in bars
+    "temperature_k"      // Temperature in Kelvin
   ],
 
-  // Optional per‑profile scalars (FiLM conditioning).
+  // Optional per-profile scalars (FiLM conditioning).
+  // These are global properties that modulate the entire profile.
   "global_variables": [
-    "orbital_distance_m"
+    "orbital_distance_m" // Distance from star in meters
   ],
 
   // Targets (the model predicts these).
+  // These are the quantities we want to predict from the inputs.
   "target_variables": [
-    "net_thermal_flux",
-    "net_reflected_flux"
+    "net_thermal_flux",   // Thermal radiation flux
+    "net_reflected_flux"  // Reflected radiation flux
   ],
 
-  // Pad value for variable‑length sequences; masked out in loss.
+  // Padding value for variable-length sequences.
+  // IMPORTANT: This value is used as a sentinel to identify padding positions.
+  // - Must be a value that never occurs naturally in your data
+  // - All features at a padded timestep will be set to this value
+  // - The loss function will automatically exclude these positions
+  // - Model outputs at padding positions are NOT overwritten (industry standard)
   "padding_value": -9999.0                  // float
 },
 
 // ════════════════════════════════════════════════════════════════
-// ║                 4.  NORMALISATION                            ║
+// ║                 4.  NORMALIZATION                            ║
 // ════════════════════════════════════════════════════════════════
 "normalization": {
-  // Per‑key method (falls back to default_method if unspecified).
-  // Supported: "standard", "log-standard", "symlog", "log-min-max",
-  // "iqr", "max-out", "signed-log", "scaled_signed_offset_log",
-  // "bool", "none".
+  // Per-key normalization method (falls back to default_method if unspecified).
+  // Methods available:
+  // - "standard": Zero mean, unit variance
+  // - "log-standard": Log transform then standardize
+  // - "symlog": Symmetric log (linear near zero, log elsewhere)
+  // - "log-min-max": Log transform then min-max scaling
+  // - "iqr": Interquartile range normalization
+  // - "max-out": Scale by maximum absolute value
+  // - "signed-log": Signed log transform
+  // - "scaled_signed_offset_log": Scaled signed log with offset
+  // - "bool": Binary values (no normalization)
+  // - "none": No normalization
   "key_methods": {
-    "pressure_bar":     "log-min-max",
-    "temperature_k":    "standard",
-    "orbital_distance_m":"log-standard",
-    "net_thermal_flux": "symlog",
-    "net_reflected_flux":"symlog"
+    "pressure_bar":       "log-min-max",    // Pressure spans orders of magnitude
+    "temperature_k":      "standard",       // Temperature is roughly normal
+    "orbital_distance_m": "log-standard",   // Distance spans orders of magnitude
+    "net_thermal_flux":   "symlog",         // Flux can be positive/negative with wide range
+    "net_reflected_flux": "symlog"          // Flux can be positive/negative with wide range
   },
 
   // Fallback for any variable missing above.
   "default_method": "standard",
 
-  // Numerical epsilon for log ops.
+  // Numerical epsilon for log operations (prevents log(0)).
   "epsilon": 1e-9,                          // float > 0
 
   // Max values kept in RAM for quantile/IQR computations.
   "quantile_max_values_in_memory": 10000000, // int ≥ 1
 
-  // Absolute‑percentile that defines linear→log switch in symlog.
+  // Percentile that defines linear→log switch in symlog.
   "symlog_percentile": 0.25                 // 0 ≤ float ≤ 1
 },
 
@@ -104,15 +139,22 @@
 "model_hyperparameters": {
   // Hidden dimension of transformer embeddings.
   "d_model": 256,                            // int, power of 2 recommended
+  
   // Attention heads (must divide d_model exactly).
-  "nhead": 4,                                // int
-  // Encoder layer count.
+  "nhead": 4,                                // int (256/4 = 64 dims per head)
+  
+  // Number of transformer encoder layers.
   "num_encoder_layers": 3,                   // int
-  // FFN inner dimension (often 4×d_model).
+  
+  // FFN inner dimension (typically 4×d_model).
   "dim_feedforward": 1024,                   // int
-  // Drop‑out applied inside encoder & projection layers.
-  "dropout": 0.0,                           // 0‑1 float
+  
+  // Dropout applied inside encoder & projection layers.
+  "dropout": 0.0,                            // 0-1 float
+  
   // Maximum sequence length your data can reach.
+  // Sequences longer than this will be truncated.
+  // Sequences shorter than this will be right-padded.
   "max_sequence_length": 256                 // int ≥ max observed seq len
 },
 
@@ -120,51 +162,58 @@
 // ║                 6.  TRAINING HYPERPARAMETERS                 ║
 // ════════════════════════════════════════════════════════════════
 "training_hyperparameters": {
-  // Epoch budget.
+  // Maximum number of training epochs.
   "epochs": 200,                             // int ≥ 1
-  // Mini‑batch size per GPU.
+  
+  // Mini-batch size per GPU.
   "batch_size": 512,                         // int ≥ 1
+  
   // Initial learning rate.
   "learning_rate": 1e-4,                     // float > 0
-  // L2 weight decay.
+  
+  // L2 weight decay (regularization).
   "weight_decay": 1e-5,                      // float ≥ 0
-  // Optimiser: choose "adamw", "adam", or "sgd".
+  
+  // Optimizer: choose "adamw", "adam", or "sgd".
   "optimizer": "adamw",
-  // Gradient clipping (0 disables).
+  
+  // Gradient clipping value (0 disables).
   "gradient_clip_val": 1.0,                  // float ≥ 0
+  
   // Gradient accumulation steps for large effective batch.
   "gradient_accumulation_steps": 1,          // int ≥ 1
 
-  // ─── Scheduler settings ──────────────────────────────────────
-  // "reduce_on_plateau"  → ReduceLROnPlateau
-  // "cosine"             → CosineAnnealingLR (+ optional warm‑up)
+  // ─── Learning Rate Scheduler ─────────────────────────────────
+  // "reduce_on_plateau": Reduce LR when validation loss plateaus
+  // "cosine": Cosine annealing with optional warmup
   "scheduler_type": "cosine",
 
-  // Parameters used **only** for ReduceLROnPlateau
+  // Parameters for ReduceLROnPlateau (if selected)
   "lr_patience": 3,                          // epochs without improvement
   "lr_factor": 0.5,                          // new_lr = old_lr * factor
 
-  // Parameters used **only** for CosineAnnealingLR
-  "warmup_epochs": 5,                        // linear warm‑up before cosine
+  // Parameters for CosineAnnealingLR (if selected)
+  "warmup_epochs": 5,                        // linear warmup before cosine
 
-  // Minimum LR clamp for either scheduler.
+  // Minimum learning rate for any scheduler.
   "min_lr": 1e-8,
 
-  // ─── Early‑stopping ───────────────────────────────────────────
-  "early_stopping_patience": 20,             // epochs
-  "min_delta": 1e-8,                         // significant improvement
+  // ─── Early Stopping ──────────────────────────────────────────
+  "early_stopping_patience": 20,             // epochs without improvement
+  "min_delta": 1e-8,                         // minimum improvement threshold
 
-  // ─── Mixed precision & dataset frac ───────────────────────────
-  "use_amp": true,                           // Automatic Mixed Precision
-  // If you need a quick run on small subset.
-  "dataset_fraction_to_use": 1.0,            // 0‑1 float
+  // ─── Mixed Precision & Data Fraction ─────────────────────────
+  "use_amp": true,                           // Automatic Mixed Precision (faster on modern GPUs)
+  
+  // Fraction of dataset to use (for quick experiments).
+  "dataset_fraction_to_use": 1.0,            // 0-1 float
 
-  // Validation/Test split fractions if splits file absent.
-  "val_frac": 0.15,
-  "test_frac": 0.15,
+  // Validation/Test split fractions (if splits file absent).
+  "val_frac": 0.15,                          // 15% for validation
+  "test_frac": 0.15,                         // 15% for test
 
-  // Abort epoch if too many batches fail (e.g., all‑NaN).
-  "max_batch_failure_rate": 0.10             // 0‑1 float
+  // Abort epoch if too many batches are all padding.
+  "max_batch_failure_rate": 0.10             // 0-1 float
 },
 
 // ════════════════════════════════════════════════════════════════
@@ -178,20 +227,31 @@
 // ════════════════════════════════════════════════════════════════
 // ║                 8.  HYPERPARAMETER SEARCH SPACE              ║
 // ════════════════════════════════════════════════════════════════
-// Bounds supplied to Optuna in hyperparam_search.py.
+// Bounds for Optuna hyperparameter optimization.
 "hyperparameter_search": {
-  // Categorical choices – transformer size.
-  "d_model": [128, 256, 512],
+  // Categorical choices for transformer architecture
+  "d_model": [128, 256, 512],                // Model dimensions to try
   "nhead_divisors": [4, 8, 16],              // nhead must divide d_model
-  "num_encoder_layers": [3, 8],              // low & high inclusive
-  "dim_feedforward": [512, 1024, 2048],
+  "num_encoder_layers": [3, 8],              // Range of layer counts
+  "dim_feedforward": [512, 1024, 2048],      // FFN dimensions to try
 
-  // Continuous ranges (Optuna floats).
-  "dropout":      { "low": 0.0, "high": 0.1 },
-  "learning_rate":{ "low": 1e-4, "high": 5e-4, "log": true },
-  "weight_decay": { "low": 1e-6, "high": 1e-4, "log": true },
+  // Continuous ranges (Optuna will sample from these)
+  "dropout": {
+    "low": 0.0,
+    "high": 0.1
+  },
+  "learning_rate": {
+    "low": 1e-4,
+    "high": 5e-4,
+    "log": true                              // Sample in log space
+  },
+  "weight_decay": {
+    "low": 1e-6,
+    "high": 1e-4,
+    "log": true                              // Sample in log space
+  },
 
-  // Batch sizes to try.
+  // Batch sizes to try
   "batch_size": [128, 256, 512]
 }
 }

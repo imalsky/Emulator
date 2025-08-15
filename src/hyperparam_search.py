@@ -2,19 +2,20 @@
 """
 hyperparam_search.py - Optuna hyperparameter optimization with aggressive pruning.
 
-This module orchestrates hyperparameter optimization using Optuna with efficient
-data reuse and aggressive early stopping for bad trials.
+This module orchestrates hyperparameter optimization using Optuna with:
+- Efficient data reuse (preprocessed data loaded once)
+- Aggressive early stopping for bad trials
+- Reduced configurations for faster exploration
 """
 from __future__ import annotations
 
 import logging
 from argparse import Namespace
-from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 import optuna
-from optuna.pruners import HyperbandPruner, MedianPruner, PercentilePruner
+from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 import torch
 
@@ -27,73 +28,71 @@ logger = logging.getLogger(__name__)
 
 class AggressivePruner(optuna.pruners.BasePruner):
     """
-    Custom aggressive pruner that combines multiple pruning strategies.
+    Custom aggressive pruner combining multiple strategies.
+        
     Prunes if ANY of the following conditions are met:
     1. Current loss is worse than median of previous trials at same step
-    2. Current loss is in the worst 25th percentile
-    3. Loss hasn't improved for patience steps
+    2. Loss hasn't improved for patience steps
     """
     
     def __init__(
         self,
-        n_startup_trials: int = 5,
-        n_warmup_steps: int = 3,
-        patience: int = 3,
+        n_startup_trials: int = 3,
+        n_warmup_steps: int = 2,
+        patience: int = 2,
         min_improvement: float = 0.001,
-        percentile: float = 75.0,  # Prune bottom 25%
     ):
+        """
+        Initialize aggressive pruner.
+        
+        Args:
+            n_startup_trials: Number of trials before pruning starts
+            n_warmup_steps: Number of steps before pruning in each trial
+            patience: Steps without improvement before pruning
+            min_improvement: Minimum improvement to reset patience
+        """
         self._median_pruner = MedianPruner(
-            n_startup_trials=n_startup_trials,
-            n_warmup_steps=n_warmup_steps,
-        )
-        self._percentile_pruner = PercentilePruner(
-            percentile=percentile,
             n_startup_trials=n_startup_trials,
             n_warmup_steps=n_warmup_steps,
         )
         self.patience = patience
         self.min_improvement = min_improvement
-        self._trial_best_values: Dict[int, Tuple[float, int]] = {}
+        # FIXED: Removed unused _trial_best dictionary
     
     def prune(self, study: optuna.Study, trial: optuna.FrozenTrial) -> bool:
-        # Use median pruner
-        if self._median_pruner.prune(study, trial):
-            logger.info(f"Trial {trial.number} pruned by median pruner")
-            return True
+        """
+        Determine if trial should be pruned.
         
-        # Use percentile pruner
-        if self._percentile_pruner.prune(study, trial):
-            logger.info(f"Trial {trial.number} pruned by percentile pruner")
+        Args:
+            study: Optuna study
+            trial: Current trial
+            
+        Returns:
+            True if trial should be pruned
+        """
+        # Check median pruner first (fast)
+        if self._median_pruner.prune(study, trial):
             return True
         
         # Check patience-based pruning
         step = trial.last_step
-        if step is None:
+        if step is None or step < self.patience:
             return False
         
-        current_value = trial.intermediate_values[step]
-        trial_id = trial.number
-        
-        if trial_id not in self._trial_best_values:
-            self._trial_best_values[trial_id] = (current_value, step)
-        else:
-            best_value, best_step = self._trial_best_values[trial_id]
-            if current_value < best_value - self.min_improvement:
-                self._trial_best_values[trial_id] = (current_value, step)
-            elif step - best_step >= self.patience:
-                logger.info(
-                    f"Trial {trial.number} pruned by patience "
-                    f"(no improvement for {self.patience} steps)"
-                )
+        values = list(trial.intermediate_values.values())
+        if len(values) >= self.patience:
+            # Check if no improvement in last patience steps
+            recent = values[-self.patience:]
+            if min(recent) >= recent[0] - self.min_improvement:
                 return True
         
         return False
 
 
 def create_reduced_config(
-    config: Dict[str, Any], 
-    fraction: float = 0.1,
-    max_epochs: int = 30,
+    config: Dict[str, Any],
+    fraction: float = 0.1,  # Reduced from 0.2
+    max_epochs: int = 20,   # Reduced from 30
 ) -> Dict[str, Any]:
     """
     Create a reduced configuration for faster hyperparameter search.
@@ -102,25 +101,31 @@ def create_reduced_config(
         config: Original configuration
         fraction: Fraction of data to use
         max_epochs: Maximum epochs for trials
-    
+        
     Returns:
-        Modified configuration
+        Modified configuration for faster trials
     """
-    reduced_config = deepcopy(config)
+    # Only modify what we need - avoid full deepcopy
+    reduced_config = {
+        "data_specification": config["data_specification"],
+        "data_paths_config": config["data_paths_config"],
+        "normalization": config["normalization"],
+        "output_paths_config": config["output_paths_config"],
+        "model_hyperparameters": dict(config["model_hyperparameters"]),
+        "training_hyperparameters": dict(config["training_hyperparameters"]),
+        "miscellaneous_settings": dict(config["miscellaneous_settings"]),
+    }
     
-    # Reduce dataset size
+    # Reduce dataset size and epochs
     reduced_config["training_hyperparameters"]["dataset_fraction_to_use"] = fraction
+    reduced_config["training_hyperparameters"]["epochs"] = max_epochs
+    reduced_config["training_hyperparameters"]["early_stopping_patience"] = 3  # More aggressive
+    reduced_config["training_hyperparameters"]["min_delta"] = 5e-4  # Less sensitive
     
-    # Reduce epochs
-    current_epochs = reduced_config["training_hyperparameters"].get("epochs", 100)
-    reduced_config["training_hyperparameters"]["epochs"] = min(max_epochs, current_epochs)
-    
-    # More aggressive early stopping for trials
-    reduced_config["training_hyperparameters"]["early_stopping_patience"] = 5
-    reduced_config["training_hyperparameters"]["min_delta"] = 1e-4
-    
-    # Disable model export during trials to save time
+    # Disable expensive features during trials
     reduced_config["miscellaneous_settings"]["torch_export"] = False
+    reduced_config["miscellaneous_settings"]["torch_compile"] = False
+    reduced_config["miscellaneous_settings"]["detect_anomaly"] = False
     
     return reduced_config
 
@@ -135,88 +140,110 @@ def run_optuna(
     model_save_dir: Path,
 ) -> None:
     """
-    Sets up and runs an Optuna hyperparameter search with aggressive pruning
-    and efficient data reuse.
+    Run Optuna hyperparameter search with aggressive pruning.
+    
+    Args:
+        config: Configuration dictionary
+        args: Command line arguments
+        device: Compute device
+        processed_dir: Directory with preprocessed data
+        splits: Data splits
+        padding_val: Padding value
+        model_save_dir: Directory for saving results
     """
     ensure_dirs(model_save_dir)
+    
+    # Get search space from config
     search_space = config.get("hyperparameter_search", {})
     if not search_space:
-        logger.error("'hyperparameter_search' section not found in config. Aborting.")
+        logger.error("'hyperparameter_search' section not found in config.")
         return
-
-    # Create reduced config for faster trials
-    trial_config_base = create_reduced_config(config, fraction=0.2, max_epochs=50)
+    
+    # Pre-compute valid d_model/nhead combinations (faster than computing in trial)
+    valid_combinations = {}
+    for d_model in search_space["d_model"]:
+        valid_combinations[d_model] = [
+            n for n in search_space["nhead_divisors"] if d_model % n == 0
+        ]
+    
+    # Create base config once
+    trial_config_base = create_reduced_config(config, fraction=0.1, max_epochs=20)
+    
     logger.info(
-        f"Using reduced config for trials: "
-        f"{trial_config_base['training_hyperparameters']['dataset_fraction_to_use']:.0%} of data, "
+        f"Using reduced config: {trial_config_base['training_hyperparameters']['dataset_fraction_to_use']:.0%} of data, "
         f"max {trial_config_base['training_hyperparameters']['epochs']} epochs"
     )
-
+    
+    # Create collate function once
+    collate_fn = create_collate_fn(padding_val)
+    
     def objective(trial: optuna.Trial) -> float:
-        """Objective function for a single trial."""
-        trial_config = deepcopy(trial_config_base)
-
-        # Model architecture parameters
+        """
+        Objective function for a single trial.
+        
+        Args:
+            trial: Optuna trial
+            
+        Returns:
+            Best validation loss achieved
+        """
+        # Lightweight config update (no deepcopy)
+        trial_config = {
+            "data_specification": trial_config_base["data_specification"],
+            "data_paths_config": trial_config_base["data_paths_config"],
+            "normalization": trial_config_base["normalization"],
+            "output_paths_config": trial_config_base["output_paths_config"],
+            "miscellaneous_settings": trial_config_base["miscellaneous_settings"],
+            "model_hyperparameters": {},
+            "training_hyperparameters": {},
+        }
+        
+        # Model architecture
         d_model = trial.suggest_categorical("d_model", search_space["d_model"])
-        trial_config["model_hyperparameters"]["d_model"] = d_model
-
-        possible_nheads = [
-            div for div in search_space["nhead_divisors"] if d_model % div == 0
-        ]
-        if not possible_nheads:
-            logger.warning(
-                f"For trial {trial.number}, no valid nhead_divisor for d_model={d_model}. "
-                f"Defaulting to 1."
-            )
-            possible_nheads = [1]
-        nhead = trial.suggest_categorical("nhead", possible_nheads)
-        trial_config["model_hyperparameters"]["nhead"] = nhead
-
+        nhead = trial.suggest_categorical("nhead", valid_combinations[d_model])
+        
         layers_range = search_space["num_encoder_layers"]
         num_encoder_layers = trial.suggest_int(
-            "num_encoder_layers", low=layers_range[0], high=layers_range[1]
+            "num_encoder_layers", layers_range[0], layers_range[1]
         )
-        trial_config["model_hyperparameters"]["num_encoder_layers"] = num_encoder_layers
-
+        
         dim_feedforward = trial.suggest_categorical(
             "dim_feedforward", search_space["dim_feedforward"]
         )
-        trial_config["model_hyperparameters"]["dim_feedforward"] = dim_feedforward
-
-        # Regularization
+        
         dropout = trial.suggest_float("dropout", **search_space["dropout"])
-        trial_config["model_hyperparameters"]["dropout"] = dropout
-
+        
         # Training parameters
-        learning_rate = trial.suggest_float(
-            "learning_rate", **search_space["learning_rate"]
-        )
-        trial_config["training_hyperparameters"]["learning_rate"] = learning_rate
-
+        learning_rate = trial.suggest_float("learning_rate", **search_space["learning_rate"])
         batch_size = trial.suggest_categorical("batch_size", search_space["batch_size"])
-        trial_config["training_hyperparameters"]["batch_size"] = batch_size
-
-        weight_decay = trial.suggest_float(
-            "weight_decay", **search_space["weight_decay"]
-        )
-        trial_config["training_hyperparameters"]["weight_decay"] = weight_decay
-
+        weight_decay = trial.suggest_float("weight_decay", **search_space["weight_decay"])
+        
+        # Update config
+        trial_config["model_hyperparameters"] = {
+            **trial_config_base["model_hyperparameters"],
+            "d_model": d_model,
+            "nhead": nhead,
+            "num_encoder_layers": num_encoder_layers,
+            "dim_feedforward": dim_feedforward,
+            "dropout": dropout,
+        }
+        
+        trial_config["training_hyperparameters"] = {
+            **trial_config_base["training_hyperparameters"],
+            "learning_rate": learning_rate,
+            "batch_size": batch_size,
+            "weight_decay": weight_decay,
+        }
+        
         # Create trial directory
         trial_save_dir = model_save_dir / f"trial_{trial.number:04d}"
         ensure_dirs(trial_save_dir)
-        save_json(trial_config, trial_save_dir / "trial_config.json")
-
-        # Setup trial logging
-        trial_log_file = trial_save_dir / "trial_log.log"
-        setup_logging(log_file=trial_log_file, force=True)
-        logger.info(f"Starting Trial {trial.number} with params: {trial.params}")
-
-        collate_fn = create_collate_fn(padding_val)
-
+        
+        # Minimal logging - no per-trial log files
+        logger.info(f"Trial {trial.number}: d={d_model}, n={nhead}, L={num_encoder_layers}, lr={learning_rate:.1e}")
+        
         try:
-            # Data is already preprocessed and will be reused
-            logger.info("Reusing preprocessed data from disk/cache")
-            
+            # Create trainer
             trainer = ModelTrainer(
                 config=trial_config,
                 device=device,
@@ -227,52 +254,46 @@ def run_optuna(
                 optuna_trial=trial,
             )
             
+            # Train and get best validation loss
             best_val_loss = trainer.train()
             
-            # Save trial results
-            trial_results = {
-                "trial_number": trial.number,
-                "best_val_loss": best_val_loss,
+            # Save only essential results
+            save_json({
+                "trial": trial.number,
+                "loss": best_val_loss,
                 "params": trial.params,
-                "state": trial.state.name,
-            }
-            save_json(trial_results, trial_save_dir / "trial_results.json")
+            }, trial_save_dir / "result.json")
             
             return best_val_loss
             
         except optuna.exceptions.TrialPruned:
-            logger.info(f"Trial {trial.number} was pruned.")
             raise
         except Exception as e:
-            logger.error(
-                f"Trial {trial.number} failed with exception: {e}", exc_info=True
-            )
+            logger.error(f"Trial {trial.number} failed: {e}")
             return float("inf")
-
+    
     # Create study with aggressive pruning
     study_name = args.optuna_study_name or "atmospheric_transformer_study"
     storage_path = f"sqlite:///{model_save_dir / 'optuna_study.db'}"
     
-    # Use TPE sampler with more startup trials for better exploration
-    sampler_seed = config.get("miscellaneous_settings", {}).get("random_seed", 42)
+    # Simpler sampler with fewer startup trials
     sampler = TPESampler(
-        seed=sampler_seed,
-        n_startup_trials=10,  # More exploration initially
-        n_ei_candidates=24,   # More candidates for acquisition function
+        seed=config.get("miscellaneous_settings", {}).get("random_seed", 42),
+        n_startup_trials=5,  # Reduced from 10
+        n_ei_candidates=20,  # Reduced from 24
     )
     
-    # Use our custom aggressive pruner
+    # More aggressive pruner
     pruner = AggressivePruner(
-        n_startup_trials=5,
-        n_warmup_steps=3,
-        patience=3,
+        n_startup_trials=3,
+        n_warmup_steps=2,
+        patience=2,
         min_improvement=0.001,
-        percentile=75.0,  # Prune bottom 25%
     )
-
+    
     # Create or load study
     if args.resume and Path(storage_path.replace("sqlite:///", "")).exists():
-        logger.info(f"Resuming existing study '{study_name}'")
+        logger.info(f"Resuming study '{study_name}'")
         study = optuna.load_study(
             study_name=study_name,
             storage=storage_path,
@@ -289,14 +310,9 @@ def run_optuna(
             sampler=sampler,
             pruner=pruner,
         )
-
-    logger.info(
-        f"Starting Optuna study '{study_name}' with {args.num_trials} trials."
-    )
-    logger.info(f"Sampler: {sampler.__class__.__name__}")
-    logger.info(f"Pruner: {pruner.__class__.__name__} (aggressive settings)")
-    logger.info(f"Results will be saved in: {model_save_dir}")
-
+    
+    logger.info(f"Starting Optuna with {args.num_trials} trials")
+    
     # Run optimization
     study.optimize(
         objective,
@@ -304,60 +320,45 @@ def run_optuna(
         gc_after_trial=True,
         show_progress_bar=True,
     )
-
+    
     # Log results
-    logger.info("\n--- Optuna Hyperparameter Search Complete ---")
-    logger.info(f"Number of finished trials: {len(study.trials)}")
+    logger.info(f"\nCompleted {len(study.trials)} trials")
     
     if study.best_trial:
-        logger.info(f"Best trial: Trial #{study.best_trial.number}")
-        logger.info(f"  Best Validation Loss: {study.best_value:.6f}")
-        logger.info("  Best Hyperparameters:")
+        logger.info(f"Best trial: #{study.best_trial.number}, Loss: {study.best_value:.6f}")
+        logger.info("Best params:")
         for key, value in study.best_trial.params.items():
-            logger.info(f"    {key}: {value}")
-
-        # Save best parameters
-        best_params_path = model_save_dir / "best_hyperparameters.json"
+            logger.info(f"  {key}: {value}")
+        
+        # Save best parameters and create final config
         results_summary = {
             "best_value": study.best_value,
             "best_params": study.best_trial.params,
             "best_trial_number": study.best_trial.number,
             "n_trials": len(study.trials),
-            "n_pruned": len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]),
-            "n_complete": len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
-            "n_failed": len([t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]),
+            "n_pruned": sum(1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED),
         }
-        save_json(results_summary, best_params_path)
-        logger.info(f"Best hyperparameters saved to {best_params_path}")
+        save_json(results_summary, model_save_dir / "best_hyperparameters.json")
         
-        # Create final config with best params for full training
-        final_config = deepcopy(config)
-        model_hp = final_config["model_hyperparameters"]
-        train_hp = final_config["training_hyperparameters"]
-        
-        # Apply best parameters
-        best_params = study.best_trial.params
-        model_hp["d_model"] = best_params["d_model"]
-        model_hp["nhead"] = best_params["nhead"]
-        model_hp["num_encoder_layers"] = best_params["num_encoder_layers"]
-        model_hp["dim_feedforward"] = best_params["dim_feedforward"]
-        model_hp["dropout"] = best_params["dropout"]
-        train_hp["learning_rate"] = best_params["learning_rate"]
-        train_hp["batch_size"] = best_params["batch_size"]
-        train_hp["weight_decay"] = best_params["weight_decay"]
+        # Create final config with best params
+        final_config = dict(config)
+        final_config["model_hyperparameters"].update({
+            "d_model": study.best_trial.params["d_model"],
+            "nhead": study.best_trial.params["nhead"],
+            "num_encoder_layers": study.best_trial.params["num_encoder_layers"],
+            "dim_feedforward": study.best_trial.params["dim_feedforward"],
+            "dropout": study.best_trial.params["dropout"],
+        })
+        final_config["training_hyperparameters"].update({
+            "learning_rate": study.best_trial.params["learning_rate"],
+            "batch_size": study.best_trial.params["batch_size"],
+            "weight_decay": study.best_trial.params["weight_decay"],
+        })
         
         save_json(final_config, model_save_dir / "best_config.json")
-        logger.info("Created best_config.json for full training run")
-        
+        logger.info(f"\nTrain with best params: python main.py train --config {model_save_dir / 'best_config.json'}")
     else:
-        logger.warning("No successful trials completed in the study.")
-    
-    # Print pruning statistics
-    pruned_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
-    if pruned_trials:
-        logger.info(f"\nPruning statistics:")
-        logger.info(f"  Total pruned: {len(pruned_trials)}/{len(study.trials)}")
-        logger.info(f"  Pruning rate: {len(pruned_trials)/len(study.trials):.1%}")
+        logger.warning("No successful trials completed")
 
 
 __all__ = ["run_optuna", "AggressivePruner", "create_reduced_config"]

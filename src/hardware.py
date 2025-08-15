@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-hardware.py – Device detection and DataLoader helpers.
-"""
-from __future__ import annotations
+"""Device detection and DataLoader optimization helpers."""
 
 import logging
 import torch
@@ -11,27 +8,29 @@ logger = logging.getLogger(__name__)
 
 
 def setup_device() -> torch.device:
-    """
-    Choose the best available device (CUDA ▸ MPS ▸ CPU).
-    """
+    """Select the best available compute device."""
     if torch.cuda.is_available():
         device = torch.device("cuda")
         try:
-            name = torch.cuda.get_device_name(torch.cuda.current_device())
-            logger.info(f"Using CUDA device: {name}")
-        except Exception:
-            logger.info("Using CUDA device.")
-    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            props = torch.cuda.get_device_properties(0)
+            logger.info(
+                f"Using CUDA: {torch.cuda.get_device_name(0)} "
+                f"({props.total_memory / 1024**3:.1f}GB)"
+            )
+        except (RuntimeError, AssertionError) as e:
+            logger.warning(f"CUDA details unavailable: {e}. Check drivers.")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
-        logger.info("Using Apple‑Silicon MPS device (may be slower than CUDA).")
+        logger.info("Using Apple MPS device.")
     else:
         device = torch.device("cpu")
         logger.info("Using CPU device.")
+    
     return device
 
 
 def should_pin_memory() -> bool:
-    """Pin memory only when CUDA is present."""
+    """Determine if memory pinning should be enabled."""
     return torch.cuda.is_available()
 
 
