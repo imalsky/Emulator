@@ -1,5 +1,5 @@
 {
-  "device": "mps",
-  "use_amp": false,
-  "effective_bs": 512
+  "device": "cuda",
+  "use_amp": true,
+  "effective_bs": 256
 }

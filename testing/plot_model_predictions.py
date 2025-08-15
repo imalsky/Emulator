@@ -1,251 +1,299 @@
-# File 2: plot_model_predictions.py
+#!/usr/bin/env python3
+"""
+Evaluate and visualize model predictions on test data.
+Creates comparison plots of true vs predicted atmospheric fluxes.
+"""
 
 import json
-import random
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
+import sys
 from pathlib import Path
-from typing import Dict, Any
 
-# Relative path to the model directory (assuming script is in 'testing/' and 'models/' is sibling)
-model_dir = (
-    Path(__file__).parent.parent / "models" / "trained_model_picaso_transformer_v2"
-)  # Change 'trained_model_picaso_transformer' if needed
-processed_dir = (
-    Path(__file__).parent.parent / "data" / "processed"
-)  # Assuming 'data/' is also sibling to 'testing/'
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 
+# Configuration
+MODEL_NAME = "trained_model"
+NUM_PROFILES = 2
 
-class DataNormalizer:
-    @staticmethod
-    def denormalize_tensor(
-        x: torch.Tensor, method: str, stats: Dict[str, Any]
-    ) -> torch.Tensor:
-        x = x.to(torch.float32)
-        if method in ("none", "bool"):
-            return x
-        if not stats:
-            raise ValueError(f"No stats for denormalization with method '{method}'")
+# Setup paths
+ROOT = Path(__file__).parent.parent
+sys.path.extend([str(ROOT), str(ROOT / "src")])
 
-        dtype, device = x.dtype, x.device
-        eps = stats.get("epsilon", 1e-9)
-
-        def to_t(val: float) -> torch.Tensor:
-            return torch.as_tensor(val, dtype=dtype, device=device)
-
-        if method == "standard":
-            return x * to_t(stats["std"]) + to_t(stats["mean"])
-        elif method == "log-standard":
-            return 10 ** (x * to_t(stats["log_std"]) + to_t(stats["log_mean"]))
-        elif method == "signed-log":
-            unscaled_log = x * to_t(stats["std"]) + to_t(stats["mean"])
-            return torch.sign(unscaled_log) * (10 ** torch.abs(unscaled_log) - 1.0)
-        elif method == "log-min-max":
-            unscaled = torch.clamp(x, 0, 1) * (
-                to_t(stats["max"]) - to_t(stats["min"])
-            ) + to_t(stats["min"])
-            return 10**unscaled
-        elif method == "max-out":
-            return x * to_t(stats["max_val"])
-        elif method == "iqr":
-            return x * to_t(stats["iqr"]) + to_t(stats["median"])
-        elif method == "scaled_signed_offset_log":
-            ytmp = x * to_t(stats["m"])
-            return torch.sign(ytmp) * (10 ** torch.abs(ytmp) - 1)
-        elif method == "symlog":
-            unscaled = x * to_t(stats["scale_factor"])
-            abs_unscaled = torch.abs(unscaled)
-            linear_mask = abs_unscaled <= 1.0
-            thr = to_t(stats["threshold"])
-            y = torch.zeros_like(x)
-            y[linear_mask] = unscaled[linear_mask] * thr
-            y[~linear_mask] = (
-                torch.sign(unscaled[~linear_mask])
-                * thr
-                * (10 ** (abs_unscaled[~linear_mask] - 1.0))
-            )
-            return y
-        else:
-            raise ValueError(f"Unsupported denormalization method '{method}'")
+from normalizer import DataNormalizer
+from model import create_prediction_model
 
 
-def load_config_and_metadata(model_dir: Path):
-    config_path = model_dir / "run_config.json"
-    with open(config_path, "r") as f:
+def remap_layer_keys(state_dict):
+    """
+    Remap checkpoint keys from old 'layers' structure to new 'blocks' structure.
+    
+    Old architecture: layers.0 (initial_film), layers.1 (transformer0), layers.2 (film0), ...
+    New architecture: initial_film, blocks.0.transformer, blocks.0.film, ...
+    """
+    remapped = {}
+    
+    for key, value in state_dict.items():
+        # Remove any _orig_mod prefix from compiled models
+        key = key.replace("_orig_mod.", "")
+        
+        if not key.startswith("layers."):
+            remapped[key] = value
+            continue
+            
+        # Parse layer index and remaining path
+        parts = key.split(".", 2)
+        layer_idx = int(parts[1])
+        rest = parts[2] if len(parts) > 2 else ""
+        
+        # Map to new structure
+        if layer_idx == 0:
+            remapped[f"initial_film.{rest}"] = value
+        elif layer_idx % 2 == 1:  # Odd = transformer
+            block_idx = layer_idx // 2
+            remapped[f"blocks.{block_idx}.transformer.{rest}"] = value
+        else:  # Even > 0 = film
+            block_idx = (layer_idx - 2) // 2
+            remapped[f"blocks.{block_idx}.film.{rest}"] = value
+    
+    return remapped
+
+
+def load_model(model_dir):
+    """Load trained model and configuration."""
+    # Find config file
+    config_files = list(model_dir.glob("*_config.json"))
+    if not config_files:
+        raise FileNotFoundError(f"No config found in {model_dir}")
+    
+    with open(config_files[0]) as f:
         config = json.load(f)
-    metadata_path = processed_dir / "normalization_metadata.json"
-    with open(metadata_path, "r") as f:
-        metadata = json.load(f)
-    return config, metadata
-
-
-def load_best_jit_model(model_dir: Path):
-    jit_files = list(model_dir.glob("best_model_epoch_*_jit.pt"))
-    if not jit_files:
-        raise FileNotFoundError("No JIT model files found in the model directory.")
-    # Select the one with the highest epoch
-    best_jit_path = max(
-        jit_files, key=lambda p: int(p.stem.split("_epoch_")[1].split("_")[0])
-    )
-    # Load to CPU to avoid device issues (model was saved on CUDA)
-    map_location = torch.device("cpu")
-    model = torch.jit.load(best_jit_path, map_location=map_location)
+    
+    # Load checkpoint
+    checkpoint_path = model_dir / "best_model.pt"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"No checkpoint at {checkpoint_path}")
+    
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    print(f"Loading model from epoch {checkpoint.get('epoch', 'unknown')}")
+    
+    # Create model and load weights
+    model = create_prediction_model(config, device=torch.device("cpu"), compile_model=False)
+    state_dict = remap_layer_keys(checkpoint.get("state_dict", checkpoint))
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
-    return model, best_jit_path
+    
+    return model, config
 
 
-def get_random_test_profiles(num_profiles: int = 2):
-    test_shards = sorted(processed_dir.glob("test_shard_*.npz"))
-    if not test_shards:
-        raise FileNotFoundError("No test shards found.")
-    shard = random.choice(test_shards)
-    data = np.load(shard)
-    seq_inputs = data["sequence_inputs"]
-    globals_arr = (
-        data["globals"] if "globals" in data else np.empty((len(seq_inputs), 0))
-    )
-    targets = data["targets"]
-
-    indices = random.sample(range(len(seq_inputs)), num_profiles)
-    profiles = []
+def load_test_data(config, num_samples=2):
+    """Load random samples from test/validation set."""
+    # Try test directory first, fall back to validation
+    data_dir = ROOT / "data/processed/test"
+    if not data_dir.exists():
+        data_dir = ROOT / "data/processed/val"
+    
+    # Load metadata
+    with open(data_dir / "metadata.json") as f:
+        metadata = json.load(f)
+    
+    # Pick random shard
+    shards = sorted((data_dir / "sequence_inputs").glob("shard_*.npy"))
+    shard = np.random.choice(shards)
+    
+    # Load arrays
+    sequences = np.load(data_dir / "sequence_inputs" / shard.name)
+    targets = np.load(data_dir / "targets" / shard.name)
+    
+    # Load global features if present
+    globals_array = None
+    if config["data_specification"].get("global_variables"):
+        globals_path = data_dir / "globals" / shard.name
+        if globals_path.exists():
+            globals_array = np.load(globals_path)
+    
+    # Select random samples
+    indices = np.random.choice(len(sequences), min(num_samples, len(sequences)), replace=False)
+    padding_value = config["data_specification"]["padding_value"]
+    
+    samples = []
     for idx in indices:
-        profiles.append(
-            {
-                "sequence": torch.from_numpy(seq_inputs[idx]).float(),
-                "global": (
-                    torch.from_numpy(globals_arr[idx]).float()
-                    if globals_arr.shape[1] > 0
-                    else None
-                ),
-                "target": torch.from_numpy(targets[idx]).float(),
-            }
-        )
-    return profiles
+        # Create tensors
+        seq_tensor = torch.from_numpy(sequences[idx]).float()
+        tgt_tensor = torch.from_numpy(targets[idx]).float()
+        
+        # Identify padding positions
+        is_padding = torch.all(torch.abs(seq_tensor - padding_value) < 1e-6, dim=-1)
+        
+        sample = {
+            "sequence": seq_tensor,
+            "target": tgt_tensor,
+            "padding_mask": is_padding,  # True = padding (for model)
+            "valid_mask": ~is_padding,   # True = valid (for plotting)
+        }
+        
+        if globals_array is not None:
+            sample["global_features"] = torch.from_numpy(globals_array[idx]).float()
+        
+        samples.append(sample)
+    
+    return samples
 
 
-def plot_predictions(model, profiles, metadata, config, plots_dir: Path):
+def run_inference(model, sample):
+    """Run model inference on a single sample."""
+    with torch.no_grad():
+        # Prepare inputs with batch dimension
+        inputs = {
+            "sequence": sample["sequence"].unsqueeze(0),
+            "sequence_mask": sample["padding_mask"].unsqueeze(0),
+        }
+        
+        if "global_features" in sample:
+            inputs["global_features"] = sample["global_features"].unsqueeze(0)
+        
+        # Forward pass
+        output = model(**inputs)
+        return output.squeeze(0)
+
+
+def denormalize(tensor, variable_name, norm_metadata):
+    """Denormalize a tensor using saved statistics."""
+    method = norm_metadata["normalization_methods"].get(variable_name, "none")
+    stats = norm_metadata["per_key_stats"].get(variable_name, {})
+    
+    if method != "none" and stats:
+        stats["method"] = method  # Ensure method is in stats
+        result = DataNormalizer.denormalize_tensor(tensor, method, stats)
+        return result.cpu().numpy()
+    
+    return tensor.cpu().numpy()
+
+
+def calculate_errors(predictions, targets):
+    """Calculate percent error, capped at 10000%."""
+    errors = 100 * np.abs((predictions - targets) / np.maximum(np.abs(targets), 1e-10))
+    return np.minimum(errors, 1e4)
+
+
+def create_plots(samples, model, config, norm_metadata, output_path):
+    """Create comparison plots for model evaluation."""
+    # Get variable names and indices
     input_vars = config["data_specification"]["input_variables"]
     target_vars = config["data_specification"]["target_variables"]
-    norm_methods = metadata["normalization_methods"]
-    per_key_stats = metadata["per_key_stats"]
-
-    fig, axs = plt.subplots(2, 2, figsize=(12, 10), sharey="row")
-
-    for i, profile in enumerate(profiles):
-        seq = profile["sequence"].unsqueeze(0)  # Add batch dim
-        glb = profile["global"].unsqueeze(0) if profile["global"] is not None else None
-        # Assume no padding; create dummy mask
-        seq_mask = torch.zeros(seq.shape[:2], dtype=torch.bool)
-
-        with torch.no_grad():
-            pred = model(seq, glb, seq_mask).squeeze(0)
-
-        # Denormalize relevant variables
-        pressure = DataNormalizer.denormalize_tensor(
-            profile["sequence"][:, input_vars.index("pressure_bar")],
-            norm_methods["pressure_bar"],
-            per_key_stats["pressure_bar"],
-        )
-        true_thermal = DataNormalizer.denormalize_tensor(
-            profile["target"][:, target_vars.index("net_thermal_flux")],
-            norm_methods["net_thermal_flux"],
-            per_key_stats["net_thermal_flux"],
-        )
-        pred_thermal = DataNormalizer.denormalize_tensor(
-            pred[:, target_vars.index("net_thermal_flux")],
-            norm_methods["net_thermal_flux"],
-            per_key_stats["net_thermal_flux"],
-        )
-        true_reflected = DataNormalizer.denormalize_tensor(
-            profile["target"][:, target_vars.index("net_reflected_flux")],
-            norm_methods["net_reflected_flux"],
-            per_key_stats["net_reflected_flux"],
-        )
-        pred_reflected = DataNormalizer.denormalize_tensor(
-            pred[:, target_vars.index("net_reflected_flux")],
-            norm_methods["net_reflected_flux"],
-            per_key_stats["net_reflected_flux"],
-        )
-
-        # Convert to numpy for plotting
-        pressure = pressure.numpy()
-        true_thermal = true_thermal.numpy()
-        pred_thermal = pred_thermal.numpy()
-        true_reflected = true_reflected.numpy()
-        pred_reflected = pred_reflected.numpy()
-
-        # Print debug for a couple levels (first 3 levels of first profile)
-        if i == 0:
-            print("Debug: Sample values for Profile 1 (first 3 levels):")
-            for lvl in range(min(3, len(pressure))):
-                print(f"Level {lvl}: Pressure={pressure[lvl]:.2e}")
-                print(
-                    f"  Thermal: True={true_thermal[lvl]:.2e}, Pred={pred_thermal[lvl]:.2e}, Frac Err={np.abs((pred_thermal[lvl] - true_thermal[lvl]) / (np.abs(true_thermal[lvl]) + 1e-10)):.2e}"
-                )
-                print(
-                    f"  Reflected: True={true_reflected[lvl]:.2e}, Pred={pred_reflected[lvl]:.2e}, Frac Err={np.abs((pred_reflected[lvl] - true_reflected[lvl]) / (np.abs(true_reflected[lvl]) + 1e-10)):.2e}"
-                )
-
-        # Top row: Flux vs Pressure (symlog x, log y inverted, xlim -1e10 to 1e10)
-        axs[0, 0].plot(true_thermal, pressure, label=f"True Thermal {i+1}")
-        axs[0, 0].plot(pred_thermal, pressure, "--", label=f"Pred Thermal {i+1}")
-        axs[0, 0].set_xscale("symlog")
-        axs[0, 0].set_yscale("log")
-        axs[0, 0].set_ylim(1e2, 1e-5)
-        axs[0, 0].set_xlim(-1e10, 1e10)
-        axs[0, 0].set_title("Net Thermal Flux")
-        axs[0, 0].set_ylabel("Pressure (bar)")
-        axs[0, 0].set_xlabel("Flux")
-
-        axs[0, 1].plot(true_reflected, pressure, label=f"True Reflected {i+1}")
-        axs[0, 1].plot(pred_reflected, pressure, "--", label=f"Pred Reflected {i+1}")
-        axs[0, 1].set_xscale("symlog")
-        axs[0, 1].set_yscale("log")
-        axs[0, 1].set_ylim(1e2, 1e-5)
-        axs[0, 1].set_xlim(-1e10, 1e10)
-        axs[0, 1].set_title("Net Reflected Flux")
-        axs[0, 1].set_xlabel("Flux")
-
-        # Bottom row: Fractional error vs Pressure (semilogx for error, log y inverted, xlim 1e-3 to 1e2)
-        # Fractional error formula: | (pred - true) / |true| | per pressure level (absolute value on denominator to handle negatives/zeros)
-        frac_err_thermal = np.abs(
-            (pred_thermal - true_thermal) / (np.abs(true_thermal) + 1)
-        )
-        frac_err_reflected = np.abs(
-            (pred_reflected - true_reflected) / (np.abs(true_reflected) + 1)
-        )
-
-        axs[1, 0].semilogx(frac_err_thermal * 100, pressure, label=f"Profile {i+1}")
-        axs[1, 0].set_yscale("log")
-        axs[1, 0].set_xlim(1e-3, 1e2)
-        axs[1, 0].set_ylim(1e2, 1e-5)
-        axs[1, 0].set_title("Percent Error - Thermal")
-        axs[1, 0].set_ylabel("Pressure (bar)")
-        axs[1, 0].set_xlabel("Percent Error")
-
-        axs[1, 1].semilogx(frac_err_reflected * 100, pressure, label=f"Profile {i+1}")
-        axs[1, 1].set_yscale("log")
-        axs[1, 1].set_xlim(1e-3, 1e2)
-        axs[1, 1].set_ylim(1e2, 1e-5)
-        axs[1, 1].set_title("Percent Error - Reflected")
-        axs[1, 1].set_xlabel("Percent Error")
-
-    axs[0, 0].legend()
-    axs[0, 1].legend()
-    axs[1, 0].legend()
-    axs[1, 1].legend()
+    
+    pressure_idx = input_vars.index("pressure_bar")
+    thermal_idx = target_vars.index("net_thermal_flux")
+    reflected_idx = target_vars.index("net_reflected_flux")
+    
+    # Setup figure
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    colors = plt.cm.tab10(np.arange(len(samples)))
+    
+    for i, sample in enumerate(samples):
+        # Run inference
+        predictions = run_inference(model, sample)
+        
+        # Get valid (non-padded) data points
+        valid_indices = sample["valid_mask"].nonzero(as_tuple=False).squeeze(-1)
+        if valid_indices.numel() == 0:
+            continue
+        
+        # Extract valid data
+        seq_valid = sample["sequence"][valid_indices]
+        tgt_valid = sample["target"][valid_indices]
+        pred_valid = predictions[valid_indices]
+        
+        # Denormalize all variables
+        pressure = denormalize(seq_valid[:, pressure_idx], "pressure_bar", norm_metadata)
+        thermal_true = denormalize(tgt_valid[:, thermal_idx], "net_thermal_flux", norm_metadata)
+        thermal_pred = denormalize(pred_valid[:, thermal_idx], "net_thermal_flux", norm_metadata)
+        reflected_true = denormalize(tgt_valid[:, reflected_idx], "net_reflected_flux", norm_metadata)
+        reflected_pred = denormalize(pred_valid[:, reflected_idx], "net_reflected_flux", norm_metadata)
+        
+        # Calculate errors
+        thermal_error = calculate_errors(thermal_pred, thermal_true)
+        reflected_error = calculate_errors(reflected_pred, reflected_true)
+        
+        # Print summary
+        print(f"\nProfile {i+1}:")
+        print(f"  Points: {valid_indices.numel()}")
+        print(f"  Mean error: Thermal={thermal_error.mean():.1f}%, Reflected={reflected_error.mean():.1f}%")
+        
+        # Plot results
+        color = colors[i]
+        
+        # Thermal flux comparison
+        axes[0, 0].plot(thermal_true, pressure, "o-", color=color, alpha=0.7, 
+                       label=f"True {i+1}", markersize=3)
+        axes[0, 0].plot(thermal_pred, pressure, "x--", color=color, alpha=0.9,
+                       label=f"Pred {i+1}", markersize=3)
+        
+        # Reflected flux comparison
+        axes[0, 1].plot(reflected_true, pressure, "o-", color=color, alpha=0.7, markersize=3)
+        axes[0, 1].plot(reflected_pred, pressure, "x--", color=color, alpha=0.9, markersize=3)
+        
+        # Error plots
+        axes[1, 0].semilogx(thermal_error, pressure, color=color, label=f"Profile {i+1}")
+        axes[1, 1].semilogx(reflected_error, pressure, color=color)
+    
+    # Format all axes
+    for ax in axes.flat:
+        ax.set_yscale("log")
+        ax.set_ylim(1e2, 1e-5)
+        ax.grid(True, which="both", alpha=0.3)
+        ax.set_ylabel("Pressure (bar)")
+    
+    # Format flux axes
+    axes[0, 0].set_xscale("symlog")
+    axes[0, 1].set_xscale("symlog")
+    axes[0, 0].set_xlabel("Flux (W/m²)")
+    axes[0, 1].set_xlabel("Flux (W/m²)")
+    
+    # Format error axes
+    for ax in axes[1, :]:
+        ax.set_xlim(1e-2, 1e4)
+        ax.set_xlabel("Percent Error (%)")
+    
+    # Add titles and legends
+    axes[0, 0].set_title("Net Thermal Flux")
+    axes[0, 1].set_title("Net Reflected Flux")
+    axes[1, 0].set_title("Thermal Error")
+    axes[1, 1].set_title("Reflected Error")
+    
+    axes[0, 0].legend(fontsize=8, loc="best")
+    axes[1, 0].legend(fontsize=8, loc="best")
+    
+    # Save figure
     plt.tight_layout()
-    plt.savefig(plots_dir / "model_predictions.png")
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"\n✓ Saved plot to: {output_path}")
+
+
+def main():
+    """Main evaluation pipeline."""
+    # Setup paths
+    model_dir = ROOT / "models" / MODEL_NAME
+    plot_dir = model_dir / "plots"
+    plot_dir.mkdir(exist_ok=True)
+    
+    # Load model and metadata
+    print(f"Evaluating model: {MODEL_NAME}")
+    model, config = load_model(model_dir)
+    
+    # Load normalization metadata
+    norm_path = ROOT / "data/processed/normalization_metadata.json"
+    with open(norm_path) as f:
+        norm_metadata = json.load(f)
+    
+    # Load test samples
+    samples = load_test_data(config, NUM_PROFILES)
+    print(f"Loaded {len(samples)} test samples")
+    
+    # Create evaluation plots
+    output_path = plot_dir / "model_predictions.png"
+    create_plots(samples, model, config, norm_metadata, output_path)
 
 
 if __name__ == "__main__":
-    plots_dir = model_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-
-    config, metadata = load_config_and_metadata(model_dir)
-    model, jit_path = load_best_jit_model(model_dir)
-    print(f"Loaded best JIT model: {jit_path}")
-
-    profiles = get_random_test_profiles()
-    plot_predictions(model, profiles, metadata, config, plots_dir)
+    main()

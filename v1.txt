@@ -1,0 +1,3912 @@
+===== /Users/imalsky/Desktop/Problemulator/src/preprocess.py =====
+#!/usr/bin/env python3
+"""
+preprocess.py - Preprocess raw HDF5 data into normalized NPY shards.
+"""
+from __future__ import annotations
+
+import datetime
+import logging
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import h5py
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from normalizer import DataNormalizer
+from utils import compute_data_hash_with_stats, ensure_dirs, save_json
+
+logger = logging.getLogger(__name__)
+
+HDF5_READ_CHUNK_SIZE = 131072
+
+
+
+def _group_indices_by_file(indices: List[Tuple[str, int]]) -> Dict[str, List[int]]:
+    """Groups a list of (file_stem, index) tuples by file_stem."""
+    grouped = {}
+    for file_stem, idx in indices:
+        grouped.setdefault(file_stem, []).append(idx)
+    return grouped
+
+
+def _load_and_restore_chunk(
+    hf_file: h5py.File, variables: List[str], indices: np.ndarray, max_seq_len: int = None
+) -> Dict[str, np.ndarray] | None:
+    """
+    Loads a chunk of data for specified variables and indices, using a
+    sort/unsort method for efficient HDF5 reading while preserving order.
+    """
+    if not indices.size:
+        return {}
+
+    # Sort indices for efficient h5py reading
+    sorter = np.argsort(indices)
+    sorted_indices = indices[sorter]
+
+    # Compute inverse permutation to restore original order
+    inverse_sorter = np.argsort(sorter)
+
+    data_chunk = {}
+    for var in variables:
+        if var not in hf_file:
+            logger.error(f"Critical error: Variable '{var}' not found in HDF5 file.")
+            return None
+        
+        # Load data in sorted order (efficient)
+        data_sorted = hf_file[var][sorted_indices]
+        # Restore original order (correctness)
+        data_orig_order = data_sorted[inverse_sorter]
+        
+        if max_seq_len is not None and data_orig_order.ndim == 2:
+            if data_orig_order.shape[1] > max_seq_len:
+                logger.warning(
+                    f"Truncating sequence from {data_orig_order.shape[1]} to {max_seq_len} "
+                    f"for variable '{var}'"
+                )
+                data_orig_order = data_orig_order[:, :max_seq_len]
+        
+        data_chunk[var] = data_orig_order
+
+    return data_chunk
+
+
+def _save_shard(
+    shard_buffers: Dict[str, List[np.ndarray]],
+    seq_dir: Path,
+    tgt_dir: Path,
+    glb_dir: Path | None,
+    shard_idx: int,
+) -> None:
+    """Saves a shard of data to NPY files using efficient concatenation."""
+    if (
+        not shard_buffers["sequence_inputs"]
+        or not shard_buffers["sequence_inputs"][0].size
+    ):
+        return  # Do not save empty shards
+
+    shard_name = f"shard_{shard_idx:06d}.npy"
+
+    # Use np.concatenate for performance
+    seq_data = np.concatenate(shard_buffers["sequence_inputs"], axis=0)
+    np.save(seq_dir / shard_name, seq_data)
+
+    tgt_data = np.concatenate(shard_buffers["targets"], axis=0)
+    np.save(tgt_dir / shard_name, tgt_data)
+
+    if (
+        glb_dir is not None
+        and shard_buffers.get("globals")
+        and shard_buffers["globals"]
+    ):
+        glb_data = np.concatenate(shard_buffers["globals"], axis=0)
+        np.save(glb_dir / shard_name, glb_data)
+
+
+def _save_preprocessing_summary(
+    output_dir: Path,
+    config: Dict[str, Any],
+    all_splits: Dict[str, list],
+    norm_metadata: Dict[str, Any],
+    data_hash: str,
+) -> None:
+    """Saves a human-readable summary of the preprocessing results."""
+    summary_path = output_dir / "preprocessing_summary.txt"
+    logger.info(f"Saving preprocessing summary to {summary_path}")
+
+    try:
+        content = f"""# Preprocessing Summary
+                - Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                - Data Hash: {data_hash}
+
+                --- Data Specification ---
+                - Input Variables: {config['data_specification']['input_variables']}
+                - Global Variables: {config['data_specification'].get('global_variables', 'None')}
+                - Target Variables: {config['data_specification']['target_variables']}
+                - Padding Value: {config['data_specification']['padding_value']}
+                - Max Sequence Length: {config['model_hyperparameters']['max_sequence_length']}
+
+                --- Data Splits ---
+                """
+        shard_size = config.get("miscellaneous_settings", {}).get("shard_size", 1000)
+        for name, indices in all_splits.items():
+            count = len(indices)
+            num_shards = (count + shard_size - 1) // shard_size if count > 0 else 0
+            content += f"- {name.capitalize()} Split:\n"
+            content += f"  - Total Samples: {count:,}\n"
+            content += f"  - Shards Created: {num_shards}\n"
+
+        content += "\n--- Normalization Metadata ---\n"
+        methods = norm_metadata.get("normalization_methods", {})
+        for var, stats in norm_metadata.get("per_key_stats", {}).items():
+            content += f"- Variable: '{var}'\n"
+            content += f"  - Method: {methods.get(var, 'N/A')}\n"
+
+        summary_path.write_text(content)
+
+    except Exception as e:
+        logger.error(f"Could not write preprocessing summary: {e}")
+
+
+def preprocess_data(
+    config: Dict[str, Any],
+    raw_hdf5_paths: List[Path],
+    splits: Dict[str, List[Tuple[str, int]]],
+    processed_dir: Path,
+) -> bool:
+    """Main function to orchestrate the preprocessing of raw HDF5 data."""
+    ensure_dirs(processed_dir)
+    
+    # Compute hash including file modification times and sizes
+    current_hash = compute_data_hash_with_stats(config, raw_hdf5_paths)
+    hash_path = processed_dir / "data_hash.txt"
+    metadata_path = processed_dir / "normalization_metadata.json"
+
+    shard_size = config.get("miscellaneous_settings", {}).get("shard_size", 4096)
+    all_splits = {
+        "train": splits["train"],
+        "val": splits["validation"],
+        "test": splits["test"],
+    }
+
+    if (
+        hash_path.exists()
+        and hash_path.read_text().strip() == current_hash
+        and metadata_path.exists()
+    ):
+        logger.info(
+            "Processed data is up-to-date based on configuration and file stats. "
+            "Skipping preprocessing."
+        )
+        return True
+
+    logger.info(
+        "Configuration or source files have changed. Starting preprocessing..."
+    )
+    preprocessing_start_time = time.time()
+
+    start_time = time.time()
+    normalizer = DataNormalizer(config_data=config)
+    norm_metadata = normalizer.calculate_stats(raw_hdf5_paths, splits["train"])
+    if not save_json(norm_metadata, metadata_path):
+        logger.error("Failed to save normalization metadata. Exiting.")
+        return False
+    logger.info(
+        f"Normalization metadata computed and saved in {time.time() - start_time:.2f}s."
+    )
+
+    file_map = {path.stem: path for path in raw_hdf5_paths if path.is_file()}
+    data_spec = config["data_specification"]
+    input_vars = data_spec["input_variables"]
+    global_vars = data_spec.get("global_variables", [])
+    target_vars = data_spec["target_variables"]
+    padding_value = data_spec["padding_value"]
+    max_seq_len = config["model_hyperparameters"]["max_sequence_length"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device} for normalization.")
+
+    for split_name, split_indices in all_splits.items():
+        if not split_indices:
+            logger.warning(f"No indices for '{split_name}' split. Skipping.")
+            continue
+
+        split_start_time = time.time()
+        grouped_indices = _group_indices_by_file(split_indices)
+        split_dir = processed_dir / split_name
+        seq_dir = split_dir / "sequence_inputs"
+        tgt_dir = split_dir / "targets"
+        glb_dir = split_dir / "globals" if global_vars else None
+        ensure_dirs(seq_dir, tgt_dir, glb_dir)
+
+        num_shards = (len(split_indices) + shard_size - 1) // shard_size
+        split_metadata = {
+            "total_samples": len(split_indices),
+            "shard_size": shard_size,
+            "num_shards": num_shards,
+            "sequence_length": max_seq_len,
+            "has_globals": bool(global_vars),
+        }
+        save_json(split_metadata, split_dir / "metadata.json")
+
+        shard_buffers = {
+            "sequence_inputs": [],
+            "targets": [],
+            "globals": [] if global_vars else None,
+        }
+        num_samples_in_buffer = 0
+        current_shard_idx = 0
+
+        logger.info(f"Processing {split_name} split ({len(split_indices)} profiles)...")
+
+        with tqdm(total=len(split_indices), desc=f"Processing {split_name}") as pbar:
+            for file_stem, indices in grouped_indices.items():
+                if file_stem not in file_map:
+                    logger.warning(f"Skipping unknown file '{file_stem}'.")
+                    pbar.update(len(indices))
+                    continue
+
+                with h5py.File(file_map[file_stem], "r") as hf_raw:
+                    for i in range(0, len(indices), HDF5_READ_CHUNK_SIZE):
+                        chunk_idx = np.array(indices[i : i + HDF5_READ_CHUNK_SIZE])
+                        
+                        # Pass max_seq_len to enforce truncation
+                        input_data = _load_and_restore_chunk(
+                            hf_raw, input_vars, chunk_idx, max_seq_len
+                        )
+                        target_data = _load_and_restore_chunk(
+                            hf_raw, target_vars, chunk_idx, max_seq_len
+                        )
+                        global_data = (
+                            _load_and_restore_chunk(hf_raw, global_vars, chunk_idx)
+                            if global_vars
+                            else {}
+                        )
+
+                        if (
+                            input_data is None
+                            or target_data is None
+                            or global_data is None
+                        ):
+                            logger.error(
+                                "A required variable was missing from HDF5 file. Aborting."
+                            )
+                            return False
+
+                        seq_in_np = np.stack(
+                            [input_data[var] for var in input_vars], axis=-1
+                        )
+                        tgt_np = np.stack(
+                            [target_data[var] for var in target_vars], axis=-1
+                        )
+                        glb_np = (
+                            np.stack([global_data[var] for var in global_vars], axis=-1)
+                            if global_vars
+                            else None
+                        )
+
+                        seq_in = torch.from_numpy(seq_in_np).to(device).float()
+                        tgt = torch.from_numpy(tgt_np).to(device).float()
+                        glb = (
+                            torch.from_numpy(glb_np).to(device).float()
+                            if global_vars and glb_np is not None
+                            else None
+                        )
+
+                        # Apply normalization
+                        for j, var in enumerate(input_vars):
+                            method = normalizer.key_methods.get(var, "none")
+                            stats = norm_metadata.get("per_key_stats", {}).get(var)
+                            if stats:
+                                seq_in[..., j] = normalizer.normalize_tensor(
+                                    seq_in[..., j], method, stats
+                                )
+                        for j, var in enumerate(target_vars):
+                            method = normalizer.key_methods.get(var, "none")
+                            stats = norm_metadata.get("per_key_stats", {}).get(var)
+                            if stats:
+                                tgt[..., j] = normalizer.normalize_tensor(
+                                    tgt[..., j], method, stats
+                                )
+                        if global_vars and glb is not None:
+                            for j, var in enumerate(global_vars):
+                                method = normalizer.key_methods.get(var, "none")
+                                stats = norm_metadata.get("per_key_stats", {}).get(var)
+                                if stats:
+                                    glb[..., j] = normalizer.normalize_tensor(
+                                        glb[..., j], method, stats
+                                    )
+
+                        # Apply padding if needed
+                        pad_width = max_seq_len - seq_in.shape[1]
+                        if pad_width > 0:
+                            pad_spec = ((0, 0), (0, pad_width), (0, 0))
+                            seq_in_np = np.pad(
+                                seq_in.cpu().numpy(),
+                                pad_spec,
+                                constant_values=padding_value,
+                            )
+                            tgt_np = np.pad(
+                                tgt.cpu().numpy(),
+                                pad_spec,
+                                constant_values=padding_value,
+                            )
+                        else:
+                            seq_in_np = seq_in.cpu().numpy()
+                            tgt_np = tgt.cpu().numpy()
+                        glb_np = (
+                            glb.cpu().numpy()
+                            if global_vars and glb is not None
+                            else None
+                        )
+
+                        shard_buffers["sequence_inputs"].append(
+                            seq_in_np.astype(np.float32)
+                        )
+                        shard_buffers["targets"].append(tgt_np.astype(np.float32))
+                        if global_vars and glb_np is not None:
+                            shard_buffers["globals"].append(glb_np.astype(np.float32))
+
+                        num_samples_in_buffer += len(chunk_idx)
+                        pbar.update(len(chunk_idx))
+
+                        # Save complete shards
+                        while num_samples_in_buffer >= shard_size:
+                            full_seq_data = np.concatenate(
+                                shard_buffers["sequence_inputs"], axis=0
+                            )
+                            full_tgt_data = np.concatenate(
+                                shard_buffers["targets"], axis=0
+                            )
+                            seq_to_save = full_seq_data[:shard_size]
+                            tgt_to_save = full_tgt_data[:shard_size]
+                            temp_shard_buffer = {
+                                "sequence_inputs": [seq_to_save],
+                                "targets": [tgt_to_save],
+                            }
+
+                            if global_vars and shard_buffers.get("globals"):
+                                full_glb_data = np.concatenate(
+                                    shard_buffers["globals"], axis=0
+                                )
+                                glb_to_save = full_glb_data[:shard_size]
+                                temp_shard_buffer["globals"] = [glb_to_save]
+                                shard_buffers["globals"] = (
+                                    [full_glb_data[shard_size:]]
+                                    if full_glb_data.shape[0] > shard_size
+                                    else []
+                                )
+
+                            _save_shard(
+                                temp_shard_buffer,
+                                seq_dir,
+                                tgt_dir,
+                                glb_dir,
+                                current_shard_idx,
+                            )
+                            current_shard_idx += 1
+
+                            shard_buffers["sequence_inputs"] = (
+                                [full_seq_data[shard_size:]]
+                                if full_seq_data.shape[0] > shard_size
+                                else []
+                            )
+                            shard_buffers["targets"] = (
+                                [full_tgt_data[shard_size:]]
+                                if full_tgt_data.shape[0] > shard_size
+                                else []
+                            )
+                            num_samples_in_buffer -= shard_size
+
+        # Save final partial shard if any samples remain
+        if num_samples_in_buffer > 0:
+            logger.info(
+                f"Saving final shard for '{split_name}' with {num_samples_in_buffer} samples."
+            )
+            _save_shard(
+                shard_buffers, 
+                seq_dir, 
+                tgt_dir, 
+                glb_dir, 
+                current_shard_idx
+            )
+
+        logger.info(
+            f"Completed {split_name} split in {time.time() - split_start_time:.2f}s."
+        )
+
+    _save_preprocessing_summary(
+        processed_dir, config, all_splits, norm_metadata, current_hash
+    )
+    hash_path.write_text(current_hash)
+    total_time = time.time() - preprocessing_start_time
+    logger.info(f"Preprocessing completed successfully in {total_time:.2f}s.")
+    return True
+
+
+__all__ = ["preprocess_data"]
+
+===== /Users/imalsky/Desktop/Problemulator/src/model.py =====
+#!/usr/bin/env python3
+"""
+model.py - Optimized transformer model with FiLM conditioning and full export compatibility.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+import math
+from packaging import version
+from utils import PADDING_VALUE, DTYPE, validate_config
+from torch.export import Dim, export as texport, save as tsave
+import torch.onnx
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+logger = logging.getLogger(__name__)
+
+
+class SinePositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for sequential data."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.d_model = d_model
+        # Pre-register buffer for better export compatibility
+        self.register_buffer('_cached_pe', None, persistent=False)
+        self._cached_seq_len = -1
+
+    def forward(self, x: Tensor) -> Tensor:
+        batch_size, seq_len, d_model = x.shape
+        
+        # Cache positional encoding for efficiency and export compatibility
+        if self._cached_pe is None or self._cached_seq_len != seq_len:
+            position = torch.arange(seq_len, device=x.device, dtype=DTYPE).unsqueeze(1)
+            div_term = torch.exp(
+                torch.arange(0, self.d_model, 2, device=x.device, dtype=DTYPE) * 
+                (-math.log(10000.0) / self.d_model)
+            )
+            pe = torch.zeros(1, seq_len, self.d_model, device=x.device, dtype=DTYPE)
+            pe[0, :, 0::2] = torch.sin(position * div_term)
+            pe[0, :, 1::2] = torch.cos(position * div_term)
+            self.register_buffer('_cached_pe', pe, persistent=False)
+            self._cached_seq_len = seq_len
+        
+        return x + self._cached_pe
+
+
+class FiLMLayer(nn.Module):
+    """
+    Feature-wise Linear Modulation layer with near-identity initialization.
+    Export-compatible implementation without dynamic branching.
+    """
+
+    def __init__(self, context_dim: int, feature_dim: int, clamp_gamma: Optional[float] = 1.0) -> None:
+        super().__init__()
+        self.projection = nn.Linear(context_dim, feature_dim * 2)
+        
+        # Near-identity initialization
+        nn.init.normal_(self.projection.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.projection.bias)
+
+        # Store clamp value as buffer for export compatibility
+        if clamp_gamma is not None:
+            self.register_buffer('clamp_value', torch.tensor(clamp_gamma))
+        else:
+            self.register_buffer('clamp_value', torch.tensor(float('inf')))
+
+    def forward(self, features: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        # Get scale and shift parameters
+        gamma_beta = self.projection(context)
+        delta_gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+
+        # Always apply clamping (with inf it becomes no-op)
+        delta_gamma = torch.clamp(delta_gamma, -self.clamp_value, self.clamp_value)
+        beta = torch.clamp(beta, -self.clamp_value, self.clamp_value)
+
+        # Expand for sequence dimension
+        delta_gamma = delta_gamma.unsqueeze(1)
+        beta = beta.unsqueeze(1)
+
+        # Apply FiLM transformation
+        return features * (1.0 + delta_gamma) + beta
+
+
+class DecomposedTransformerEncoderLayer(nn.Module):
+    """
+    Custom decomposed transformer encoder layer built from primitive operations.
+    Fully compatible with torch.export and torch.compile.
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        norm_first: bool = True,
+        batch_first: bool = True,
+    ) -> None:
+        super().__init__()
+        
+        self.d_model = d_model
+        self.nhead = nhead
+        self.norm_first = norm_first
+        
+        # Multi-head attention
+        self.self_attn = nn.MultiheadAttention(
+            d_model, 
+            nhead, 
+            dropout=dropout, 
+            batch_first=batch_first
+        )
+        
+        # Feed-forward network
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        
+        # Activation
+        if activation == "gelu":
+            self.activation = nn.GELU()
+        elif activation == "relu":
+            self.activation = nn.ReLU()
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+        
+        # Normalization layers
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        # Dropout layers
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self) -> None:
+        """Initialize weights following PyTorch's TransformerEncoderLayer."""
+        nn.init.xavier_uniform_(self.linear1.weight)
+        nn.init.xavier_uniform_(self.linear2.weight)
+        nn.init.constant_(self.linear1.bias, 0)
+        nn.init.constant_(self.linear2.bias, 0)
+    
+    def forward(
+        self, 
+        src: Tensor,
+        src_mask: Optional[Tensor] = None,
+        src_key_padding_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        # Use static branching based on norm_first
+        if self.norm_first:
+            # Pre-norm architecture
+            x = src
+            # Self-attention block
+            x2 = self.norm1(x)
+            x2, _ = self.self_attn(x2, x2, x2, attn_mask=src_mask, 
+                                  key_padding_mask=src_key_padding_mask, need_weights=False)
+            x = x + self.dropout1(x2)
+            
+            # Feed-forward block  
+            x2 = self.norm2(x)
+            x2 = self.linear2(self.dropout(self.activation(self.linear1(x2))))
+            x = x + self.dropout2(x2)
+        else:
+            # Post-norm architecture
+            x = src
+            # Self-attention block
+            x2, _ = self.self_attn(x, x, x, attn_mask=src_mask,
+                                  key_padding_mask=src_key_padding_mask, need_weights=False)
+            x = x + self.dropout1(x2)
+            x = self.norm1(x)
+            
+            # Feed-forward block
+            x2 = self.linear2(self.dropout(self.activation(self.linear1(x))))
+            x = x + self.dropout2(x2)
+            x = self.norm2(x)
+        
+        return x
+
+
+class TransformerBlock(nn.Module):
+    """Combined transformer + optional FiLM block to avoid dynamic control flow."""
+    
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        global_input_dim: int,
+        film_clamp: Optional[float] = 1.0,
+    ):
+        super().__init__()
+        self.has_film = global_input_dim > 0
+        
+        self.transformer = DecomposedTransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            norm_first=True,
+            batch_first=True,
+        )
+        
+        if self.has_film:
+            self.film = FiLMLayer(global_input_dim, d_model, clamp_gamma=film_clamp)
+    
+    def forward(
+        self,
+        x: Tensor,
+        global_features: Optional[Tensor] = None,
+        src_key_padding_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        # Always pass through transformer
+        x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
+        
+        # Apply FiLM if it exists and global features are provided
+        # This avoids dynamic branching - if no FiLM layer exists, this is skipped at module level
+        if self.has_film and global_features is not None:
+            x = self.film(x, global_features)
+        
+        return x
+
+
+class PredictionModel(nn.Module):
+    """Transformer for atmospheric profile regression with deep FiLM conditioning."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        global_input_dim: int,
+        output_dim: int,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_encoder_layers: int = 6,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        padding_value: float = PADDING_VALUE,
+        film_clamp: Optional[float] = 1.0,
+    ) -> None:
+        super().__init__()
+
+        if d_model % nhead != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead})")
+
+        self.d_model = d_model
+        self.has_global_features = global_input_dim > 0
+        # Store padding value as buffer for export compatibility
+        self.register_buffer('padding_value', torch.tensor(padding_value))
+
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, d_model), 
+            nn.LayerNorm(d_model), 
+            nn.GELU()
+        )
+
+        # Positional encoding
+        self.pos_encoder = SinePositionalEncoding(d_model)
+
+        # Build transformer blocks with integrated FiLM
+        self.blocks = nn.ModuleList()
+        
+        # Initial FiLM if we have global features
+        if self.has_global_features:
+            self.initial_film = FiLMLayer(global_input_dim, d_model, clamp_gamma=film_clamp)
+        else:
+            self.initial_film = None
+            
+        # Transformer blocks
+        for _ in range(num_encoder_layers):
+            self.blocks.append(
+                TransformerBlock(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                    dropout=dropout,
+                    global_input_dim=global_input_dim,
+                    film_clamp=film_clamp,
+                )
+            )
+
+        # Output projection
+        self.output_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, output_dim),
+        )
+
+        self._init_weights()
+
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logger.info(
+            f"PredictionModel created with {trainable_params:,} trainable parameters. "
+            f"Architecture: d_model={d_model}, nhead={nhead}, layers={num_encoder_layers}"
+        )
+
+    def _init_weights(self) -> None:
+        """Initialize weights for all layers except FiLM and Transformer blocks."""
+        for module in self.modules():
+            if isinstance(module, (FiLMLayer, DecomposedTransformerEncoderLayer, TransformerBlock)):
+                continue  # These have their own initialization
+            elif isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        sequence: Tensor,
+        global_features: Optional[Tensor] = None,
+        sequence_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        # Project input features to model dimension
+        x = self.input_proj(sequence)
+
+        # Add positional encoding
+        x = self.pos_encoder(x)
+        
+        # Apply initial FiLM if it exists
+        if self.initial_film is not None and global_features is not None:
+            x = self.initial_film(x, global_features)
+
+        # Pass through transformer blocks
+        for block in self.blocks:
+            x = block(x, global_features, sequence_mask)
+
+        # Project to output dimension
+        output = self.output_proj(x)
+
+        # Mask padding positions
+        if sequence_mask is not None:
+            # Create mask for output dimension
+            output_mask = sequence_mask.unsqueeze(-1).expand_as(output)
+            output = torch.where(output_mask, self.padding_value, output)
+
+        return output
+
+
+def create_prediction_model(
+    config: Dict[str, Any],
+    device: Optional[torch.device] = None,
+    compile_model: bool = True,
+) -> PredictionModel:
+    """Create a prediction model with optional compilation."""
+    validate_config(config)
+
+    data_spec = config["data_specification"]
+    model_params = config["model_hyperparameters"]
+
+    if device is None:
+        device = torch.device("cpu")
+
+    model = PredictionModel(
+        input_dim=len(data_spec["input_variables"]),
+        global_input_dim=len(data_spec.get("global_variables", [])),
+        output_dim=len(data_spec["target_variables"]),
+        d_model=model_params.get("d_model", 256),
+        nhead=model_params.get("nhead", 8),
+        num_encoder_layers=model_params.get("num_encoder_layers", 6),
+        dim_feedforward=model_params.get("dim_feedforward", 1024),
+        dropout=float(model_params.get("dropout", 0.1)),
+        padding_value=float(data_spec.get("padding_value", PADDING_VALUE)),
+        film_clamp=1.0,
+    )
+
+    model.to(device=device)
+
+    # Conditionally compile the model
+    if compile_model:
+        compile_enabled = config.get("miscellaneous_settings", {}).get("torch_compile", False)
+        compile_mode = config.get("miscellaneous_settings", {}).get("compile_mode", "default")
+
+        if (
+            version.parse(torch.__version__) >= version.parse("2.0.0")
+            and device.type == "cuda"
+            and compile_enabled
+        ):
+            try:
+                logger.info(f"Attempting torch.compile with mode='{compile_mode}'")
+                # Add fullgraph=True for better optimization if no dynamic control flow
+                compile_kwargs = {"mode": compile_mode}
+                # Only use fullgraph if we're confident there are no graph breaks
+                if compile_mode == "max-autotune":
+                    compile_kwargs["fullgraph"] = True
+                    
+                model = torch.compile(model, **compile_kwargs)
+                logger.info("Model compiled successfully")
+            except Exception as e:
+                logger.warning(f"torch.compile failed: {e}. Proceeding without compilation.")
+        elif compile_enabled and device.type != "cuda":
+            logger.info("torch.compile is only enabled for CUDA devices.")
+
+    logger.info(f"Model moved to device: {device}")
+    return model
+
+
+def export_model(
+    model: nn.Module,
+    example_input: Dict[str, Tensor],
+    save_path: Union[str, Path],
+    config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Export model with torch.export, ensuring compatibility and correctness.
+    Performs validation to ensure exported model produces identical results.
+    """
+    save_path = Path(save_path)
+    save_dir = save_path.parent
+    model_name = save_path.stem
+
+    if config is not None and not config.get("miscellaneous_settings", {}).get("torch_export", True):
+        logger.info("Model export disabled in config – skipping.")
+        return
+
+    model.eval()
+
+    # Always export from CPU to avoid device-specific issues
+    original_device = next(model.parameters()).device
+    
+    # Unwrap torch.compile wrapper if present
+    if hasattr(model, "_orig_mod"):
+        logger.info("Extracting original model from compiled wrapper")
+        model = model._orig_mod
+    
+    # Move model to CPU first
+    model = model.to('cpu')
+
+    # Then move example inputs to CPU
+    sequence = example_input["sequence"].to('cpu')
+    global_features = example_input.get("global_features")
+    if global_features is not None:
+        global_features = global_features.to('cpu')
+    sequence_mask = example_input.get("sequence_mask")
+    if sequence_mask is not None:
+        sequence_mask = sequence_mask.to('cpu')
+
+    # Prepare inputs for export (ensure batch size > 1 for dynamic shapes)
+    batch_size = sequence.shape[0]
+    if batch_size == 1:
+        # Duplicate inputs to create batch size 2
+        export_sequence = torch.cat([sequence, sequence], dim=0)
+        export_global = torch.cat([global_features, global_features], dim=0) if global_features is not None else None
+        export_mask = torch.cat([sequence_mask, sequence_mask], dim=0) if sequence_mask is not None else None
+    else:
+        export_sequence = sequence
+        export_global = global_features
+        export_mask = sequence_mask
+
+    # Prepare kwargs for export
+    kwargs: Dict[str, Tensor] = {"sequence": export_sequence}
+    if export_global is not None:
+        kwargs["global_features"] = export_global
+    if export_mask is not None:
+        kwargs["sequence_mask"] = export_mask
+
+    # Define dynamic shapes
+    batch_dim = Dim("batch", min=1, max=1024)  # Reasonable max batch size
+    
+    dynamic_shapes: Dict[str, Any] = {
+        "sequence": {0: batch_dim}
+    }
+    if export_global is not None:
+        dynamic_shapes["global_features"] = {0: batch_dim}
+    if export_mask is not None:
+        dynamic_shapes["sequence_mask"] = {0: batch_dim}
+
+    try:
+        # Export with torch.export
+        with torch.no_grad():
+            # Use strict=False to allow some flexibility in tracing
+            exported_program = texport(
+                model, 
+                args=(), 
+                kwargs=kwargs, 
+                dynamic_shapes=dynamic_shapes,
+                strict=False
+            )
+        
+        # Save exported model
+        export_path = save_dir / f"{model_name}_exported.pt2"
+        tsave(exported_program, str(export_path))
+        logger.info(f"Model exported successfully to {export_path}")
+        
+        # Validate exported model
+        logger.info("Validating exported model...")
+        with torch.no_grad():
+            # Test with original batch size
+            test_kwargs = {
+                "sequence": sequence,
+                "global_features": global_features,
+                "sequence_mask": sequence_mask
+            }
+            test_kwargs = {k: v for k, v in test_kwargs.items() if v is not None}
+            
+            original_output = model(**test_kwargs)
+            exported_output = exported_program.module()(**test_kwargs)
+            
+            if not torch.allclose(original_output, exported_output, rtol=1e-4, atol=1e-5):
+                logger.warning("Exported model output differs from original!")
+                max_diff = torch.max(torch.abs(original_output - exported_output)).item()
+                logger.warning(f"Maximum difference: {max_diff}")
+            else:
+                logger.info("✓ Exported model validation passed")
+                
+    except Exception as exc:
+        logger.error(f"Model export failed: {exc}", exc_info=True)
+        
+        # Try fallback without dynamic shapes
+        logger.info("Attempting fallback export with static shapes...")
+        try:
+            with torch.no_grad():
+                static_exported = texport(
+                    model,
+                    args=(),
+                    kwargs=kwargs,
+                    strict=False
+                )
+            static_path = save_dir / f"{model_name}_exported_static.pt2"
+            tsave(static_exported, str(static_path))
+            logger.warning(f"Static shape export succeeded: {static_path}")
+        except Exception as fallback_exc:
+            logger.error(f"Fallback export also failed: {fallback_exc}")
+    
+    finally:
+        # Model is already on CPU, so just restore to original device if needed
+        if original_device.type != 'cpu':
+            model.to(original_device)
+
+
+__all__ = ["PredictionModel", "create_prediction_model", "export_model"]
+
+===== /Users/imalsky/Desktop/Problemulator/src/dataset.py =====
+#!/usr/bin/env python3
+"""
+dataset.py - Optimized data loader with efficient RAM loading.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import psutil
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Tuple
+
+import numpy as np
+import torch
+from torch import Tensor
+from torch.utils.data import Dataset
+
+from utils import DTYPE, PADDING_VALUE
+
+logger = logging.getLogger(__name__)
+
+
+class AtmosphericDataset(Dataset):
+    def __init__(
+        self,
+        dir_path: Path,
+        config: Dict[str, Any],
+        indices: List[int],
+        force_disk_loading: bool = False,
+    ) -> None:
+        super().__init__()
+        if not dir_path.is_dir():
+            raise RuntimeError(f"Directory not found: {dir_path}")
+
+        self.dir_path = dir_path
+        self.config = config
+        self.indices = indices
+        self.force_disk_loading = force_disk_loading
+
+        data_spec = self.config["data_specification"]
+        self.input_variables = data_spec["input_variables"]
+        self.target_variables = data_spec["target_variables"]
+        self.global_variables = data_spec.get("global_variables", [])
+        
+        # Safe padding comparison
+        self.padding_value = float(data_spec.get("padding_value", PADDING_VALUE))
+        self.padding_epsilon = 1e-6
+
+        self._validate_structure()
+        self._load_metadata()
+        
+        # Estimate memory requirements and decide loading strategy
+        self._estimate_memory_and_load()
+
+        logger.info(
+            f"AtmosphericDataset initialized: {len(self.indices)} samples from {dir_path}"
+            f" (mode: {'RAM' if self.ram_mode else 'disk cache'})"
+        )
+
+    def _validate_structure(self) -> None:
+        required_dirs = ["sequence_inputs", "targets"]
+        if self.global_variables:
+            required_dirs.append("globals")
+
+        missing = [d for d in required_dirs if not (self.dir_path / d).exists()]
+        if missing:
+            raise RuntimeError(f"Missing directories in {self.dir_path}: {missing}")
+
+    def _load_metadata(self) -> None:
+        """Load split metadata to understand shard structure."""
+        metadata_path = self.dir_path / "metadata.json"
+        if not metadata_path.exists():
+            raise RuntimeError(f"Missing metadata.json in {self.dir_path}")
+
+        with open(metadata_path, "r") as f:
+            self.metadata = json.load(f)
+
+        self.shard_size = self.metadata["shard_size"]
+        self.total_samples = self.metadata["total_samples"]
+        self.num_shards = self.metadata["num_shards"]
+        self.has_globals = self.metadata["has_globals"]
+        self.sequence_length = self.metadata["sequence_length"]
+
+    def _estimate_memory_and_load(self) -> None:
+        """Estimate memory requirements and load data accordingly."""
+        # Get shard files
+        seq_dir = self.dir_path / "sequence_inputs"
+        self.seq_shards = sorted(seq_dir.glob("shard_*.npy"))
+        
+        if len(self.seq_shards) == 0:
+            raise RuntimeError(f"No shard files found in {seq_dir}")
+        
+        # Estimate memory requirements using the first shard of each array
+        seq_shard = np.load(self.seq_shards[0], mmap_mode='r')               # [Ns, T, Din]
+        seq_bytes_per_sample = seq_shard.itemsize * int(np.prod(seq_shard.shape[1:]))
+
+        tgt_path0 = self.dir_path / "targets" / self.seq_shards[0].name
+        if not tgt_path0.exists():
+            raise RuntimeError(f"Missing target shard file: {tgt_path0}")
+        tgt_shard = np.load(tgt_path0, mmap_mode='r')                         # [Ns, T, Dout]
+        tgt_bytes_per_sample = tgt_shard.itemsize * int(np.prod(tgt_shard.shape[1:]))
+
+        total_bytes_per_sample = seq_bytes_per_sample + tgt_bytes_per_sample
+
+        if self.has_globals:
+            glb_path0 = self.dir_path / "globals" / self.seq_shards[0].name
+            if not glb_path0.exists():
+                raise RuntimeError(f"Missing globals shard file: {glb_path0}")
+            glb_shard = np.load(glb_path0, mmap_mode='r')                     # [Ns, G]
+            glb_bytes_per_sample = glb_shard.itemsize * int(glb_shard.shape[1])
+            total_bytes_per_sample += glb_bytes_per_sample
+
+        total_bytes_needed = total_bytes_per_sample * len(self.indices)
+        total_gb_needed = total_bytes_needed / (1024**3)
+        
+        # Get available memory
+        available_memory = psutil.virtual_memory().available
+        available_gb = available_memory / (1024**3)
+        
+        # Safety margin - use only 80% of available memory
+        safe_available_gb = available_gb * 0.8
+        
+        logger.info(
+            f"Memory estimate: {total_gb_needed:.2f} GB needed, "
+            f"{safe_available_gb:.2f} GB safely available"
+        )
+        
+        # Decide loading strategy
+        if self.force_disk_loading:
+            logger.info("Force disk loading enabled - using disk cache mode")
+            self._setup_disk_cache()
+            self.ram_mode = False
+        elif total_gb_needed < safe_available_gb:
+            logger.info("Loading entire dataset into RAM...")
+            self._load_all_to_ram()
+            self.ram_mode = True
+        else:
+            logger.warning(
+                f"Dataset too large for RAM ({total_gb_needed:.2f} GB > "
+                f"{safe_available_gb:.2f} GB available). Using disk cache mode."
+            )
+            self._setup_disk_cache()
+            self.ram_mode = False
+    
+    def _load_all_to_ram(self) -> None:
+        """Load entire dataset into RAM efficiently by processing shards in order."""
+        n_samples = len(self.indices)
+        seq_shape = (n_samples, self.sequence_length, len(self.input_variables))
+        tgt_shape = (n_samples, self.sequence_length, len(self.target_variables))
+        
+        self.ram_sequences = np.zeros(seq_shape, dtype=np.float32)
+        self.ram_targets = np.zeros(tgt_shape, dtype=np.float32)
+        
+        if self.has_globals:
+            glb_shape = (n_samples, len(self.global_variables))
+            self.ram_globals = np.zeros(glb_shape, dtype=np.float32)
+        
+        # Create index mapping
+        self.ram_index_map = {}
+        
+        # Group indices by shard for efficient loading
+        indices_by_shard = {}
+        for idx, original_idx in enumerate(self.indices):
+            shard_idx = original_idx // self.shard_size
+            within_shard_idx = original_idx % self.shard_size
+            if shard_idx not in indices_by_shard:
+                indices_by_shard[shard_idx] = []
+            indices_by_shard[shard_idx].append((idx, within_shard_idx, original_idx))
+        
+        # Load data shard by shard to minimize file I/O
+        processed = 0
+        for shard_idx in sorted(indices_by_shard.keys()):
+            shard_name = f"shard_{shard_idx:06d}.npy"
+            
+            # Load entire shard once
+            seq_data = np.load(self.dir_path / "sequence_inputs" / shard_name)
+            tgt_data = np.load(self.dir_path / "targets" / shard_name)
+            if self.has_globals:
+                glb_data = np.load(self.dir_path / "globals" / shard_name)
+            
+            # Extract all samples from this shard
+            for idx, within_shard_idx, original_idx in indices_by_shard[shard_idx]:
+                self.ram_sequences[idx] = seq_data[within_shard_idx]
+                self.ram_targets[idx] = tgt_data[within_shard_idx]
+                if self.has_globals:
+                    self.ram_globals[idx] = glb_data[within_shard_idx]
+                self.ram_index_map[idx] = original_idx
+                processed += 1
+            
+            if processed % 10000 == 0 or processed == n_samples:
+                logger.info(f"Loaded {processed}/{n_samples} samples into RAM")
+    
+    def _setup_disk_cache(self) -> None:
+        """Setup disk caching with proper memory mapping."""
+        # Map indices to shards
+        self.effective_indices = []
+        for idx in self.indices:
+            if idx >= self.total_samples:
+                logger.warning(f"Index {idx} exceeds total samples {self.total_samples}")
+                continue
+            shard_idx = idx // self.shard_size
+            within_shard_idx = idx % self.shard_size
+            self.effective_indices.append((idx, shard_idx, within_shard_idx))
+        
+        self._shard_cache = {}
+        self._mmap_cache = {} 
+        self._cache_size = min(len(self.seq_shards), 200)
+        self._cache_order = []
+        
+        # Pre-load first N shards
+        logger.info(f"Pre-loading up to {self._cache_size} shards into cache...")
+        unique_shard_indices = sorted(set(idx[1] for idx in self.effective_indices))
+        for i, shard_idx in enumerate(unique_shard_indices[:self._cache_size]):
+            self._load_shard(shard_idx)
+            if (i + 1) % 20 == 0:
+                logger.info(f"Pre-loaded {i + 1} shards")
+
+    def _load_shard(self, shard_idx: int) -> Dict[str, np.ndarray]:
+        """Load a shard with proper memory mapping for efficient disk access."""
+        # Check if already in memory cache
+        if shard_idx in self._shard_cache:
+            self._cache_order.remove(shard_idx)
+            self._cache_order.append(shard_idx)
+            return self._shard_cache[shard_idx]
+        
+        # Check if already memory-mapped
+        if shard_idx in self._mmap_cache:
+            return self._mmap_cache[shard_idx]
+
+        # Load shard files
+        shard_name = f"shard_{shard_idx:06d}.npy"
+        seq_path = self.dir_path / "sequence_inputs" / shard_name
+        tgt_path = self.dir_path / "targets" / shard_name
+
+        if not seq_path.exists() or not tgt_path.exists():
+            raise RuntimeError(f"Missing shard files for shard {shard_idx}")
+
+        seq_size = seq_path.stat().st_size
+        use_mmap = seq_size > 50 * 1024 * 1024  # Memory map if > 50MB
+        
+        if use_mmap:
+            # Use memory mapping for large files
+            shard_data = {
+                "sequence_inputs": np.load(seq_path, mmap_mode='r'),
+                "targets": np.load(tgt_path, mmap_mode='r'),
+            }
+            
+            if self.has_globals:
+                glb_path = self.dir_path / "globals" / shard_name
+                if glb_path.exists():
+                    shard_data["globals"] = np.load(glb_path, mmap_mode='r')
+                else:
+                    raise RuntimeError(f"Missing globals shard for shard {shard_idx}")
+            
+            # Store in mmap cache (no LRU needed as these are lightweight)
+            self._mmap_cache[shard_idx] = shard_data
+            return shard_data
+        
+        else:
+            # Load small files fully into memory with caching
+            shard_data = {
+                "sequence_inputs": np.load(seq_path),
+                "targets": np.load(tgt_path),
+            }
+
+            if self.has_globals:
+                glb_path = self.dir_path / "globals" / shard_name
+                if glb_path.exists():
+                    shard_data["globals"] = np.load(glb_path)
+                else:
+                    raise RuntimeError(f"Missing globals shard for shard {shard_idx}")
+
+            # Add to cache with LRU eviction
+            if len(self._cache_order) >= self._cache_size:
+                # Evict oldest
+                oldest = self._cache_order.pop(0)
+                del self._shard_cache[oldest]
+
+            self._shard_cache[shard_idx] = shard_data
+            self._cache_order.append(shard_idx)
+
+            return shard_data
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> Tuple[Dict[str, Tensor], Tensor]:
+        """Get item with proper handling of memory-mapped arrays."""
+        if not (0 <= idx < len(self)):
+            raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
+
+        if self.ram_mode:
+            # Fast path: direct RAM access
+            seq_in_np = self.ram_sequences[idx]
+            tgt_np = self.ram_targets[idx]
+            
+            inputs = {"sequence": torch.from_numpy(seq_in_np.copy()).to(DTYPE)}
+            
+            if self.has_globals:
+                glb_np = self.ram_globals[idx]
+                inputs["global_features"] = torch.from_numpy(glb_np.copy()).to(DTYPE)
+            
+            targets = torch.from_numpy(tgt_np.copy()).to(DTYPE)
+        else:
+            # Disk cache path
+            global_idx, shard_idx, within_shard_idx = self.effective_indices[idx]
+            
+            # Load the shard (may be memory-mapped)
+            shard_data = self._load_shard(shard_idx)
+            
+            # Extract the specific sample
+            seq_in_np = shard_data["sequence_inputs"][within_shard_idx]
+            tgt_np = shard_data["targets"][within_shard_idx]
+            
+            # Always copy from memory-mapped arrays to ensure tensor owns memory
+            if hasattr(seq_in_np, 'base') and seq_in_np.base is not None:
+                seq_in_np = seq_in_np.copy()
+                tgt_np = tgt_np.copy()
+            
+            inputs = {"sequence": torch.from_numpy(seq_in_np).to(DTYPE)}
+            
+            if self.has_globals and "globals" in shard_data:
+                glb_np = shard_data["globals"][within_shard_idx]
+                if hasattr(glb_np, 'base') and glb_np.base is not None:
+                    glb_np = glb_np.copy()
+                inputs["global_features"] = torch.from_numpy(glb_np).to(DTYPE)
+            
+            targets = torch.from_numpy(tgt_np).to(DTYPE)
+
+        return inputs, targets
+
+
+def create_dataset(
+    dir_path: Path,
+    config: Dict[str, Any],
+    indices: List[int],
+) -> AtmosphericDataset:
+    logger.info(f"Creating dataset from {dir_path}...")
+    return AtmosphericDataset(
+        dir_path=dir_path,
+        config=config,
+        indices=indices,
+    )
+
+
+def pad_collate(
+    batch: List[Tuple[Dict[str, Tensor], Tensor]],
+    padding_value: float = PADDING_VALUE,
+    padding_epsilon: float = 1e-6,
+):
+    """Collate function with safe padding comparison."""
+    inputs, targets = zip(*batch)
+
+    seq = torch.stack([d["sequence"] for d in inputs])
+
+    # Safe padding comparison - True means padding position
+    seq_mask = (torch.abs(seq - padding_value) < padding_epsilon).all(dim=-1)
+
+    batched = {"sequence": seq}
+    masks = {"sequence": seq_mask}
+
+    if "global_features" in inputs[0]:
+        batched["global_features"] = torch.stack([d["global_features"] for d in inputs])
+
+    tgt = torch.stack(targets)
+    # Safe padding comparison - True means padding position  
+    tgt_mask = (torch.abs(tgt - padding_value) < padding_epsilon).all(dim=-1)
+
+    return batched, masks, tgt, tgt_mask
+
+
+def create_collate_fn(padding_value: float) -> Callable:
+    return partial(pad_collate, padding_value=padding_value)
+
+
+__all__ = ["AtmosphericDataset", "create_dataset", "create_collate_fn"]
+
+===== /Users/imalsky/Desktop/Problemulator/src/utils.py =====
+#!/usr/bin/env python3
+"""
+utils.py - Helper functions for configuration, logging, and data handling.
+
+This module provides utilities for:
+- Configuration file loading and validation
+- Logging setup
+- Random seed management
+- Dataset split generation and loading
+- JSON serialization with custom handlers
+- Hash computation for data integrity checks
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import random
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Union
+import h5py
+
+import numpy as np
+import torch
+
+try:
+    import json5 as _json_backend
+
+    _HAS_JSON5 = True
+except ImportError:
+    _json_backend = json
+    _HAS_JSON5 = False
+
+DTYPE = torch.float32
+PADDING_VALUE = -9999.0
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s - %(message)s"
+DEFAULT_SEED = 42
+METADATA_FILENAME = "normalization_metadata.json"
+UTF8_ENCODING = "utf-8"
+UTF8_SIG_ENCODING = "utf-8-sig"
+HASH_ALGORITHM = "sha256"
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(
+    level: int = logging.INFO,
+    log_file: Union[str, Path, None] = None,
+    force: bool = False,
+) -> None:
+    root_logger = logging.getLogger()
+
+    if force:
+        while root_logger.handlers:
+            handler = root_logger.handlers.pop()
+            handler.close()
+
+    root_logger.setLevel(level)
+    formatter = logging.Formatter(LOG_FORMAT)
+
+    if not root_logger.handlers:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+
+    if log_file:
+        try:
+            log_file_path = Path(log_file)
+            log_file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(
+                log_file_path, mode="a", encoding=UTF8_ENCODING
+            )
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
+            print(f"Logging to console and file: {log_file_path.resolve()}")
+        except OSError as e:
+            print(
+                f"Error setting up file logging for {log_file}: {e}. Using console only."
+            )
+    else:
+        print("Logging to console only.")
+
+
+def load_config(path: Union[str, Path]) -> Dict[str, Any]:
+    config_path = Path(path)
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+
+    try:
+        with open(config_path, "r", encoding=UTF8_SIG_ENCODING) as f:
+            if _HAS_JSON5:
+                config_dict = _json_backend.load(f)
+            else:
+                logger.warning(
+                    "JSON5 not available; comments in config will cause errors."
+                )
+                config_dict = json.load(f)
+
+        validate_config(config_dict)
+
+        backend = "JSON5" if _HAS_JSON5 else "JSON"
+        logger.info(f"Loaded and validated {backend} config from {config_path}.")
+        return config_dict
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Failed to parse JSON from {config_path}: {e}") from e
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load or validate config {config_path}: {e}"
+        ) from e
+
+
+def validate_config(config: Dict[str, Any]) -> None:
+    data_spec = config.get("data_specification")
+    if not isinstance(data_spec, dict):
+        raise ValueError(
+            "Config section 'data_specification' is missing or not a dictionary."
+        )
+    if not data_spec.get("input_variables"):
+        raise ValueError("'input_variables' must be a non-empty list.")
+    if not data_spec.get("target_variables"):
+        raise ValueError("'target_variables' must be a non-empty list.")
+
+    model_params = config.get("model_hyperparameters")
+    if not isinstance(model_params, dict):
+        raise ValueError(
+            "Config section 'model_hyperparameters' is missing or not a dictionary."
+        )
+
+    d_model = model_params.get("d_model", 0)
+    nhead = model_params.get("nhead", 0)
+    if not isinstance(d_model, int) or d_model <= 0:
+        raise ValueError("'d_model' must be a positive integer.")
+    if not isinstance(nhead, int) or nhead <= 0:
+        raise ValueError("'nhead' must be a positive integer.")
+    if d_model % nhead != 0:
+        raise ValueError(
+            f"'d_model' ({d_model}) must be divisible by 'nhead' ({nhead})."
+        )
+
+
+def ensure_dirs(*paths: Union[str, Path, None]) -> bool:
+    try:
+        for path in paths:
+            if path is not None:  # Skip None paths
+                Path(path).mkdir(parents=True, exist_ok=True)
+        return True
+    except OSError as e:
+        logger.error(f"Failed to create directories {paths}: {e}")
+        return False
+
+
+def _json_serializer(obj: Any) -> Any:
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, Path):
+        return str(obj.resolve())
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable.")
+
+
+def save_json(data: Dict[str, Any], path: Union[str, Path]) -> bool:
+    try:
+        json_path = Path(path)
+        ensure_dirs(json_path.parent)
+
+        with json_path.open("w", encoding=UTF8_ENCODING) as f:
+            json.dump(data, f, indent=2, default=_json_serializer, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+
+    except (OSError, TypeError) as e:
+        logger.error(f"Failed to save JSON to {path}: {e}", exc_info=True)
+        return False
+
+
+def seed_everything(seed: int = DEFAULT_SEED) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    logger.info(f"Global random seed set to {seed}.")
+
+
+def generate_dataset_splits(
+    raw_hdf5_paths: List[Path],
+    val_frac: float = 0.15,
+    test_frac: float = 0.15,
+    random_seed: int = DEFAULT_SEED,
+) -> Dict[str, List[Tuple[str, int]]]:
+    if not (0 < val_frac < 1 and 0 < test_frac < 1 and val_frac + test_frac < 1):
+        raise ValueError(f"Invalid split fractions: val={val_frac}, test={test_frac}")
+
+    all_indices = []
+    total_profiles = 0
+
+    for h5_path in raw_hdf5_paths:
+        if not h5_path.is_file():
+            logger.warning(f"Skipping missing HDF5 file: {h5_path}")
+            continue
+        try:
+            with h5py.File(h5_path, "r") as hf:
+                if not hf.keys():
+                    continue
+                first_key = next(iter(hf.keys()))
+                n_profiles = hf[first_key].shape[0]
+                assert all(
+                    d.shape[0] == n_profiles for d in hf.values()
+                ), "Inconsistent leading dimensions in HDF5"
+                file_stem = h5_path.stem
+                all_indices.extend([(file_stem, i) for i in range(n_profiles)])
+                total_profiles += n_profiles
+        except (OSError, AssertionError) as e:
+            logger.warning(f"Failed to read {h5_path}: {e}. Skipping.")
+
+    if total_profiles == 0:
+        raise RuntimeError("No profiles found across all HDF5 files. Exiting.")
+
+    n_val = max(1, int(round(total_profiles * val_frac)))
+    n_test = max(1, int(round(total_profiles * test_frac)))
+    n_train = total_profiles - n_val - n_test
+    if n_train <= 0:
+        raise ValueError(f"Training split empty. Reduce val/test fractions.")
+
+    rng = random.Random(random_seed)
+    rng.shuffle(all_indices)
+
+    splits = {
+        "train": all_indices[:n_train],
+        "validation": all_indices[n_train : n_train + n_val],
+        "test": all_indices[n_train + n_val :],
+    }
+
+    logger.info(
+        f"Generated splits from {total_profiles} profiles across {len(raw_hdf5_paths)} files: "
+        f"train={len(splits['train'])} ({len(splits['train'])/total_profiles:.1%}), "
+        f"val={len(splits['validation'])} ({len(splits['validation'])/total_profiles:.1%}), "
+        f"test={len(splits['test'])} ({len(splits['test'])/total_profiles:.1%})"
+    )
+
+    return splits
+
+
+def get_config_str(config: Dict[str, Any], section: str, key: str, op_desc: str) -> str:
+    if section not in config or not isinstance(config[section], dict):
+        raise ValueError(
+            f"Config section '{section}' missing or invalid for {op_desc}."
+        )
+
+    path_val = config[section].get(key)
+    if not isinstance(path_val, str) or not path_val.strip():
+        raise ValueError(
+            f"Config key '{key}' in '{section}' missing or empty for {op_desc}."
+        )
+
+    return path_val.strip()
+
+
+def load_or_generate_splits(
+    config: Dict[str, Any],
+    data_root_dir: Path,
+    raw_hdf5_paths: List[Path],
+    model_save_dir: Path,
+) -> Tuple[Dict[str, List[Tuple[str, int]]], Path]:
+    splits_path = None
+
+    try:
+        splits_filename = get_config_str(
+            config, "data_paths_config", "dataset_splits_filename", "dataset splits"
+        )
+        splits_path = data_root_dir / splits_filename
+
+        logger.info(f"Loading dataset splits from: {splits_path}")
+
+        if not splits_path.exists():
+            raise FileNotFoundError(f"Splits file not found: {splits_path}")
+
+        with open(splits_path, "r", encoding=UTF8_ENCODING) as f:
+            splits = json.load(f)
+
+        required_keys = {"train", "validation", "test"}
+        if not required_keys.issubset(splits.keys()):
+            raise ValueError(f"Splits file must contain keys: {required_keys}")
+
+        for key in required_keys:
+            if not isinstance(splits[key], list) or not splits[key]:
+                raise ValueError(f"Split '{key}' must be a non-empty list")
+
+        for split in splits.values():
+            for i, item in enumerate(split):
+                if isinstance(item, list) and len(item) == 2:
+                    split[i] = tuple(item)
+
+        logger.info(f"Loaded splits from {splits_path}")
+        logger.info(
+            f"Split sizes: {len(splits['train'])} train, "
+            f"{len(splits['validation'])} val, {len(splits['test'])} test."
+        )
+        return splits, splits_path
+
+    except (KeyError, ValueError, FileNotFoundError, json.JSONDecodeError) as e:
+        logger.info(f"Could not load splits file. Reason: {e}. Generating new splits.")
+
+    logger.info("Generating new dataset splits...")
+
+    train_params = config.get("training_hyperparameters", {})
+    val_frac = train_params.get("val_frac", 0.15)
+    test_frac = train_params.get("test_frac", 0.15)
+
+    misc_settings = config.get("miscellaneous_settings", {})
+    random_seed = misc_settings.get("random_seed", DEFAULT_SEED)
+
+    splits = generate_dataset_splits(
+        raw_hdf5_paths=raw_hdf5_paths,
+        val_frac=val_frac,
+        test_frac=test_frac,
+        random_seed=random_seed,
+    )
+
+    new_splits_path = model_save_dir / f"splits_generated.json"  # Simplified name
+    if save_json(splits, new_splits_path):
+        logger.info(f"Saved generated splits to {new_splits_path}")
+    else:
+        logger.warning("Failed to save generated splits")
+
+    return splits, new_splits_path
+
+
+def compute_data_hash(config: Dict[str, Any], raw_hdf5_paths: List[Path]) -> str:
+    hasher = hashlib.new(HASH_ALGORITHM)
+    hasher.update(json.dumps(config, sort_keys=True).encode(UTF8_ENCODING))
+    for path in sorted(raw_hdf5_paths):
+        hasher.update(str(path).encode(UTF8_ENCODING))
+
+    return hasher.hexdigest()
+
+def compute_data_hash_with_stats(config: Dict[str, Any], raw_hdf5_paths: List[Path]) -> str:
+    """
+    Compute hash including file modification times and sizes for better integrity checking.
+    
+    This is more robust than compute_data_hash as it will detect if files are modified
+    in-place, not just if their paths change.
+    
+    Args:
+        config: Configuration dictionary
+        raw_hdf5_paths: List of HDF5 file paths
+        
+    Returns:
+        Hexadecimal hash string
+    """
+    hasher = hashlib.new(HASH_ALGORITHM)
+    
+    # Hash the config
+    hasher.update(json.dumps(config, sort_keys=True).encode(UTF8_ENCODING))
+    
+    # Hash file paths, sizes, and modification times
+    for path in sorted(raw_hdf5_paths):
+        hasher.update(str(path).encode(UTF8_ENCODING))
+        if path.is_file():
+            stat = path.stat()
+            # Include file size
+            hasher.update(str(stat.st_size).encode(UTF8_ENCODING))
+            # Include modification time (nanoseconds for precision)
+            hasher.update(str(stat.st_mtime_ns).encode(UTF8_ENCODING))
+        else:
+            # Mark missing files explicitly
+            hasher.update(b"missing")
+    
+    return hasher.hexdigest()
+
+# Also update the __all__ export list to include the new function:
+__all__ = [
+    "DTYPE",
+    "PADDING_VALUE", 
+    "LOG_FORMAT",
+    "DEFAULT_SEED",
+    "METADATA_FILENAME",
+    "setup_logging",
+    "load_config",
+    "validate_config",
+    "ensure_dirs",
+    "save_json",
+    "seed_everything",
+    "generate_dataset_splits",
+    "get_config_str",
+    "load_or_generate_splits",
+    "compute_data_hash",
+    "compute_data_hash_with_stats",  # Add this
+]
+
+===== /Users/imalsky/Desktop/Problemulator/src/train.py =====
+#!/usr/bin/env python3
+"""
+train.py - Optimized model training with corrected loss normalization.
+"""
+from __future__ import annotations
+
+import gc
+import logging
+import random
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import torch
+from torch import nn, optim
+from torch.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    ReduceLROnPlateau,
+    SequentialLR,
+)
+from torch.utils.data import DataLoader
+
+import optuna
+
+from dataset import create_dataset
+from hardware import should_pin_memory
+from model import create_prediction_model, export_model
+from utils import save_json, seed_everything
+
+logger = logging.getLogger(__name__)
+
+# Defaults
+DEFAULT_BATCH_SIZE = 256
+DEFAULT_EPOCHS = 100
+DEFAULT_LR = 1e-4
+DEFAULT_OPTIMIZER = "adamw"
+DEFAULT_GRAD_CLIP = 1.0
+DEFAULT_EARLY_STOPPING_PATIENCE = 20
+DEFAULT_MIN_DELTA = 1e-6
+DEFAULT_GRADIENT_ACCUMULATION = 1
+DEFAULT_NUM_WORKERS = 8
+DEFAULT_MAX_BATCH_FAILURE_RATE = 0.10
+
+
+class DevicePrefetchLoader:
+    """Wraps a DataLoader to prefetch batches to device asynchronously for CUDA."""
+
+    def __init__(self, loader: DataLoader, device: torch.device):
+        self.loader = loader
+        self.device = device
+        self.is_cuda = self.device.type == 'cuda'
+
+    def __iter__(self):
+        if self.is_cuda:
+            stream = torch.cuda.Stream()
+            first = True
+            current_batch = None
+
+            for next_batch in self.loader:
+                with torch.cuda.stream(stream):
+                    next_batch = self._to_device(next_batch)
+                
+                if not first:
+                    yield current_batch
+                else:
+                    first = False
+                
+                torch.cuda.current_stream().wait_stream(stream)
+                current_batch = next_batch
+            
+            if current_batch is not None:
+                yield current_batch
+        else:
+            for batch in self.loader:
+                yield self._to_device(batch)
+
+    def _to_device(self, batch):
+        """Move batch to device."""
+        inputs, masks, targets, tgt_masks = batch
+        non_blocking = self.is_cuda
+
+        device_inputs = {}
+        device_inputs["sequence"] = inputs["sequence"].to(self.device, non_blocking=non_blocking)
+        if "global_features" in inputs:
+            device_inputs["global_features"] = inputs["global_features"].to(
+                self.device, non_blocking=non_blocking
+            )
+
+        device_masks = {}
+        device_masks["sequence"] = masks["sequence"].to(self.device, non_blocking=non_blocking)
+
+        device_targets = targets.to(self.device, non_blocking=non_blocking)
+        device_tgt_masks = tgt_masks.to(self.device, non_blocking=non_blocking)
+
+        return device_inputs, device_masks, device_targets, device_tgt_masks
+
+    def __len__(self):
+        return len(self.loader)
+
+
+class ModelTrainer:
+    """Orchestrates training, validation, and testing of the model."""
+
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        device: torch.device,
+        save_dir: Path,
+        processed_dir: Path,
+        splits: Dict[str, List[Tuple[str, int]]],
+        collate_fn: Callable,
+        optuna_trial: Optional[optuna.Trial] = None,
+    ) -> None:
+        self.cfg = config
+        self.device = device
+        self.save_dir = save_dir
+        self.model = None
+        self.current_epoch = 0
+        self.trial = optuna_trial
+
+        misc_cfg = self.cfg.get("miscellaneous_settings", {})
+        train_params = self.cfg.get("training_hyperparameters", {})
+        self.max_batch_failure_rate = train_params.get(
+            "max_batch_failure_rate", DEFAULT_MAX_BATCH_FAILURE_RATE
+        )
+        
+        # Performance optimizations for A100
+        if self.device.type == "cuda" and "A100" in torch.cuda.get_device_name(0):
+            logger.info("Detected A100 GPU - applying performance optimizations")
+            if not train_params.get("use_amp", False):
+                logger.info("Enabling AMP for A100")
+                train_params["use_amp"] = True
+            if train_params.get("batch_size", DEFAULT_BATCH_SIZE) < 256:
+                logger.info(f"Increasing batch size from {train_params.get('batch_size', DEFAULT_BATCH_SIZE)} to 256")
+                train_params["batch_size"] = 256
+        
+        if misc_cfg.get("detect_anomaly", False):
+            torch.autograd.set_detect_anomaly(True)
+            logger.warning("Anomaly detection enabled - training will be slower.")
+            
+        save_json(splits, self.save_dir / "dataset_splits.json")
+        self._setup_datasets(processed_dir, splits)
+        self._build_dataloaders(collate_fn, misc_cfg, train_params)
+        self._build_model()
+        self._build_optimizer(train_params)
+        self._build_scheduler(train_params)
+        self._setup_training_params(train_params)
+        self._setup_logging()
+        self._save_metadata()
+        self.has_val = self.val_loader is not None and len(self.val_loader) > 0
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def _setup_datasets(
+        self, processed_dir: Path, splits: Dict[str, List[Tuple[str, int]]]
+    ) -> None:
+        """Setup datasets from preprocessed NPY shards."""
+        fraction = self.cfg.get("training_hyperparameters", {}).get(
+            "dataset_fraction_to_use", 1.0
+        )
+        if 0.0 < fraction < 1.0:
+            logger.warning(f"Using only {fraction:.0%} of the dataset.")
+            random_seed = self.cfg.get("miscellaneous_settings", {}).get(
+                "random_seed", 42
+            )
+            seed_everything(random_seed)
+
+        train_dir = processed_dir / "train"
+        val_dir = processed_dir / "val"
+        test_dir = processed_dir / "test"
+
+        if not train_dir.exists():
+            raise RuntimeError("No training directory found.")
+
+        def get_indices(split_data: List[Tuple[str, int]]) -> List[int]:
+            num_samples = len(split_data)
+            if num_samples == 0:
+                return []
+            if 0.0 < fraction < 1.0:
+                k = max(1, int(num_samples * fraction))
+                return random.sample(range(num_samples), k)
+            return list(range(num_samples))
+
+        train_idx = get_indices(splits["train"])
+        val_idx = get_indices(splits["validation"])
+        test_idx = get_indices(splits["test"])
+
+        self.train_ds = create_dataset(train_dir, self.cfg, train_idx)
+        self.val_ds = (
+            create_dataset(val_dir, self.cfg, val_idx) if val_dir.exists() else None
+        )
+        self.test_ds = (
+            create_dataset(test_dir, self.cfg, test_idx) if test_dir.exists() else None
+        )
+
+        logger.info(
+            f"Datasets ready - train:{len(self.train_ds):,}  "
+            f"val:{len(self.val_ds or []):,}  test:{len(self.test_ds or []):,}"
+        )
+
+    def _build_dataloaders(
+        self, collate_fn: Callable, misc_cfg: Dict, train_cfg: Dict
+    ) -> None:
+        pin_memory = should_pin_memory()
+        num_workers = misc_cfg.get("num_workers", DEFAULT_NUM_WORKERS)
+        if num_workers < 8 and self.device.type == "cuda":
+            logger.info(f"Increasing num_workers from {num_workers} to 8 for better GPU utilization")
+            num_workers = 8
+            
+        dl_common = dict(
+            batch_size=train_cfg.get("batch_size", DEFAULT_BATCH_SIZE),
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+        )
+        if num_workers > 0:
+            dl_common["persistent_workers"] = True
+            dl_common["prefetch_factor"] = 4
+
+        self.train_loader = DataLoader(
+            self.train_ds, shuffle=True, drop_last=False, **dl_common
+        )
+        self.val_loader = (
+            DataLoader(self.val_ds, shuffle=False, drop_last=False, **dl_common)
+            if self.val_ds
+            else None
+        )
+        self.test_loader = (
+            DataLoader(self.test_ds, shuffle=False, drop_last=False, **dl_common)
+            if self.test_ds
+            else None
+        )
+        
+        # Wrap with DevicePrefetchLoader for async transfers
+        if self.device.type != "cpu":
+            logger.info(f"Using DevicePrefetchLoader for {self.device.type.upper()} transfers")
+            self.train_loader = DevicePrefetchLoader(self.train_loader, self.device)
+            if self.val_loader:
+                self.val_loader = DevicePrefetchLoader(self.val_loader, self.device)
+            if self.test_loader:
+                self.test_loader = DevicePrefetchLoader(self.test_loader, self.device)
+
+    def _build_model(self) -> None:
+        self.model = create_prediction_model(self.cfg, device=self.device, compile_model=True)
+
+    def _build_optimizer(self, tp: Dict) -> None:
+        opt_name = tp.get("optimizer", DEFAULT_OPTIMIZER).lower()
+        lr = tp.get("learning_rate", DEFAULT_LR)
+        wd = tp.get("weight_decay", 1e-5)
+
+        decay, no_decay = [], []
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.dim() == 1 or "bias" in n or "norm" in n:
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        groups = [
+            {"params": decay, "weight_decay": wd},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
+        if opt_name == "adam":
+            self.optimizer = optim.Adam(groups, lr=lr)
+        elif opt_name == "sgd":
+            self.optimizer = optim.SGD(groups, lr=lr, momentum=0.9)
+        else:
+            self.optimizer = optim.AdamW(groups, lr=lr)
+
+        logger.info(f"Optimizer: {opt_name}  lr={lr:.2e}  wd={wd:.2e}")
+
+    def _build_scheduler(self, tp: Dict) -> None:
+        scheduler_type = tp.get("scheduler_type", "reduce_on_plateau").lower()
+
+        if scheduler_type == "cosine":
+            epochs = tp.get("epochs", DEFAULT_EPOCHS)
+            warmup_epochs = tp.get("warmup_epochs", 0)
+
+            if warmup_epochs >= epochs:
+                raise ValueError("warmup_epochs must be less than total epochs.")
+
+            main_scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=epochs - warmup_epochs,
+                eta_min=tp.get("min_lr", 1e-8),
+            )
+
+            if warmup_epochs > 0:
+                warmup_scheduler = LinearLR(
+                    self.optimizer,
+                    start_factor=1e-5,
+                    end_factor=1.0,
+                    total_iters=warmup_epochs,
+                )
+                self.scheduler = SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup_scheduler, main_scheduler],
+                    milestones=[warmup_epochs],
+                )
+                logger.info(f"Cosine scheduler with {warmup_epochs} warmup epochs.")
+            else:
+                self.scheduler = main_scheduler
+                logger.info("Cosine scheduler without warmup.")
+
+        elif scheduler_type == "reduce_on_plateau":
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                patience=tp.get("lr_patience", 10),
+                factor=tp.get("lr_factor", 0.5),
+                min_lr=tp.get("min_lr", 1e-8),
+            )
+            logger.info("Using ReduceLROnPlateau scheduler.")
+        else:
+            raise ValueError(f"Unsupported scheduler_type: {scheduler_type}")
+
+    def _setup_training_params(self, tp: Dict) -> None:
+        self.criterion = nn.MSELoss(reduction="none")
+        self.max_grad_norm = tp.get("gradient_clip_val", DEFAULT_GRAD_CLIP)
+        self.accumulation_steps = tp.get(
+            "gradient_accumulation_steps", DEFAULT_GRADIENT_ACCUMULATION
+        )
+
+        self.use_amp = tp.get("use_amp", False) and self.device.type == "cuda"
+        self.scaler = GradScaler(enabled=self.use_amp)
+        if self.use_amp:
+            logger.info("AMP enabled.")
+
+        eff_bs = tp.get("batch_size", DEFAULT_BATCH_SIZE) * self.accumulation_steps
+        logger.info(
+            f"Effective batch size: {eff_bs} (accumulation: {self.accumulation_steps})"
+        )
+
+    def _setup_logging(self) -> None:
+        self.log_path = self.save_dir / "training_log.csv"
+        self.log_path.write_text("epoch,train_loss,val_loss,lr,time_s,del\n")
+        self.best_val_loss = float("inf")
+        self.best_epoch = -1
+
+    def _save_metadata(self) -> None:
+        md = {
+            "device": str(self.device),
+            "use_amp": self.use_amp,
+            "effective_bs": self.cfg["training_hyperparameters"].get(
+                "batch_size", DEFAULT_BATCH_SIZE
+            )
+            * self.accumulation_steps,
+        }
+        save_json(md, self.save_dir / "training_metadata.json")
+
+    def train(self) -> float:
+        tp = self.cfg.get("training_hyperparameters", {})
+        epochs = tp.get("epochs", DEFAULT_EPOCHS)
+        patience = tp.get("early_stopping_patience", DEFAULT_EARLY_STOPPING_PATIENCE)
+        min_delta = tp.get("min_delta", DEFAULT_MIN_DELTA)
+        epochs_bad = 0
+
+        logger.info(f"Training for {epochs} epochs.")
+        for epoch in range(1, epochs + 1):
+            self.current_epoch = epoch
+            t0 = time.time()
+
+            tr_loss = self._run_epoch(self.train_loader, is_train=True)
+            if tr_loss is None:
+                raise RuntimeError("Too many invalid batches in training.")
+
+            val_loss = (
+                self._run_epoch(self.val_loader, is_train=False)
+                if self.has_val
+                else float("inf")
+            )
+            if val_loss is None:
+                val_loss = float("inf")
+
+            if isinstance(self.scheduler, ReduceLROnPlateau):
+                metric_to_step = (
+                    val_loss if self.has_val and val_loss != float("inf") else tr_loss
+                )
+                self.scheduler.step(metric_to_step)
+            else:
+                self.scheduler.step()
+
+            if self.trial:
+                self.trial.report(val_loss, epoch)
+                if self.trial.should_prune():
+                    logger.info("Trial pruned by Optuna.")
+                    raise optuna.exceptions.TrialPruned()
+
+            improvement = self.best_val_loss - val_loss if self.has_val else 0.0
+            self._log_epoch_results(
+                epoch, tr_loss, val_loss, time.time() - t0, improvement
+            )
+
+            if self.has_val:
+                if val_loss < self.best_val_loss - min_delta:
+                    self.best_val_loss = val_loss
+                    self.best_epoch = epoch
+                    epochs_bad = 0
+                    self._save_best_model()
+                else:
+                    epochs_bad += 1
+                    if epochs_bad >= patience:
+                        logger.info(
+                            f"Early stopping triggered after {patience} epochs with no improvement."
+                        )
+                        break
+
+        if not self.has_val:
+            self.best_val_loss = tr_loss
+            self.best_epoch = epochs
+            self._save_best_model()
+
+        logger.info(
+            f"Done. Best val_loss={self.best_val_loss:.4e} at epoch {self.best_epoch}."
+        )
+        return self.best_val_loss
+
+    def test(self) -> Dict[str, float]:
+        if not self.test_loader:
+            logger.warning("No test dataset. Skipping test.")
+            return {"test_loss": float("inf"), "best_epoch": self.best_epoch}
+
+        ckpt = self.save_dir / "best_model.pt"
+        if ckpt.exists():
+            state = torch.load(ckpt, map_location=self.device)
+            sd = state["state_dict"]
+            if any(k.startswith("_orig_mod.") for k in sd):
+                sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+            self.model.load_state_dict(sd, strict=True)
+
+        loss = self._run_epoch(self.test_loader, is_train=False)
+        if loss is None:
+            loss = float("inf")
+        metrics = {"test_loss": loss, "best_epoch": self.best_epoch}
+        save_json(metrics, self.save_dir / "test_metrics.json")
+        logger.info(f"Test loss: {metrics['test_loss']:.4e}")
+        return metrics
+
+    def _run_epoch(self, loader: DataLoader, is_train: bool) -> Optional[float]:
+        if not loader or len(loader) == 0:
+            mode = "training" if is_train else "validation"
+            logger.warning(f"DataLoader for {mode} is empty. Skipping epoch.")
+            return 0.0 if is_train else float("inf")
+
+        self.model.train(is_train)
+        tot_loss = tot_elems = 0.0
+        failed = 0
+        device_type = str(self.device.type)
+
+        for bidx, batch in enumerate(loader):
+            # Data already on device if using DevicePrefetchLoader
+            inputs, masks, targets, tgt_masks = batch
+            
+            seq = inputs["sequence"]
+            gbl = inputs.get("global_features")
+            seq_mask = masks["sequence"]
+
+            with torch.set_grad_enabled(is_train), autocast(
+                device_type=device_type, enabled=self.use_amp
+            ):
+                preds = self.model(seq, gbl, seq_mask)
+                unreduced = self.criterion(preds, targets)
+                valid = (~tgt_masks).unsqueeze(-1).expand_as(unreduced)
+                denom = valid.sum()
+                if denom.item() == 0:
+                    failed += 1
+                    continue
+                loss = (unreduced * valid.float()).sum() / denom.float()
+
+            if is_train:
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                if (bidx + 1) % self.accumulation_steps == 0 or (bidx + 1) == len(
+                    loader
+                ):
+                    if self.use_amp:
+                        self.scaler.unscale_(self.optimizer)
+                    if self.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.max_grad_norm
+                        )
+                    if self.use_amp:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+
+            tot_loss += loss.item() * denom.item()
+            tot_elems += denom.item()
+
+        if len(loader) > 0 and failed / len(loader) > self.max_batch_failure_rate:
+            logger.critical("Too many failed batches. Aborting epoch.")
+            return None
+
+        if tot_elems == 0:
+            logger.error("No valid elements were processed in this epoch.")
+            return None
+
+        return tot_loss / tot_elems
+
+    def _log_epoch_results(
+        self,
+        epoch: int,
+        tr: float,
+        val: float,
+        dt: float,
+        diff: float,
+    ) -> None:
+        lr = self.optimizer.param_groups[0]["lr"]
+        msg = f"E{epoch:03d}  train:{tr:.3e}  val:{val:.3e}  lr:{lr:.2e}  t:{dt:.1f}s"
+        if diff > 0:
+            msg += f"  ↓{diff:.3e}"
+        logger.info(msg)
+        with self.log_path.open("a") as f:
+            f.write(f"{epoch},{tr:.6e},{val:.6e},{lr:.6e},{dt:.1f},{diff:.6e}\n")
+
+    def _save_best_model(self) -> None:
+        tgt = self.model
+        ckpt = {
+            "state_dict": tgt.state_dict(),
+            "epoch": self.best_epoch,
+            "val_loss": self.best_val_loss,
+            "config": self.cfg,
+        }
+        torch.save(ckpt, self.save_dir / "best_model.pt")
+        logger.info(f"Saved best model (epoch {self.best_epoch}).")
+        self._export_model()
+
+    def _export_model(self) -> None:
+        try:
+            sample = next(iter(self.val_loader)) if self.val_loader else None
+            if sample is None:
+                logger.warning("No sample for export.")
+                return
+
+            # Create fresh un-compiled model for export
+            logger.info("Creating a fresh, un-compiled model instance for export.")
+            model_for_export = create_prediction_model(
+                self.cfg, device=self.device, compile_model=False
+            )
+            # Load trained weights
+            if hasattr(self.model, '_orig_mod'):
+                state_dict = self.model._orig_mod.state_dict()
+            else:
+                state_dict = self.model.state_dict()
+            model_for_export.load_state_dict(state_dict)
+
+            inp, masks, _, _ = sample
+            example = {
+                "sequence": inp["sequence"][:1],
+                "sequence_mask": masks["sequence"][:1],
+            }
+            if "global_features" in inp:
+                example["global_features"] = inp["global_features"][:1]
+
+            path = self.save_dir / f"best_model_epoch_{self.best_epoch}_exported.pt"
+            export_model(model_for_export, example, path, self.cfg)
+        except Exception as e:
+            logger.error(f"Model export failed: {e}", exc_info=True)
+
+
+__all__ = ["ModelTrainer"]
+
+===== /Users/imalsky/Desktop/Problemulator/src/hardware.py =====
+#!/usr/bin/env python3
+"""
+hardware.py - Device detection and DataLoader optimization helpers.
+
+This module provides utilities for:
+- Automatic device selection (CUDA → MPS → CPU)
+- Memory pinning optimization for DataLoaders
+- Hardware-specific configuration
+"""
+from __future__ import annotations
+
+import logging
+import torch
+
+logger = logging.getLogger(__name__)
+
+
+def setup_device() -> torch.device:
+    """
+    Select the best available compute device.
+    
+    Priority order:
+    1. CUDA (NVIDIA GPUs)
+    2. MPS (Apple Silicon)
+    3. CPU (fallback)
+    
+    Returns:
+        torch.device: The selected compute device
+    """
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        try:
+            device_name = torch.cuda.get_device_name(torch.cuda.current_device())
+            logger.info(f"Using CUDA device: {device_name}")
+        except Exception:
+            logger.info("Using CUDA device.")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+        logger.info("Using Apple Silicon MPS device (may be slower than CUDA).")
+    else:
+        device = torch.device("cpu")
+        logger.info("Using CPU device.")
+    
+    return device
+
+
+def should_pin_memory() -> bool:
+    """
+    Determine if memory pinning should be enabled for DataLoaders.
+    
+    Memory pinning speeds up CPU→GPU transfers but uses additional RAM.
+    Only beneficial when CUDA is available.
+    
+    Returns:
+        bool: True if memory should be pinned, False otherwise
+    """
+    return torch.cuda.is_available()
+
+
+__all__ = ["setup_device", "should_pin_memory"]
+
+===== /Users/imalsky/Desktop/Problemulator/src/normalizer.py =====
+#!/usr/bin/env python3
+"""
+normalizer.py - GPU-aware data normalization with numerical stability.
+
+Calculates global statistics from training samples across multiple HDF5 files
+using memory-efficient batch processing with online algorithms.
+All logarithmic operations are performed in base 10.
+"""
+from __future__ import annotations
+
+import logging
+import math
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple, Union
+
+import h5py
+import numpy as np
+import torch
+from torch import Tensor
+from tqdm import tqdm
+import time
+
+from hardware import setup_device
+from utils import DTYPE
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_EPSILON = 1e-9
+DEFAULT_QUANTILE_MEMORY_LIMIT = 1_000_000
+DEFAULT_SYMLOG_PERCENTILE = 0.5
+STATS_CHUNK_SIZE = 8192
+NORMALIZED_VALUE_CLAMP = 50.0
+
+
+class DataNormalizer:
+    METHODS = {
+        "iqr",
+        "log-min-max",
+        "max-out",
+        "signed-log",
+        "scaled_signed_offset_log",
+        "symlog",
+        "standard",
+        "log-standard",
+        "bool",
+        "none",
+    }
+    QUANTILE_METHODS = {"iqr", "symlog", "log-min-max"}
+
+    def __init__(self, *, config_data: Dict[str, Any]):
+        self.config = config_data
+        self.device = setup_device()
+        self.norm_config = self.config.get("normalization", {})
+        self.eps = float(self.norm_config.get("epsilon", DEFAULT_EPSILON))
+        self.keys_to_process, self.key_methods = self._get_keys_and_methods()
+        self._approximated_quantile_keys = set()
+        logger.info(f"DataNormalizer initialized on device '{self.device}'.")
+
+    def _get_keys_and_methods(self) -> Tuple[Set[str], Dict[str, str]]:
+        spec = self.config.get("data_specification", {})
+        all_vars = set()
+        for key in ["input_variables", "global_variables", "target_variables"]:
+            all_vars.update(spec.get(key, []))
+
+        user_key_methods = self.norm_config.get("key_methods", {})
+        default_method = self.norm_config.get("default_method", "standard")
+
+        key_methods = {}
+        for key in all_vars:
+            method = user_key_methods.get(key, default_method).lower()
+            if method not in self.METHODS:
+                raise ValueError(f"Unsupported method '{method}' for key '{key}'.")
+            key_methods[key] = method
+
+        return all_vars, key_methods
+
+    def calculate_stats(
+        self, raw_hdf5_paths: List[Path], train_indices: List[Tuple[str, int]]
+    ) -> Dict[str, Any]:
+        logger.info(
+            f"Starting statistics calculation from {len(train_indices)} training samples..."
+        )
+        start_time = time.time()
+
+        if not train_indices:
+            raise ValueError(
+                "Cannot calculate statistics from empty training indices. Exiting."
+            )
+
+        file_map = {path.stem: path for path in raw_hdf5_paths if path.is_file()}
+        if not file_map:
+            raise RuntimeError("No valid HDF5 files found. Exiting.")
+
+        available_keys = self._get_available_keys(file_map)
+        keys_to_load = self.keys_to_process.intersection(available_keys)
+
+        if len(keys_to_load) != len(self.keys_to_process):
+            missing = self.keys_to_process - available_keys
+            logger.warning(f"Keys not found in HDF5 and will be skipped: {missing}")
+
+        accumulators = self._initialize_accumulators(keys_to_load)
+
+        dataset_metadata = {
+            "total_train_profiles": len(train_indices),
+            "variables": list(keys_to_load),
+            "sequence_lengths": {
+                key: {"min": float("inf"), "max": float("-inf")} for key in keys_to_load
+            },
+        }
+
+        grouped_indices = self._group_indices_by_file(train_indices)
+        for file_stem, indices in grouped_indices.items():
+            if file_stem not in file_map:
+                logger.warning(f"Skipping unknown file stem '{file_stem}' in indices.")
+                continue
+
+            h5_path = file_map[file_stem]
+            with h5py.File(h5_path, "r", swmr=True, libver="latest") as hf:
+                num_chunks = (len(indices) + STATS_CHUNK_SIZE - 1) // STATS_CHUNK_SIZE
+
+                for i in tqdm(
+                    range(0, len(indices), STATS_CHUNK_SIZE),
+                    desc=f"Stats for {file_stem}",
+                    total=num_chunks,
+                    leave=False,
+                ):
+                    chunk_indices = indices[i : i + STATS_CHUNK_SIZE]
+
+                    # Sort indices for efficient h5py reading
+                    chunk_indices_np = np.array(chunk_indices)
+                    sorter = np.argsort(chunk_indices_np)
+                    sorted_indices = chunk_indices_np[sorter].tolist()
+
+                    batch_of_tensors = {}
+                    for key in keys_to_load:
+                        if key in hf:
+                            data_chunk_np = hf[key][sorted_indices]
+                            # For stats calculation, order doesn't matter
+                            batch_of_tensors[key] = torch.from_numpy(data_chunk_np).to(
+                                device=self.device, dtype=DTYPE
+                            )
+
+                    self._update_accumulators_with_batch(
+                        batch_of_tensors, accumulators, dataset_metadata
+                    )
+
+        logger.info(f"Finished statistics calculation in {time.time() - start_time:.2f}s.")
+
+        computed_stats = self._finalize_stats(accumulators)
+        if not computed_stats:
+            raise RuntimeError("No statistics computed due to invalid data. Exiting.")
+
+        metadata = {
+            "normalization_methods": self.key_methods,
+            "per_key_stats": computed_stats,
+        }
+
+        for key in dataset_metadata["sequence_lengths"]:
+            min_len = dataset_metadata["sequence_lengths"][key]["min"]
+            max_len = dataset_metadata["sequence_lengths"][key]["max"]
+            if min_len == float("inf"):
+                dataset_metadata["sequence_lengths"][key] = None
+            else:
+                dataset_metadata["sequence_lengths"][key] = {
+                    "min": int(min_len),
+                    "max": int(max_len),
+                }
+
+        metadata["dataset_metadata"] = dataset_metadata
+
+        logger.info("Statistics calculation complete.")
+        return metadata
+
+    def _get_available_keys(self, file_map: Dict[str, Path]) -> Set[str]:
+        available = set()
+        for path in file_map.values():
+            with h5py.File(path, "r") as hf:
+                available.update(hf.keys())
+        return available
+
+    def _group_indices_by_file(
+        self, indices: List[Tuple[str, int]]
+    ) -> Dict[str, List[int]]:
+        grouped = {}
+        for file_stem, idx in indices:
+            grouped.setdefault(file_stem, []).append(idx)
+        return grouped
+
+    def _initialize_accumulators(
+        self, keys_to_process: Set[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        accumulators = {}
+        for key in keys_to_process:
+            method = self.key_methods[key]
+            if method in ("none", "bool"):
+                continue
+
+            acc: Dict[str, Any] = {}
+            if method in ("standard", "log-standard", "signed-log"):
+                acc.update(
+                    {
+                        "count": 0,
+                        "mean": torch.tensor(0.0, dtype=DTYPE, device=self.device),
+                        "m2": torch.tensor(0.0, dtype=DTYPE, device=self.device),
+                    }
+                )
+
+            if method in self.QUANTILE_METHODS:
+                acc["values"] = torch.empty(0, dtype=DTYPE, device=self.device)
+                acc["total_values_seen"] = 0
+
+            if method in ("max-out", "scaled_signed_offset_log", "log-min-max"):
+                acc.update(
+                    {
+                        "min": torch.tensor(
+                            float("inf"), dtype=DTYPE, device=self.device
+                        ),
+                        "max": torch.tensor(
+                            float("-inf"), dtype=DTYPE, device=self.device
+                        ),
+                    }
+                )
+
+            if acc:
+                accumulators[key] = acc
+        return accumulators
+
+    def _update_accumulators_with_batch(
+        self, batch: Dict[str, Tensor], accumulators: Dict, dataset_metadata: Dict
+    ) -> None:
+        memory_limit = self.norm_config.get(
+            "quantile_max_values_in_memory", DEFAULT_QUANTILE_MEMORY_LIMIT
+        )
+        for key, data_batch in batch.items():
+            if key not in accumulators:
+                continue
+
+            method = self.key_methods[key]
+            key_acc = accumulators[key]
+
+            data = data_batch.flatten()
+            valid_data = data[torch.isfinite(data)]
+            if valid_data.numel() == 0:
+                continue
+
+            data_for_stats = valid_data
+            if method == "log-standard":
+                valid_data = torch.clamp(valid_data, min=self.eps)
+                data_for_stats = torch.log10(valid_data)
+            elif method == "signed-log":
+                data_for_stats = torch.sign(valid_data) * torch.log10(
+                    torch.abs(valid_data) + 1.0
+                )
+
+            if "count" in key_acc:
+                n_new = data_for_stats.numel()
+                if n_new > 0:
+                    count_old = key_acc["count"]
+                    mean_old = key_acc["mean"]
+                    m2_old = key_acc["m2"]
+
+                    batch_mean = data_for_stats.mean()
+                    batch_var = torch.var(data_for_stats, unbiased=False)
+                    batch_m2 = batch_var * n_new
+
+                    delta = batch_mean - mean_old
+                    count_new = count_old + n_new
+                    mean_new = mean_old + delta * (n_new / count_new)
+                    m2_new = (
+                        m2_old + batch_m2 + delta**2 * count_old * n_new / count_new
+                    )
+
+                    key_acc["count"] = count_new
+                    key_acc["mean"] = mean_new
+                    key_acc["m2"] = m2_new
+
+            if "values" in key_acc:
+                key_acc["total_values_seen"] += valid_data.numel()
+                current_stored_size = key_acc["values"].numel()
+
+                if current_stored_size + valid_data.numel() <= memory_limit:
+                    key_acc["values"] = torch.cat([key_acc["values"], valid_data])
+                else:
+                    self._approximated_quantile_keys.add(key)
+                    combined_data = torch.cat([key_acc["values"], valid_data])
+                    perm = torch.randperm(combined_data.numel(), device=self.device)[
+                        :memory_limit
+                    ]
+                    key_acc["values"] = combined_data[perm]
+
+            if "max" in key_acc:
+                if method == "scaled_signed_offset_log":
+                    log_vals = torch.sign(valid_data) * torch.log10(
+                        torch.abs(valid_data) + 1.0
+                    )
+                    key_acc["min"] = torch.min(key_acc["min"], log_vals.min())
+                    key_acc["max"] = torch.max(key_acc["max"], log_vals.max())
+                elif method == "log-min-max":
+                    log_vals = torch.log10(torch.clamp(valid_data, min=self.eps))
+                    key_acc["min"] = torch.min(key_acc["min"], log_vals.min())
+                    key_acc["max"] = torch.max(key_acc["max"], log_vals.max())
+                else:
+                    key_acc["min"] = torch.min(key_acc["min"], valid_data.min())
+                    key_acc["max"] = torch.max(key_acc["max"], valid_data.max())
+
+            if data_batch.ndim == 2:
+                current_len = data_batch.shape[1]
+                dataset_metadata["sequence_lengths"][key]["min"] = min(
+                    dataset_metadata["sequence_lengths"][key]["min"], current_len
+                )
+                dataset_metadata["sequence_lengths"][key]["max"] = max(
+                    dataset_metadata["sequence_lengths"][key]["max"], current_len
+                )
+
+    def _finalize_stats(self, accumulators: Dict) -> Dict[str, Any]:
+        final_stats = {}
+        for key, method in self.key_methods.items():
+            stats: Dict[str, Any] = {"method": method, "epsilon": self.eps}
+            if key not in accumulators:
+                if method not in ("none", "bool"):
+                    stats["method"] = "none"
+                final_stats[key] = stats
+                continue
+
+            key_acc = accumulators[key]
+
+            if "count" in key_acc and key_acc["count"] > 1:
+                mean = key_acc["mean"].item()
+                variance = key_acc["m2"].item() / (key_acc["count"] - 1)
+                std = max(math.sqrt(variance), self.eps)
+
+                if method == "standard":
+                    stats.update({"mean": mean, "std": std})
+                elif method == "log-standard":
+                    stats.update({"log_mean": mean, "log_std": std})
+                elif method == "signed-log":
+                    stats.update({"mean": mean, "std": std})
+
+            if "values" in key_acc and key_acc["values"].numel() > 0:
+                if key in self._approximated_quantile_keys:
+                    logger.info(
+                        f"Approximating quantiles for '{key}' using sample of "
+                        f"{key_acc['values'].numel():,} values (out of {key_acc['total_values_seen']:,} total)."
+                    )
+
+                all_values = key_acc["values"]
+                stats.update(self._compute_quantile_stats(all_values, key, method))
+
+            if method == "max-out":
+                max_val = max(abs(key_acc["min"].item()), abs(key_acc["max"].item()))
+                stats["max_val"] = max(max_val, self.eps)
+
+            elif method == "scaled_signed_offset_log":
+                m = max(
+                    abs(key_acc["min"].item()), abs(key_acc["max"].item()), self.eps
+                )
+                stats["m"] = m
+
+            final_stats[key] = stats
+        return final_stats
+
+    def _compute_quantile_stats(self, values: Tensor, key: str, method: str) -> dict:
+        """Compute quantile-based statistics with improved numerical stability."""
+        stats: Dict[str, float] = {}
+
+        def _robust_quantile(tensor: Tensor, q_values: Union[float, Tensor]) -> Tensor:
+            try:
+                return torch.quantile(tensor, q_values)
+            except RuntimeError as e:
+                if "too large" in str(e).lower() or "out of memory" in str(e).lower():
+                    fallback_size = 1_000_000
+                    if tensor.numel() <= fallback_size:
+                        raise e
+                    logger.warning(
+                        f"Quantile failed for '{key}' on {tensor.numel():,} elements. "
+                        f"Subsampling to {fallback_size:,}."
+                    )
+                    perm = torch.randperm(tensor.numel(), device=tensor.device)[
+                        :fallback_size
+                    ]
+                    subsampled = tensor.flatten()[perm]
+                    return torch.quantile(subsampled, q_values)
+                raise e
+
+        if method == "iqr":
+            q_tensor = torch.tensor([0.25, 0.5, 0.75], dtype=DTYPE, device=values.device)
+            q_vals = _robust_quantile(values, q_tensor)
+            q1, med, q3 = q_vals[0].item(), q_vals[1].item(), q_vals[2].item()
+            iqr = max(q3 - q1, self.eps)
+            stats.update({"median": med, "iqr": iqr})
+
+        elif method == "log-min-max":
+            log_vals = torch.log10(torch.clamp(values, min=self.eps))
+            min_v, max_v = log_vals.min().item(), log_vals.max().item()
+            stats.update({"min": min_v, "max": max(max_v, min_v + self.eps)})
+
+        elif method == "symlog":
+            percentile = self.norm_config.get(
+                "symlog_percentile", DEFAULT_SYMLOG_PERCENTILE
+            )
+            thr = _robust_quantile(torch.abs(values), percentile).item()
+            thr = max(thr, self.eps * 100)
+            
+            abs_v = torch.abs(values)
+            mask = abs_v > thr
+            transformed = torch.zeros_like(values)
+            
+            # Safe division with larger threshold ensures numerical stability
+            transformed[mask] = torch.sign(values[mask]) * (torch.log10(abs_v[mask] / thr) + 1)
+            transformed[~mask] = values[~mask] / thr
+
+            sf = transformed.abs().max().item() if transformed.numel() > 0 else 1.0
+            stats.update({"threshold": thr, "scale_factor": max(sf, 1.0)})
+
+        return stats
+
+    @staticmethod
+    def normalize_tensor(x: Tensor, method: str, stats: Dict[str, Any]) -> Tensor:
+        x = x.to(DTYPE)
+
+        if method in ("none", "bool") or not stats:
+            return x
+
+        eps = stats.get("epsilon", DEFAULT_EPSILON)
+        result = x
+
+        try:
+            if method == "standard":
+                result = (x - stats["mean"]) / stats["std"]
+            elif method == "log-standard":
+                x_safe = torch.log10(torch.clamp(x, min=eps))
+                result = (x_safe - stats["log_mean"]) / stats["log_std"]
+            elif method == "signed-log":
+                y = torch.sign(x) * torch.log10(torch.abs(x) + 1.0)
+                result = (y - stats["mean"]) / stats["std"]
+            elif method == "log-min-max":
+                log_x = torch.log10(torch.clamp(x, min=eps))
+                denom = stats["max"] - stats["min"]
+                if denom <= 0:
+                    raise ValueError("log-min-max stats have zero range")
+                normed = (log_x - stats["min"]) / denom
+                result = torch.clamp(normed, 0.0, 1.0)
+            elif method == "max-out":
+                result = x / stats["max_val"]
+            elif method == "iqr":
+                result = (x - stats["median"]) / stats["iqr"]
+            elif method == "scaled_signed_offset_log":
+                y = torch.sign(x) * torch.log10(torch.abs(x) + 1)
+                result = y / stats["m"]
+            elif method == "symlog":
+                thr, sf = stats["threshold"], stats["scale_factor"]
+                abs_x = torch.abs(x)
+                linear_mask = abs_x <= thr
+                y = torch.zeros_like(x)
+                y[linear_mask] = x[linear_mask] / thr
+                y[~linear_mask] = torch.sign(x[~linear_mask]) * (
+                    torch.log10(abs_x[~linear_mask] / thr) + 1.0
+                )
+                result = y / sf
+            else:
+                logger.warning(f"Unsupported method '{method}'. Returning raw tensor.")
+        except KeyError as e:
+            logger.error(f"Missing stat '{e}' for '{method}'. Returning raw tensor.")
+            return x
+
+        if method in ("standard", "log-standard", "signed-log", "iqr"):
+            result = torch.clamp(
+                result, -NORMALIZED_VALUE_CLAMP, NORMALIZED_VALUE_CLAMP
+            )
+
+        return result
+
+    @staticmethod
+    def normalize_array(x: np.ndarray, method: str, stats: Dict[str, Any]) -> None:
+        if method in ("none", "bool") or not stats:
+            return
+
+        eps = stats.get("epsilon", DEFAULT_EPSILON)
+
+        try:
+            if method == "standard":
+                x[:] = (x - stats["mean"]) / stats["std"]
+            elif method == "log-standard":
+                x_safe = np.log10(np.maximum(x, eps))
+                x[:] = (x_safe - stats["log_mean"]) / stats["log_std"]
+            elif method == "signed-log":
+                y = np.sign(x) * np.log10(np.abs(x) + 1.0)
+                x[:] = (y - stats["mean"]) / stats["std"]
+            elif method == "log-min-max":
+                log_x = np.log10(np.maximum(x, eps))
+                denom = stats["max"] - stats["min"]
+                if denom <= 0:
+                    raise ValueError("log-min-max stats have zero range")
+                normed = (log_x - stats["min"]) / denom
+                x[:] = np.clip(normed, 0.0, 1.0)
+            elif method == "max-out":
+                x[:] = x / stats["max_val"]
+            elif method == "iqr":
+                x[:] = (x - stats["median"]) / stats["iqr"]
+            elif method == "scaled_signed_offset_log":
+                y = np.sign(x) * np.log10(np.abs(x) + 1)
+                x[:] = y / stats["m"]
+            elif method == "symlog":
+                thr, sf = stats["threshold"], stats["scale_factor"]
+                abs_x = np.abs(x)
+                linear_mask = abs_x <= thr
+                y = np.zeros_like(x)
+                y[linear_mask] = x[linear_mask] / thr
+                y[~linear_mask] = np.sign(x[~linear_mask]) * (
+                    np.log10(abs_x[~linear_mask] / thr) + 1.0
+                )
+                x[:] = y / sf
+            else:
+                logger.warning(f"Unsupported method '{method}'. Array unchanged.")
+        except KeyError as e:
+            logger.error(f"Missing stat '{e}' for '{method}'. Array unchanged.")
+
+        if method in ("standard", "log-standard", "signed-log", "iqr"):
+            np.clip(x, -NORMALIZED_VALUE_CLAMP, NORMALIZED_VALUE_CLAMP, out=x)
+
+    @staticmethod
+    def denormalize_tensor(x: Tensor, method: str, stats: Dict[str, Any]) -> Tensor:
+        x = x.to(DTYPE)
+        if method in ("none", "bool"):
+            return x
+        if not stats:
+            raise ValueError(f"No stats for denormalization with method '{method}'")
+
+        dtype, device = x.dtype, x.device
+        eps = stats.get("epsilon", DEFAULT_EPSILON)
+
+        def to_t(val: float) -> Tensor:
+            return torch.as_tensor(val, dtype=dtype, device=device)
+
+        if method == "standard":
+            return x.mul(to_t(stats["std"])).add(to_t(stats["mean"]))
+        elif method == "log-standard":
+            return 10 ** (x.mul(to_t(stats["log_std"])).add(to_t(stats["log_mean"])))
+        elif method == "signed-log":
+            unscaled_log = x.mul(to_t(stats["std"])).add(to_t(stats["mean"]))
+            return torch.sign(unscaled_log) * (10 ** torch.abs(unscaled_log) - 1.0)
+        elif method == "log-min-max":
+            unscaled = (
+                torch.clamp(x, 0, 1)
+                .mul(to_t(stats["max"] - stats["min"]))
+                .add(to_t(stats["min"]))
+            )
+            return 10**unscaled
+        elif method == "max-out":
+            return x.mul(to_t(stats["max_val"]))
+        elif method == "iqr":
+            return x.mul(to_t(stats["iqr"])).add(to_t(stats["median"]))
+        elif method == "scaled_signed_offset_log":
+            ytmp = x.mul(to_t(stats["m"]))
+            return torch.sign(ytmp) * (10 ** torch.abs(ytmp) - 1)
+        elif method == "symlog":
+            unscaled = x.mul(to_t(stats["scale_factor"]))
+            abs_unscaled = torch.abs(unscaled)
+            linear_mask = abs_unscaled <= 1.0
+            thr = to_t(stats["threshold"])
+            y = torch.zeros_like(x)
+            y[linear_mask] = unscaled[linear_mask].mul(thr)
+            y[~linear_mask] = (
+                torch.sign(unscaled[~linear_mask])
+                * thr
+                * (10 ** (abs_unscaled[~linear_mask] - 1.0))
+            )
+            return y
+        else:
+            raise ValueError(f"Unsupported denormalization method '{method}'")
+
+    @staticmethod
+    def denormalize(
+        v: Union[Tensor, List, float, bool, None],
+        metadata: Dict[str, Any],
+        var_name: str,
+    ) -> Union[Tensor, List, float, bool, None]:
+        if v is None:
+            return None
+
+        method = metadata["normalization_methods"].get(var_name, "none")
+        if method in ("none", "bool"):
+            return v
+
+        stats = metadata["per_key_stats"].get(var_name)
+        if not stats:
+            raise ValueError(f"No stats for '{var_name}' in metadata.")
+
+        is_scalar = not isinstance(v, (torch.Tensor, list))
+        is_list = isinstance(v, list)
+
+        tensor_v = (
+            torch.as_tensor(v, dtype=DTYPE)
+            if not isinstance(v, torch.Tensor)
+            else v.to(DTYPE)
+        )
+
+        denorm_tensor = DataNormalizer.denormalize_tensor(tensor_v, method, stats)
+
+        if is_scalar:
+            return denorm_tensor.item()
+        elif is_list:
+            return denorm_tensor.tolist()
+        else:
+            return denorm_tensor
+
+
+__all__ = ["DataNormalizer"]
+
+
+===== /Users/imalsky/Desktop/Problemulator/src/main.py =====
+#!/usr/bin/env python3
+"""
+main.py - Entry point with separate normalize, train, and tune commands.
+"""
+from __future__ import annotations
+
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import sys
+import argparse
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import torch
+from torch.profiler import profile, ProfilerActivity, schedule
+
+from dataset import create_collate_fn
+from hardware import setup_device
+from preprocess import preprocess_data
+from train import ModelTrainer
+from utils import (
+    DEFAULT_SEED,
+    PADDING_VALUE,
+    ensure_dirs,
+    get_config_str,
+    load_config,
+    load_or_generate_splits,
+    save_json,
+    seed_everything,
+    setup_logging,
+)
+from hyperparam_search import run_optuna
+
+DEFAULT_CONFIG_PATH = Path("config/config.jsonc")
+DEFAULT_DATA_DIR = Path("data")
+DEFAULT_PROCESSED_DIR = DEFAULT_DATA_DIR / "processed"
+DEFAULT_RAW_DIR = DEFAULT_DATA_DIR / "raw"
+DEFAULT_MODELS_DIR = Path("models")
+
+logger = logging.getLogger(__name__)
+
+
+def _get_raw_hdf5_paths(config: Dict[str, Any], raw_dir: Path) -> List[Path]:
+    """Get list of raw HDF5 file paths from config."""
+    h5_filenames = config.get("data_paths_config", {}).get("hdf5_dataset_filename", [])
+    if not isinstance(h5_filenames, list) or not h5_filenames:
+        raise ValueError("No raw HDF5 files specified in config.")
+
+    raw_paths = [raw_dir / fname for fname in h5_filenames]
+    missing = [p for p in raw_paths if not p.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing raw HDF5 files: {missing}. Exiting.")
+
+    return raw_paths
+
+
+def _parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Atmospheric profile transformer pipeline.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    
+    # Add subcommands
+    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+    
+    # Common arguments for all commands
+    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help="Path to configuration file.",
+    )
+    parent_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DEFAULT_DATA_DIR,
+        help="Root data directory (contains raw/ and processed/).",
+    )
+    parent_parser.add_argument(
+        "--models-dir",
+        type=Path,
+        default=DEFAULT_MODELS_DIR,
+        help="Directory for saved models.",
+    )
+    
+    # Normalize command
+    normalize_parser = subparsers.add_parser(
+        'normalize', 
+        parents=[parent_parser],
+        help='Preprocess and normalize the data'
+    )
+    normalize_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-normalization even if cached data exists.",
+    )
+    
+    # Train command
+    train_parser = subparsers.add_parser(
+        'train',
+        parents=[parent_parser],
+        help='Train a model with current config'
+    )
+    train_parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable PyTorch profiler for performance analysis.",
+    )
+    train_parser.add_argument(
+        "--profile-wait",
+        type=int,
+        default=1,
+        help="Number of steps to wait before profiling.",
+    )
+    train_parser.add_argument(
+        "--profile-warmup",
+        type=int,
+        default=1,
+        help="Number of warmup steps for profiler.",
+    )
+    train_parser.add_argument(
+        "--profile-active",
+        type=int,
+        default=3,
+        help="Number of steps to actively profile.",
+    )
+    train_parser.add_argument(
+        "--profile-epochs",
+        type=int,
+        default=1,
+        help="Number of epochs to profile (only used with --profile).",
+    )
+    
+    # Tune command (hyperparameter search)
+    tune_parser = subparsers.add_parser(
+        'tune',
+        parents=[parent_parser],
+        help='Run hyperparameter optimization with Optuna'
+    )
+    tune_parser.add_argument(
+        "--num-trials",
+        type=int,
+        default=50,
+        help="Number of Optuna trials for hyperparameter optimization.",
+    )
+    tune_parser.add_argument(
+        "--optuna-study-name",
+        type=str,
+        default=None,
+        help="Optuna study name.",
+    )
+    tune_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an existing Optuna study.",
+    )
+    
+    args = parser.parse_args()
+    
+    # Check that a command was specified
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+    
+    return args
+
+
+def run_normalize(
+    config: Dict[str, Any],
+    raw_hdf5_paths: List[Path],
+    processed_dir: Path,
+    model_save_dir: Path,
+    force: bool = False,
+) -> Dict[str, List[Tuple[str, int]]]:
+    """Run only the data normalization step."""
+    logger.info("=== Running Data Normalization ===")
+    
+    # Load or generate splits
+    splits, splits_path = load_or_generate_splits(
+        config, processed_dir.parent, raw_hdf5_paths, model_save_dir
+    )
+    
+    save_json(
+        {"splits_file": str(splits_path.resolve())},
+        model_save_dir / "splits_info.json",
+    )
+    
+    # Force reprocessing if requested
+    if force:
+        logger.info("Force flag set - removing existing processed data")
+        import shutil
+        if processed_dir.exists():
+            shutil.rmtree(processed_dir)
+    
+    # Run preprocessing
+    success = preprocess_data(
+        config=config,
+        raw_hdf5_paths=raw_hdf5_paths,
+        splits=splits,
+        processed_dir=processed_dir,
+    )
+    
+    if not success:
+        raise RuntimeError("Preprocessing failed due to invalid data.")
+    
+    logger.info("=== Data Normalization Complete ===")
+    return splits
+
+
+def run_training_with_profiler(
+    config: Dict[str, Any],
+    device: torch.device,
+    model_save_dir: Path,
+    processed_dir: Path,
+    splits: Dict[str, List[Tuple[str, int]]],
+    padding_val: float,
+    profile_config: Dict[str, int],
+) -> None:
+    """Run training with PyTorch profiler enabled."""
+    
+    # Temporarily reduce epochs for profiling
+    original_epochs = config["training_hyperparameters"]["epochs"]
+    config["training_hyperparameters"]["epochs"] = profile_config["epochs"]
+    
+    logger.info("Starting training with PyTorch profiler...")
+    logger.info(f"Profiling {profile_config['epochs']} epoch(s)")
+    logger.info(f"Profile schedule: wait={profile_config['wait']}, "
+               f"warmup={profile_config['warmup']}, active={profile_config['active']}")
+    
+    # Create profiler schedule
+    prof_schedule = schedule(
+        wait=profile_config["wait"],
+        warmup=profile_config["warmup"],
+        active=profile_config["active"],
+        repeat=1
+    )
+    
+    # Profile trace directory
+    trace_dir = model_save_dir / "profiler_traces"
+    ensure_dirs(trace_dir)
+    
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=prof_schedule,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_dir)),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        with_modules=True
+    ) as prof:
+        
+        collate_fn = create_collate_fn(padding_val)
+        trainer = ModelTrainer(
+            config=config,
+            device=device,
+            save_dir=model_save_dir,
+            processed_dir=processed_dir,
+            splits=splits,
+            collate_fn=collate_fn,
+        )
+        
+        # Store original method
+        original_run_epoch = trainer._run_epoch
+        
+        def profiled_run_epoch(loader, is_train):
+            result = original_run_epoch(loader, is_train)
+            prof.step()  # Advance profiler
+            return result
+        
+        trainer._run_epoch = profiled_run_epoch
+        
+        try:
+            # Run training
+            trainer.train()
+        finally:
+            # Restore original method
+            trainer._run_epoch = original_run_epoch
+    
+    # Export Chrome trace
+    chrome_trace_path = trace_dir / "chrome_trace.json"
+    prof.export_chrome_trace(str(chrome_trace_path))
+    logger.info(f"Chrome trace saved to: {chrome_trace_path}")
+    
+    # Print profiler summary
+    logger.info("\n=== Profiler Summary ===")
+    logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+    
+    # Export detailed stats
+    stats_path = trace_dir / "profiler_stats.txt"
+    with open(stats_path, "w") as f:
+        f.write(prof.key_averages().table(sort_by="cuda_time_total"))
+    logger.info(f"Detailed stats saved to: {stats_path}")
+    
+    # Restore original epochs
+    config["training_hyperparameters"]["epochs"] = original_epochs
+    
+    logger.info("\nProfiling complete! View results with:")
+    logger.info(f"  tensorboard --logdir={trace_dir}")
+    logger.info(f"  chrome://tracing (load {chrome_trace_path})")
+
+
+def run_train(
+    config: Dict[str, Any],
+    device: torch.device,
+    model_save_dir: Path,
+    processed_dir: Path,
+    raw_hdf5_paths: List[Path],
+    args: argparse.Namespace,
+) -> None:
+    """Run the training pipeline."""
+    logger.info("=== Running Model Training ===")
+    
+    # Ensure data is preprocessed
+    splits = run_normalize(
+        config, raw_hdf5_paths, processed_dir, model_save_dir, force=False
+    )
+    
+    padding_val = float(
+        config.get("data_specification", {}).get("padding_value", PADDING_VALUE)
+    )
+    
+    # Run with profiler if requested
+    if args.profile:
+        profile_config = {
+            "wait": args.profile_wait,
+            "warmup": args.profile_warmup,
+            "active": args.profile_active,
+            "epochs": args.profile_epochs,
+        }
+        run_training_with_profiler(
+            config, device, model_save_dir, processed_dir, 
+            splits, padding_val, profile_config
+        )
+    else:
+        collate_fn = create_collate_fn(padding_val)
+        trainer = ModelTrainer(
+            config=config,
+            device=device,
+            save_dir=model_save_dir,
+            processed_dir=processed_dir,
+            splits=splits,
+            collate_fn=collate_fn,
+        )
+        trainer.train()
+        trainer.test()
+    
+    logger.info("=== Model Training Complete ===")
+
+
+def run_tune(
+    config: Dict[str, Any],
+    device: torch.device,
+    model_save_dir: Path,
+    processed_dir: Path,
+    raw_hdf5_paths: List[Path],
+    args: argparse.Namespace,
+) -> None:
+    """Run hyperparameter tuning."""
+    logger.info("=== Running Hyperparameter Tuning ===")
+    
+    # Ensure data is preprocessed (will reuse if exists)
+    splits = run_normalize(
+        config, raw_hdf5_paths, processed_dir, model_save_dir, force=False
+    )
+    
+    padding_val = float(
+        config.get("data_specification", {}).get("padding_value", PADDING_VALUE)
+    )
+    
+    # Create a subdirectory for the hyperparameter search
+    hyperparam_dir = model_save_dir / "hyperparam_search"
+    ensure_dirs(hyperparam_dir)
+    
+    # Run Optuna
+    run_optuna(
+        config, args, device, processed_dir, splits, padding_val, hyperparam_dir
+    )
+    
+    logger.info("=== Hyperparameter Tuning Complete ===")
+
+
+def main() -> int:
+    """Main entry point."""
+    args = _parse_arguments()
+
+    # Setup directories
+    ensure_dirs(args.data_dir, args.models_dir)
+    setup_logging()
+
+    try:
+        logger.info(f"Running command: {args.command}")
+        logger.info(f"Using config: {args.config.resolve()}")
+        config = load_config(args.config)
+
+        # Set random seed
+        seed = config.get("miscellaneous_settings", {}).get("random_seed", DEFAULT_SEED)
+        seed_everything(seed)
+
+        # Setup device
+        device = setup_device()
+        if device.type == "cuda":
+            if torch.cuda.get_device_capability()[0] >= 8:
+                torch.set_float32_matmul_precision("high")
+                logger.info("Set float32 matmul precision to 'high' for A100/newer GPU")
+
+        # Setup paths
+        raw_dir = args.data_dir / "raw"
+        processed_dir = args.data_dir / "processed"
+        raw_hdf5_paths = _get_raw_hdf5_paths(config, raw_dir)
+
+        model_folder = get_config_str(
+            config, "output_paths_config", "fixed_model_foldername", "model training"
+        )
+        model_save_dir = args.models_dir / model_folder
+        ensure_dirs(model_save_dir)
+
+        # Setup logging to file
+        log_file = model_save_dir / f"{args.command}_run.log"
+        setup_logging(log_file=log_file, force=True)
+
+        # Save config
+        save_json(config, model_save_dir / f"{args.command}_config.json")
+
+        # Execute the appropriate command
+        if args.command == 'normalize':
+            run_normalize(
+                config, raw_hdf5_paths, processed_dir, model_save_dir, 
+                force=args.force
+            )
+        elif args.command == 'train':
+            run_train(
+                config, device, model_save_dir, processed_dir, 
+                raw_hdf5_paths, args
+            )
+        elif args.command == 'tune':
+            run_tune(
+                config, device, model_save_dir, processed_dir,
+                raw_hdf5_paths, args
+            )
+        else:
+            raise ValueError(f"Unknown command: {args.command}")
+
+        logger.info(f"{args.command.capitalize()} completed successfully.")
+        return 0
+
+    except RuntimeError as e:
+        logger.error(f"Pipeline error: {e}", exc_info=False)
+        return 1
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user (Ctrl+C).")
+        return 130
+    except Exception as e:
+        logger.critical(f"Unhandled exception: {e}", exc_info=True)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+===== /Users/imalsky/Desktop/Problemulator/src/test_export.py =====
+#!/usr/bin/env python3
+"""
+test_export.py - Test script to verify model export functionality
+"""
+import torch
+from pathlib import Path
+from model import create_prediction_model, export_model
+from utils import load_config
+
+def test_model_export():
+    """Test that model can be successfully exported and produces identical results."""
+    
+    # Load config
+    config = load_config("../config/config.jsonc")
+    
+    # Create model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = create_prediction_model(config, device=device, compile_model=False)
+    
+    # Create dummy inputs
+    batch_size = 4
+    seq_length = 64
+    input_dim = len(config["data_specification"]["input_variables"])
+    global_dim = len(config["data_specification"].get("global_variables", []))
+    
+    sequence = torch.randn(batch_size, seq_length, input_dim, device=device)
+    global_features = torch.randn(batch_size, global_dim, device=device) if global_dim > 0 else None
+    
+    # Create padding mask (True = padding)
+    sequence_mask = torch.zeros(batch_size, seq_length, dtype=torch.bool, device=device)
+    # Add some padding to last sequences
+    sequence_mask[0, 50:] = True
+    sequence_mask[1, 55:] = True
+    
+    # Test forward pass
+    with torch.no_grad():
+        output = model(sequence, global_features, sequence_mask)
+    
+    print(f"✓ Model forward pass successful. Output shape: {output.shape}")
+    
+    # Test export
+    example_input = {
+        "sequence": sequence,
+        "global_features": global_features,
+        "sequence_mask": sequence_mask
+    }
+    
+    export_path = Path("test_export")
+    export_path.mkdir(exist_ok=True)
+    
+    try:
+        export_model(model, example_input, export_path / "test_model", config)
+        print("✓ Model export successful!")
+        
+        # Load and test exported model
+        exported_path = export_path / "test_model_exported.pt2"
+        if exported_path.exists():
+            exported_prog = torch.export.load(str(exported_path))
+            
+            # Test with different batch sizes
+            for test_batch_size in [1, 2, 8, 16]:
+                test_seq = torch.randn(test_batch_size, seq_length, input_dim)
+                test_global = torch.randn(test_batch_size, global_dim) if global_dim > 0 else None
+                test_mask = torch.zeros(test_batch_size, seq_length, dtype=torch.bool)
+                
+                test_kwargs = {"sequence": test_seq}
+                if test_global is not None:
+                    test_kwargs["global_features"] = test_global
+                if test_mask is not None:
+                    test_kwargs["sequence_mask"] = test_mask
+                
+                exported_out = exported_prog.module()(**test_kwargs)
+                print(f"✓ Exported model works with batch_size={test_batch_size}")
+                
+    except Exception as e:
+        print(f"✗ Export failed: {e}")
+        raise
+    
+    print("\nAll tests passed! Model is export-compatible.")
+
+if __name__ == "__main__":
+    test_model_export()
+
+===== /Users/imalsky/Desktop/Problemulator/src/hyperparam_search.py =====
+#!/usr/bin/env python3
+"""
+hyperparam_search.py - Optuna hyperparameter optimization with aggressive pruning.
+
+This module orchestrates hyperparameter optimization using Optuna with efficient
+data reuse and aggressive early stopping for bad trials.
+"""
+from __future__ import annotations
+
+import logging
+from argparse import Namespace
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional
+
+import optuna
+from optuna.pruners import HyperbandPruner, MedianPruner, PercentilePruner
+from optuna.samplers import TPESampler
+import torch
+
+from dataset import create_collate_fn
+from train import ModelTrainer
+from utils import ensure_dirs, save_json, setup_logging
+
+logger = logging.getLogger(__name__)
+
+
+class AggressivePruner(optuna.pruners.BasePruner):
+    """
+    Custom aggressive pruner that combines multiple pruning strategies.
+    Prunes if ANY of the following conditions are met:
+    1. Current loss is worse than median of previous trials at same step
+    2. Current loss is in the worst 25th percentile
+    3. Loss hasn't improved for patience steps
+    """
+    
+    def __init__(
+        self,
+        n_startup_trials: int = 5,
+        n_warmup_steps: int = 3,
+        patience: int = 3,
+        min_improvement: float = 0.001,
+        percentile: float = 75.0,  # Prune bottom 25%
+    ):
+        self._median_pruner = MedianPruner(
+            n_startup_trials=n_startup_trials,
+            n_warmup_steps=n_warmup_steps,
+        )
+        self._percentile_pruner = PercentilePruner(
+            percentile=percentile,
+            n_startup_trials=n_startup_trials,
+            n_warmup_steps=n_warmup_steps,
+        )
+        self.patience = patience
+        self.min_improvement = min_improvement
+        self._trial_best_values: Dict[int, Tuple[float, int]] = {}
+    
+    def prune(self, study: optuna.Study, trial: optuna.FrozenTrial) -> bool:
+        # Use median pruner
+        if self._median_pruner.prune(study, trial):
+            logger.info(f"Trial {trial.number} pruned by median pruner")
+            return True
+        
+        # Use percentile pruner
+        if self._percentile_pruner.prune(study, trial):
+            logger.info(f"Trial {trial.number} pruned by percentile pruner")
+            return True
+        
+        # Check patience-based pruning
+        step = trial.last_step
+        if step is None:
+            return False
+        
+        current_value = trial.intermediate_values[step]
+        trial_id = trial.number
+        
+        if trial_id not in self._trial_best_values:
+            self._trial_best_values[trial_id] = (current_value, step)
+        else:
+            best_value, best_step = self._trial_best_values[trial_id]
+            if current_value < best_value - self.min_improvement:
+                self._trial_best_values[trial_id] = (current_value, step)
+            elif step - best_step >= self.patience:
+                logger.info(
+                    f"Trial {trial.number} pruned by patience "
+                    f"(no improvement for {self.patience} steps)"
+                )
+                return True
+        
+        return False
+
+
+def create_reduced_config(
+    config: Dict[str, Any], 
+    fraction: float = 0.1,
+    max_epochs: int = 30,
+) -> Dict[str, Any]:
+    """
+    Create a reduced configuration for faster hyperparameter search.
+    
+    Args:
+        config: Original configuration
+        fraction: Fraction of data to use
+        max_epochs: Maximum epochs for trials
+    
+    Returns:
+        Modified configuration
+    """
+    reduced_config = deepcopy(config)
+    
+    # Reduce dataset size
+    reduced_config["training_hyperparameters"]["dataset_fraction_to_use"] = fraction
+    
+    # Reduce epochs
+    current_epochs = reduced_config["training_hyperparameters"].get("epochs", 100)
+    reduced_config["training_hyperparameters"]["epochs"] = min(max_epochs, current_epochs)
+    
+    # More aggressive early stopping for trials
+    reduced_config["training_hyperparameters"]["early_stopping_patience"] = 5
+    reduced_config["training_hyperparameters"]["min_delta"] = 1e-4
+    
+    # Disable model export during trials to save time
+    reduced_config["miscellaneous_settings"]["torch_export"] = False
+    
+    return reduced_config
+
+
+def run_optuna(
+    config: Dict[str, Any],
+    args: Namespace,
+    device: torch.device,
+    processed_dir: Path,
+    splits: Dict[str, List[Tuple[str, int]]],
+    padding_val: float,
+    model_save_dir: Path,
+) -> None:
+    """
+    Sets up and runs an Optuna hyperparameter search with aggressive pruning
+    and efficient data reuse.
+    """
+    ensure_dirs(model_save_dir)
+    search_space = config.get("hyperparameter_search", {})
+    if not search_space:
+        logger.error("'hyperparameter_search' section not found in config. Aborting.")
+        return
+
+    # Create reduced config for faster trials
+    trial_config_base = create_reduced_config(config, fraction=0.2, max_epochs=50)
+    logger.info(
+        f"Using reduced config for trials: "
+        f"{trial_config_base['training_hyperparameters']['dataset_fraction_to_use']:.0%} of data, "
+        f"max {trial_config_base['training_hyperparameters']['epochs']} epochs"
+    )
+
+    def objective(trial: optuna.Trial) -> float:
+        """Objective function for a single trial."""
+        trial_config = deepcopy(trial_config_base)
+
+        # Model architecture parameters
+        d_model = trial.suggest_categorical("d_model", search_space["d_model"])
+        trial_config["model_hyperparameters"]["d_model"] = d_model
+
+        possible_nheads = [
+            div for div in search_space["nhead_divisors"] if d_model % div == 0
+        ]
+        if not possible_nheads:
+            logger.warning(
+                f"For trial {trial.number}, no valid nhead_divisor for d_model={d_model}. "
+                f"Defaulting to 1."
+            )
+            possible_nheads = [1]
+        nhead = trial.suggest_categorical("nhead", possible_nheads)
+        trial_config["model_hyperparameters"]["nhead"] = nhead
+
+        layers_range = search_space["num_encoder_layers"]
+        num_encoder_layers = trial.suggest_int(
+            "num_encoder_layers", low=layers_range[0], high=layers_range[1]
+        )
+        trial_config["model_hyperparameters"]["num_encoder_layers"] = num_encoder_layers
+
+        dim_feedforward = trial.suggest_categorical(
+            "dim_feedforward", search_space["dim_feedforward"]
+        )
+        trial_config["model_hyperparameters"]["dim_feedforward"] = dim_feedforward
+
+        # Regularization
+        dropout = trial.suggest_float("dropout", **search_space["dropout"])
+        trial_config["model_hyperparameters"]["dropout"] = dropout
+
+        # Training parameters
+        learning_rate = trial.suggest_float(
+            "learning_rate", **search_space["learning_rate"]
+        )
+        trial_config["training_hyperparameters"]["learning_rate"] = learning_rate
+
+        batch_size = trial.suggest_categorical("batch_size", search_space["batch_size"])
+        trial_config["training_hyperparameters"]["batch_size"] = batch_size
+
+        weight_decay = trial.suggest_float(
+            "weight_decay", **search_space["weight_decay"]
+        )
+        trial_config["training_hyperparameters"]["weight_decay"] = weight_decay
+
+        # Create trial directory
+        trial_save_dir = model_save_dir / f"trial_{trial.number:04d}"
+        ensure_dirs(trial_save_dir)
+        save_json(trial_config, trial_save_dir / "trial_config.json")
+
+        # Setup trial logging
+        trial_log_file = trial_save_dir / "trial_log.log"
+        setup_logging(log_file=trial_log_file, force=True)
+        logger.info(f"Starting Trial {trial.number} with params: {trial.params}")
+
+        collate_fn = create_collate_fn(padding_val)
+
+        try:
+            # Data is already preprocessed and will be reused
+            logger.info("Reusing preprocessed data from disk/cache")
+            
+            trainer = ModelTrainer(
+                config=trial_config,
+                device=device,
+                save_dir=trial_save_dir,
+                processed_dir=processed_dir,
+                splits=splits,
+                collate_fn=collate_fn,
+                optuna_trial=trial,
+            )
+            
+            best_val_loss = trainer.train()
+            
+            # Save trial results
+            trial_results = {
+                "trial_number": trial.number,
+                "best_val_loss": best_val_loss,
+                "params": trial.params,
+                "state": trial.state.name,
+            }
+            save_json(trial_results, trial_save_dir / "trial_results.json")
+            
+            return best_val_loss
+            
+        except optuna.exceptions.TrialPruned:
+            logger.info(f"Trial {trial.number} was pruned.")
+            raise
+        except Exception as e:
+            logger.error(
+                f"Trial {trial.number} failed with exception: {e}", exc_info=True
+            )
+            return float("inf")
+
+    # Create study with aggressive pruning
+    study_name = args.optuna_study_name or "atmospheric_transformer_study"
+    storage_path = f"sqlite:///{model_save_dir / 'optuna_study.db'}"
+    
+    # Use TPE sampler with more startup trials for better exploration
+    sampler_seed = config.get("miscellaneous_settings", {}).get("random_seed", 42)
+    sampler = TPESampler(
+        seed=sampler_seed,
+        n_startup_trials=10,  # More exploration initially
+        n_ei_candidates=24,   # More candidates for acquisition function
+    )
+    
+    # Use our custom aggressive pruner
+    pruner = AggressivePruner(
+        n_startup_trials=5,
+        n_warmup_steps=3,
+        patience=3,
+        min_improvement=0.001,
+        percentile=75.0,  # Prune bottom 25%
+    )
+
+    # Create or load study
+    if args.resume and Path(storage_path.replace("sqlite:///", "")).exists():
+        logger.info(f"Resuming existing study '{study_name}'")
+        study = optuna.load_study(
+            study_name=study_name,
+            storage=storage_path,
+            sampler=sampler,
+            pruner=pruner,
+        )
+    else:
+        logger.info(f"Creating new study '{study_name}'")
+        study = optuna.create_study(
+            direction="minimize",
+            study_name=study_name,
+            storage=storage_path,
+            load_if_exists=False,
+            sampler=sampler,
+            pruner=pruner,
+        )
+
+    logger.info(
+        f"Starting Optuna study '{study_name}' with {args.num_trials} trials."
+    )
+    logger.info(f"Sampler: {sampler.__class__.__name__}")
+    logger.info(f"Pruner: {pruner.__class__.__name__} (aggressive settings)")
+    logger.info(f"Results will be saved in: {model_save_dir}")
+
+    # Run optimization
+    study.optimize(
+        objective,
+        n_trials=args.num_trials,
+        gc_after_trial=True,
+        show_progress_bar=True,
+    )
+
+    # Log results
+    logger.info("\n--- Optuna Hyperparameter Search Complete ---")
+    logger.info(f"Number of finished trials: {len(study.trials)}")
+    
+    if study.best_trial:
+        logger.info(f"Best trial: Trial #{study.best_trial.number}")
+        logger.info(f"  Best Validation Loss: {study.best_value:.6f}")
+        logger.info("  Best Hyperparameters:")
+        for key, value in study.best_trial.params.items():
+            logger.info(f"    {key}: {value}")
+
+        # Save best parameters
+        best_params_path = model_save_dir / "best_hyperparameters.json"
+        results_summary = {
+            "best_value": study.best_value,
+            "best_params": study.best_trial.params,
+            "best_trial_number": study.best_trial.number,
+            "n_trials": len(study.trials),
+            "n_pruned": len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]),
+            "n_complete": len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
+            "n_failed": len([t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]),
+        }
+        save_json(results_summary, best_params_path)
+        logger.info(f"Best hyperparameters saved to {best_params_path}")
+        
+        # Create final config with best params for full training
+        final_config = deepcopy(config)
+        model_hp = final_config["model_hyperparameters"]
+        train_hp = final_config["training_hyperparameters"]
+        
+        # Apply best parameters
+        best_params = study.best_trial.params
+        model_hp["d_model"] = best_params["d_model"]
+        model_hp["nhead"] = best_params["nhead"]
+        model_hp["num_encoder_layers"] = best_params["num_encoder_layers"]
+        model_hp["dim_feedforward"] = best_params["dim_feedforward"]
+        model_hp["dropout"] = best_params["dropout"]
+        train_hp["learning_rate"] = best_params["learning_rate"]
+        train_hp["batch_size"] = best_params["batch_size"]
+        train_hp["weight_decay"] = best_params["weight_decay"]
+        
+        save_json(final_config, model_save_dir / "best_config.json")
+        logger.info("Created best_config.json for full training run")
+        
+    else:
+        logger.warning("No successful trials completed in the study.")
+    
+    # Print pruning statistics
+    pruned_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+    if pruned_trials:
+        logger.info(f"\nPruning statistics:")
+        logger.info(f"  Total pruned: {len(pruned_trials)}/{len(study.trials)}")
+        logger.info(f"  Pruning rate: {len(pruned_trials)/len(study.trials):.1%}")
+
+
+__all__ = ["run_optuna", "AggressivePruner", "create_reduced_config"]
+

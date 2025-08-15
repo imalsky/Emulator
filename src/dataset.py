@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dataset.py - Optimized data loader with full RAM loading support.
+dataset.py - Optimized data loader with efficient RAM loading.
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ class AtmosphericDataset(Dataset):
         self.target_variables = data_spec["target_variables"]
         self.global_variables = data_spec.get("global_variables", [])
         
-        # Use safe padding comparison
+        # Safe padding comparison
         self.padding_value = float(data_spec.get("padding_value", PADDING_VALUE))
         self.padding_epsilon = 1e-6
 
@@ -91,15 +91,26 @@ class AtmosphericDataset(Dataset):
         if len(self.seq_shards) == 0:
             raise RuntimeError(f"No shard files found in {seq_dir}")
         
-        # Estimate memory requirements
-        sample_shard = np.load(self.seq_shards[0], mmap_mode='r')
-        bytes_per_sample = sample_shard.itemsize * np.prod(sample_shard.shape[1:])
-        
-        # Account for all data types (seq + targets + globals)
-        total_bytes_per_sample = bytes_per_sample * 2  # seq + targets
+        # Estimate memory requirements using the first shard of each array
+        seq_shard = np.load(self.seq_shards[0], mmap_mode='r')               # [Ns, T, Din]
+        seq_bytes_per_sample = seq_shard.itemsize * int(np.prod(seq_shard.shape[1:]))
+
+        tgt_path0 = self.dir_path / "targets" / self.seq_shards[0].name
+        if not tgt_path0.exists():
+            raise RuntimeError(f"Missing target shard file: {tgt_path0}")
+        tgt_shard = np.load(tgt_path0, mmap_mode='r')                         # [Ns, T, Dout]
+        tgt_bytes_per_sample = tgt_shard.itemsize * int(np.prod(tgt_shard.shape[1:]))
+
+        total_bytes_per_sample = seq_bytes_per_sample + tgt_bytes_per_sample
+
         if self.has_globals:
-            total_bytes_per_sample += bytes_per_sample / self.sequence_length
-        
+            glb_path0 = self.dir_path / "globals" / self.seq_shards[0].name
+            if not glb_path0.exists():
+                raise RuntimeError(f"Missing globals shard file: {glb_path0}")
+            glb_shard = np.load(glb_path0, mmap_mode='r')                     # [Ns, G]
+            glb_bytes_per_sample = glb_shard.itemsize * int(glb_shard.shape[1])
+            total_bytes_per_sample += glb_bytes_per_sample
+
         total_bytes_needed = total_bytes_per_sample * len(self.indices)
         total_gb_needed = total_bytes_needed / (1024**3)
         
@@ -115,7 +126,7 @@ class AtmosphericDataset(Dataset):
             f"{safe_available_gb:.2f} GB safely available"
         )
         
-        # Decide loading strategy - respect force_disk_loading parameter
+        # Decide loading strategy
         if self.force_disk_loading:
             logger.info("Force disk loading enabled - using disk cache mode")
             self._setup_disk_cache()
@@ -133,8 +144,7 @@ class AtmosphericDataset(Dataset):
             self.ram_mode = False
     
     def _load_all_to_ram(self) -> None:
-        """Load entire dataset into RAM for maximum performance."""
-        # Pre-allocate arrays
+        """Load entire dataset into RAM efficiently by processing shards in order."""
         n_samples = len(self.indices)
         seq_shape = (n_samples, self.sequence_length, len(self.input_variables))
         tgt_shape = (n_samples, self.sequence_length, len(self.target_variables))
@@ -149,27 +159,37 @@ class AtmosphericDataset(Dataset):
         # Create index mapping
         self.ram_index_map = {}
         
-        # Load all data
+        # Group indices by shard for efficient loading
+        indices_by_shard = {}
         for idx, original_idx in enumerate(self.indices):
             shard_idx = original_idx // self.shard_size
             within_shard_idx = original_idx % self.shard_size
-            
-            # Load shard if not already loaded
+            if shard_idx not in indices_by_shard:
+                indices_by_shard[shard_idx] = []
+            indices_by_shard[shard_idx].append((idx, within_shard_idx, original_idx))
+        
+        # Load data shard by shard to minimize file I/O
+        processed = 0
+        for shard_idx in sorted(indices_by_shard.keys()):
             shard_name = f"shard_{shard_idx:06d}.npy"
+            
+            # Load entire shard once
             seq_data = np.load(self.dir_path / "sequence_inputs" / shard_name)
             tgt_data = np.load(self.dir_path / "targets" / shard_name)
-            
-            self.ram_sequences[idx] = seq_data[within_shard_idx]
-            self.ram_targets[idx] = tgt_data[within_shard_idx]
-            
             if self.has_globals:
                 glb_data = np.load(self.dir_path / "globals" / shard_name)
-                self.ram_globals[idx] = glb_data[within_shard_idx]
             
-            self.ram_index_map[idx] = original_idx
+            # Extract all samples from this shard
+            for idx, within_shard_idx, original_idx in indices_by_shard[shard_idx]:
+                self.ram_sequences[idx] = seq_data[within_shard_idx]
+                self.ram_targets[idx] = tgt_data[within_shard_idx]
+                if self.has_globals:
+                    self.ram_globals[idx] = glb_data[within_shard_idx]
+                self.ram_index_map[idx] = original_idx
+                processed += 1
             
-            if (idx + 1) % 10000 == 0:
-                logger.info(f"Loaded {idx + 1}/{n_samples} samples into RAM")
+            if processed % 10000 == 0 or processed == n_samples:
+                logger.info(f"Loaded {processed}/{n_samples} samples into RAM")
     
     def _setup_disk_cache(self) -> None:
         """Setup disk caching with proper memory mapping."""
@@ -290,14 +310,11 @@ class AtmosphericDataset(Dataset):
             shard_data = self._load_shard(shard_idx)
             
             # Extract the specific sample
-            # For memory-mapped arrays, indexing returns a view
-            # We need to copy to ensure the tensor owns its memory
             seq_in_np = shard_data["sequence_inputs"][within_shard_idx]
             tgt_np = shard_data["targets"][within_shard_idx]
             
             # Always copy from memory-mapped arrays to ensure tensor owns memory
             if hasattr(seq_in_np, 'base') and seq_in_np.base is not None:
-                # This is a view into a memory-mapped array
                 seq_in_np = seq_in_np.copy()
                 tgt_np = tgt_np.copy()
             
@@ -332,12 +349,12 @@ def pad_collate(
     padding_value: float = PADDING_VALUE,
     padding_epsilon: float = 1e-6,
 ):
-    """Use safe padding comparison instead of exact equality."""
+    """Collate function with safe padding comparison."""
     inputs, targets = zip(*batch)
 
     seq = torch.stack([d["sequence"] for d in inputs])
 
-    # Safe padding comparison
+    # Safe padding comparison - True means padding position
     seq_mask = (torch.abs(seq - padding_value) < padding_epsilon).all(dim=-1)
 
     batched = {"sequence": seq}
@@ -347,7 +364,7 @@ def pad_collate(
         batched["global_features"] = torch.stack([d["global_features"] for d in inputs])
 
     tgt = torch.stack(targets)
-    # Safe padding comparison
+    # Safe padding comparison - True means padding position  
     tgt_mask = (torch.abs(tgt - padding_value) < padding_epsilon).all(dim=-1)
 
     return batched, masks, tgt, tgt_mask

@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
 preprocess.py - Preprocess raw HDF5 data into normalized NPY shards.
-
-This module reads raw HDF5 files, computes normalization stats from the training
-split, normalizes all data, and saves it into NPY files in subdirectories
-for efficient loading.
 """
 from __future__ import annotations
 
@@ -22,11 +18,11 @@ from tqdm import tqdm
 from normalizer import DataNormalizer
 from utils import compute_data_hash_with_stats, ensure_dirs, save_json
 
-
 logger = logging.getLogger(__name__)
 
-
 HDF5_READ_CHUNK_SIZE = 131072
+
+
 
 def _group_indices_by_file(indices: List[Tuple[str, int]]) -> Dict[str, List[int]]:
     """Groups a list of (file_stem, index) tuples by file_stem."""
@@ -50,7 +46,7 @@ def _load_and_restore_chunk(
     sorter = np.argsort(indices)
     sorted_indices = indices[sorter]
 
-    # Compute inverse permutation to restore original order later
+    # Compute inverse permutation to restore original order
     inverse_sorter = np.argsort(sorter)
 
     data_chunk = {}
@@ -59,9 +55,9 @@ def _load_and_restore_chunk(
             logger.error(f"Critical error: Variable '{var}' not found in HDF5 file.")
             return None
         
-        # 1. Load data in sorted order (efficient)
+        # Load data in sorted order (efficient)
         data_sorted = hf_file[var][sorted_indices]
-        # 2. Restore original order (correctness)
+        # Restore original order (correctness)
         data_orig_order = data_sorted[inverse_sorter]
         
         if max_seq_len is not None and data_orig_order.ndim == 2:
@@ -93,7 +89,7 @@ def _save_shard(
 
     shard_name = f"shard_{shard_idx:06d}.npy"
 
-    # Use np.concatenate for performance, as buffers may contain multiple arrays
+    # Use np.concatenate for performance
     seq_data = np.concatenate(shard_buffers["sequence_inputs"], axis=0)
     np.save(seq_dir / shard_name, seq_data)
 
@@ -116,33 +112,24 @@ def _save_preprocessing_summary(
     norm_metadata: Dict[str, Any],
     data_hash: str,
 ) -> None:
-    """
-    Saves a human-readable summary of the preprocessing results.
-
-    Args:
-        output_dir: The root directory for processed data (e.g., 'data/processed').
-        config: The main configuration dictionary.
-        all_splits: Dictionary containing the sample indices for each split.
-        norm_metadata: The computed normalization statistics.
-        data_hash: The hash of the data configuration.
-    """
+    """Saves a human-readable summary of the preprocessing results."""
     summary_path = output_dir / "preprocessing_summary.txt"
     logger.info(f"Saving preprocessing summary to {summary_path}")
 
     try:
         content = f"""# Preprocessing Summary
-                    - Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-                    - Data Hash: {data_hash}
+                - Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                - Data Hash: {data_hash}
 
-                    --- Data Specification ---
-                    - Input Variables: {config['data_specification']['input_variables']}
-                    - Global Variables: {config['data_specification'].get('global_variables', 'None')}
-                    - Target Variables: {config['data_specification']['target_variables']}
-                    - Padding Value: {config['data_specification']['padding_value']}
-                    - Max Sequence Length: {config['model_hyperparameters']['max_sequence_length']}
+                --- Data Specification ---
+                - Input Variables: {config['data_specification']['input_variables']}
+                - Global Variables: {config['data_specification'].get('global_variables', 'None')}
+                - Target Variables: {config['data_specification']['target_variables']}
+                - Padding Value: {config['data_specification']['padding_value']}
+                - Max Sequence Length: {config['model_hyperparameters']['max_sequence_length']}
 
-                    --- Data Splits ---
-                    """
+                --- Data Splits ---
+                """
         shard_size = config.get("miscellaneous_settings", {}).get("shard_size", 1000)
         for name, indices in all_splits.items():
             count = len(indices)
@@ -152,18 +139,10 @@ def _save_preprocessing_summary(
             content += f"  - Shards Created: {num_shards}\n"
 
         content += "\n--- Normalization Metadata ---\n"
-        for var, stats in norm_metadata.items():
+        methods = norm_metadata.get("normalization_methods", {})
+        for var, stats in norm_metadata.get("per_key_stats", {}).items():
             content += f"- Variable: '{var}'\n"
-            content += f"  - Method: {stats.get('method', 'N/A')}\n"
-            content += f"  - Stats:\n"
-            if "params" in stats:
-                for key, value in stats["params"].items():
-                    if isinstance(value, (int, float)):
-                        content += f"    - {key}: {value:g}\n"
-                    else:
-                        content += f"    - {key}: {value}\n"
-            else:
-                content += "    - No parameters found.\n"
+            content += f"  - Method: {methods.get(var, 'N/A')}\n"
 
         summary_path.write_text(content)
 
@@ -171,7 +150,6 @@ def _save_preprocessing_summary(
         logger.error(f"Could not write preprocessing summary: {e}")
 
 
-# Replace the existing preprocess_data function with this updated version:
 def preprocess_data(
     config: Dict[str, Any],
     raw_hdf5_paths: List[Path],
@@ -180,8 +158,6 @@ def preprocess_data(
 ) -> bool:
     """Main function to orchestrate the preprocessing of raw HDF5 data."""
     ensure_dirs(processed_dir)
-    
-    max_seq_len = config["model_hyperparameters"]["max_sequence_length"]
     
     # Compute hash including file modification times and sizes
     current_hash = compute_data_hash_with_stats(config, raw_hdf5_paths)
@@ -318,6 +294,7 @@ def preprocess_data(
                             else None
                         )
 
+                        # Apply normalization
                         for j, var in enumerate(input_vars):
                             method = normalizer.key_methods.get(var, "none")
                             stats = norm_metadata.get("per_key_stats", {}).get(var)
@@ -341,6 +318,7 @@ def preprocess_data(
                                         glb[..., j], method, stats
                                     )
 
+                        # Apply padding if needed
                         pad_width = max_seq_len - seq_in.shape[1]
                         if pad_width > 0:
                             pad_spec = ((0, 0), (0, pad_width), (0, 0))
@@ -373,6 +351,7 @@ def preprocess_data(
                         num_samples_in_buffer += len(chunk_idx)
                         pbar.update(len(chunk_idx))
 
+                        # Save complete shards
                         while num_samples_in_buffer >= shard_size:
                             full_seq_data = np.concatenate(
                                 shard_buffers["sequence_inputs"], axis=0
@@ -420,46 +399,11 @@ def preprocess_data(
                             )
                             num_samples_in_buffer -= shard_size
 
-
-        """
-        if num_samples_in_buffer > 0:
-            final_seq = np.concatenate(shard_buffers["sequence_inputs"], axis=0)
-            final_tgt = np.concatenate(shard_buffers["targets"], axis=0)
-
-            num_to_pad = shard_size - num_samples_in_buffer
-            if num_to_pad > 0:
-                seq_pad_shape = (num_to_pad, final_seq.shape[1], final_seq.shape[2])
-                seq_padding = np.full(seq_pad_shape, padding_value, dtype=np.float32)
-                final_seq = np.concatenate([final_seq, seq_padding], axis=0)
-
-                tgt_pad_shape = (num_to_pad, final_tgt.shape[1], final_tgt.shape[2])
-                tgt_padding = np.full(tgt_pad_shape, padding_value, dtype=np.float32)
-                final_tgt = np.concatenate([final_tgt, tgt_padding], axis=0)
-
-            final_buffers = {"sequence_inputs": [final_seq], "targets": [final_tgt]}
-
-            if global_vars and shard_buffers["globals"]:
-                final_glb = np.concatenate(shard_buffers["globals"], axis=0)
-                if num_to_pad > 0:
-                    glb_pad_shape = (num_to_pad, final_glb.shape[1])
-                    glb_padding = np.full(
-                        glb_pad_shape, padding_value, dtype=np.float32
-                    )
-                    final_glb = np.concatenate([final_glb, glb_padding], axis=0)
-                final_buffers["globals"] = [final_glb]
-
-            _save_shard(final_buffers, seq_dir, tgt_dir, glb_dir, current_shard_idx)
-            """
-
-
-        # If there are any remaining samples in the buffers, save them to a final shard.
-        # This final shard may be smaller than the standard shard_size. No padding is applied.
+        # Save final partial shard if any samples remain
         if num_samples_in_buffer > 0:
             logger.info(
                 f"Saving final shard for '{split_name}' with {num_samples_in_buffer} samples."
             )
-            # The buffers are already lists of numpy arrays. _save_shard will concatenate them.
-            # We can pass the buffers directly.
             _save_shard(
                 shard_buffers, 
                 seq_dir, 
@@ -479,5 +423,6 @@ def preprocess_data(
     total_time = time.time() - preprocessing_start_time
     logger.info(f"Preprocessing completed successfully in {total_time:.2f}s.")
     return True
+
 
 __all__ = ["preprocess_data"]

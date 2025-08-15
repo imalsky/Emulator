@@ -1,77 +1,51 @@
 #!/usr/bin/env python3
 """
-Recursively collects all .py and .jsonc files in a directory tree
-and writes their paths and contents to a single dump file.
+dump_code_and_jsonc.py — Recursively collects all .py and .jsonc files in the local
+'src/' directory tree (relative to this script) and writes their paths and contents
+to a single dump file.
+
+This version deliberately restricts the search root to 'src/' only.
 """
 
+import os
 import sys
 from pathlib import Path
 
 # Configuration
-ROOT_DIR = Path(".")
-OUTPUT_BASE = "codebase_v"
-OUTPUT_EXT = ".py"
-EXTENSIONS = (".py", ".jsonc")  # Removed .sh from extensions
+SRC_DIR = Path(__file__).resolve().parent / "src"  # Fixed search root
+OUTPUT_FILE = "all_code_dump.txt"                  # File to write the dump into
+EXTENSIONS = (".py", ".jsonc")                     # File extensions to include
 
 
-def get_next_version(output_dir: Path) -> int:
+def dump_files(root_dir: str, output_path: str, exts: tuple) -> None:
     """
-    Find the next available version number for the output file.
+    Recursively write every file with a matching extension into *output_path*.
+
+    Symlinks, the output file itself, and unreadable paths are skipped
+    to prevent infinite recursion and permission errors.
     """
-    existing_files = list(output_dir.glob(f"{OUTPUT_BASE}*{OUTPUT_EXT}"))
-    if not existing_files:
-        return 1
+    import os, sys
+    output_abs  = os.path.abspath(output_path)
+    seen_dirs   = set()
 
-    versions = []
-    for file in existing_files:
-        try:
-            version_str = file.stem[len(OUTPUT_BASE) :]
-            versions.append(int(version_str))
-        except ValueError:
-            continue
-
-    return max(versions) + 1 if versions else 1
-
-
-def dump_files(root_dir: Path, output_path: Path, extensions: tuple[str, ...]) -> None:
-    """
-    Recursively write every file with a matching extension into the output file.
-
-    Skips symlinks, the output file itself, unreadable paths, the dump script,
-    and files named 'readme' or 'dump.py'.
-    """
-    script_path = Path(__file__).resolve()
-    output_abs = output_path.resolve()
-    seen_dirs = set()
-    excluded_files = {"readme", "dump.py"}  # Files to exclude by name
-
-    with output_path.open("w", encoding="utf-8") as out:
-        for dirpath, dirnames, filenames in root_dir.walk():
-            # Exclude 'testing' directories
-            dirnames[:] = [d for d in dirnames if d != "testing"]
-
-            dir_abs = dirpath.resolve()
+    with open(output_path, "w", encoding="utf-8") as out:
+        for dirpath, _, filenames in os.walk(root_dir, followlinks=False):
+            dir_abs = os.path.abspath(dirpath)
             if dir_abs in seen_dirs:
                 continue
             seen_dirs.add(dir_abs)
 
             for name in filenames:
-                if (
-                    not name.lower().endswith(extensions)
-                    or name.lower() in excluded_files
-                ):
+                if not any(name.lower().endswith(ext.lower()) for ext in exts):
                     continue
-                file_path = (dirpath / name).resolve()
-                if (
-                    file_path == output_abs
-                    or file_path == script_path
-                    or file_path.is_symlink()
-                ):
+                file_abs = os.path.abspath(os.path.join(dirpath, name))
+                # Skip the output file, symlinks, and an old helper name if present
+                if file_abs == output_abs or os.path.islink(file_abs) or name == "dump.py":
                     continue
 
-                out.write(f"===== {file_path} =====\n")
+                out.write(f"===== {file_abs} =====\n")
                 try:
-                    with file_path.open("r", encoding="utf-8", errors="replace") as f:
+                    with open(file_abs, "r", encoding="utf-8", errors="replace") as f:
                         out.write(f.read())
                 except Exception as exc:
                     out.write(f"# Could not read file: {type(exc).__name__}: {exc}\n")
@@ -79,13 +53,21 @@ def dump_files(root_dir: Path, output_path: Path, extensions: tuple[str, ...]) -
 
 
 if __name__ == "__main__":
-    root_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT_DIR
-    extensions = tuple(sys.argv[2:]) if len(sys.argv) > 2 else EXTENSIONS
+    # Enforce 'src/' as the only search root
+    if not SRC_DIR.is_dir():
+        sys.exit(f"Error: '{SRC_DIR}' does not exist or is not a directory.")
 
-    next_version = get_next_version(root_dir)
-    output_file = root_dir / f"{OUTPUT_BASE}{next_version}{OUTPUT_EXT}"
+    # Allow overriding output file and extensions only
+    if len(sys.argv) > 1:
+        output_file = sys.argv[1]
+    else:
+        output_file = OUTPUT_FILE
 
+    if len(sys.argv) > 2:
+        extensions = tuple(sys.argv[2:])
+    else:
+        extensions = EXTENSIONS
+
+    root_dir = str(SRC_DIR)
     dump_files(root_dir, output_file, extensions)
-    print(
-        f"Dumped all {', '.join(extensions)} files under '{root_dir}' into '{output_file}'"
-    )
+    print(f"Dumped all {', '.join(extensions)} files under '{root_dir}' into '{output_file}'")

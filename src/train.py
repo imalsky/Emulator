@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train.py - Optimized model training.
+train.py - Optimized model training with corrected loss normalization.
 """
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import logging
 import random
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn, optim
@@ -31,8 +31,8 @@ from utils import save_json, seed_everything
 
 logger = logging.getLogger(__name__)
 
-# Updated defaults for A100
-DEFAULT_BATCH_SIZE = 256  # Increased from 32
+# Defaults
+DEFAULT_BATCH_SIZE = 256
 DEFAULT_EPOCHS = 100
 DEFAULT_LR = 1e-4
 DEFAULT_OPTIMIZER = "adamw"
@@ -40,14 +40,12 @@ DEFAULT_GRAD_CLIP = 1.0
 DEFAULT_EARLY_STOPPING_PATIENCE = 20
 DEFAULT_MIN_DELTA = 1e-6
 DEFAULT_GRADIENT_ACCUMULATION = 1
-DEFAULT_NUM_WORKERS = 8  # Increased from 0
+DEFAULT_NUM_WORKERS = 8
 DEFAULT_MAX_BATCH_FAILURE_RATE = 0.10
 
 
-# Device Prefetch Loader for async GPU transfers
 class DevicePrefetchLoader:
-    """Wraps a DataLoader to prefetch batches to device asynchronously for CUDA,
-    or synchronously for other devices."""
+    """Wraps a DataLoader to prefetch batches to device asynchronously for CUDA."""
 
     def __init__(self, loader: DataLoader, device: torch.device):
         self.loader = loader
@@ -56,7 +54,6 @@ class DevicePrefetchLoader:
 
     def __iter__(self):
         if self.is_cuda:
-            # CUDA path with async prefetching
             stream = torch.cuda.Stream()
             first = True
             current_batch = None
@@ -76,14 +73,13 @@ class DevicePrefetchLoader:
             if current_batch is not None:
                 yield current_batch
         else:
-            # Path for other devices (e.g., MPS) with synchronous transfer
             for batch in self.loader:
                 yield self._to_device(batch)
 
     def _to_device(self, batch):
         """Move batch to device."""
         inputs, masks, targets, tgt_masks = batch
-        non_blocking = self.is_cuda  # Use non_blocking only for CUDA
+        non_blocking = self.is_cuda
 
         device_inputs = {}
         device_inputs["sequence"] = inputs["sequence"].to(self.device, non_blocking=non_blocking)
@@ -115,7 +111,7 @@ class ModelTrainer:
         processed_dir: Path,
         splits: Dict[str, List[Tuple[str, int]]],
         collate_fn: Callable,
-        optuna_trial: optuna.Trial = None,
+        optuna_trial: Optional[optuna.Trial] = None,
     ) -> None:
         self.cfg = config
         self.device = device
@@ -130,21 +126,19 @@ class ModelTrainer:
             "max_batch_failure_rate", DEFAULT_MAX_BATCH_FAILURE_RATE
         )
         
-        # Override config for optimal A100 performance
+        # Performance optimizations for A100
         if self.device.type == "cuda" and "A100" in torch.cuda.get_device_name(0):
             logger.info("Detected A100 GPU - applying performance optimizations")
-            # Enable AMP if not already
             if not train_params.get("use_amp", False):
                 logger.info("Enabling AMP for A100")
                 train_params["use_amp"] = True
-            # Increase batch size if still default
             if train_params.get("batch_size", DEFAULT_BATCH_SIZE) < 256:
                 logger.info(f"Increasing batch size from {train_params.get('batch_size', DEFAULT_BATCH_SIZE)} to 256")
                 train_params["batch_size"] = 256
         
         if misc_cfg.get("detect_anomaly", False):
             torch.autograd.set_detect_anomaly(True)
-            logger.warning("Anomaly detection enabled – training will be slower.")
+            logger.warning("Anomaly detection enabled - training will be slower.")
             
         save_json(splits, self.save_dir / "dataset_splits.json")
         self._setup_datasets(processed_dir, splits)
@@ -203,7 +197,7 @@ class ModelTrainer:
         )
 
         logger.info(
-            f"Datasets ready – train:{len(self.train_ds):,}  "
+            f"Datasets ready - train:{len(self.train_ds):,}  "
             f"val:{len(self.val_ds or []):,}  test:{len(self.test_ds or []):,}"
         )
 
@@ -240,7 +234,7 @@ class ModelTrainer:
             else None
         )
         
-        # Wrap with DevicePrefetchLoader for async (CUDA) or sync (other devices) transfers
+        # Wrap with DevicePrefetchLoader for async transfers
         if self.device.type != "cpu":
             logger.info(f"Using DevicePrefetchLoader for {self.device.type.upper()} transfers")
             self.train_loader = DevicePrefetchLoader(self.train_loader, self.device)
@@ -433,8 +427,10 @@ class ModelTrainer:
         ckpt = self.save_dir / "best_model.pt"
         if ckpt.exists():
             state = torch.load(ckpt, map_location=self.device)
-            tgt = self.model
-            tgt.load_state_dict(state["state_dict"])
+            sd = state["state_dict"]
+            if any(k.startswith("_orig_mod.") for k in sd):
+                sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+            self.model.load_state_dict(sd, strict=True)
 
         loss = self._run_epoch(self.test_loader, is_train=False)
         if loss is None:
@@ -444,7 +440,7 @@ class ModelTrainer:
         logger.info(f"Test loss: {metrics['test_loss']:.4e}")
         return metrics
 
-    def _run_epoch(self, loader: DataLoader, is_train: bool) -> float | None:
+    def _run_epoch(self, loader: DataLoader, is_train: bool) -> Optional[float]:
         if not loader or len(loader) == 0:
             mode = "training" if is_train else "validation"
             logger.warning(f"DataLoader for {mode} is empty. Skipping epoch.")
@@ -459,7 +455,6 @@ class ModelTrainer:
             # Data already on device if using DevicePrefetchLoader
             inputs, masks, targets, tgt_masks = batch
             
-            # Extract pre-transferred tensors
             seq = inputs["sequence"]
             gbl = inputs.get("global_features")
             seq_mask = masks["sequence"]
@@ -469,15 +464,12 @@ class ModelTrainer:
             ):
                 preds = self.model(seq, gbl, seq_mask)
                 unreduced = self.criterion(preds, targets)
-                valid = (~tgt_masks).unsqueeze(-1)
-
-                # Correct calculation of valid elements
-                valid_elems_in_batch = valid.sum()
-
-                if valid_elems_in_batch == 0:
+                valid = (~tgt_masks).unsqueeze(-1).expand_as(unreduced)
+                denom = valid.sum()
+                if denom.item() == 0:
                     failed += 1
                     continue
-                loss = (unreduced * valid.float()).sum() / valid_elems_in_batch
+                loss = (unreduced * valid.float()).sum() / denom.float()
 
             if is_train:
                 if self.use_amp:
@@ -501,8 +493,8 @@ class ModelTrainer:
                         self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
 
-            tot_loss += loss.item() * valid_elems_in_batch.item()
-            tot_elems += valid_elems_in_batch.item()
+            tot_loss += loss.item() * denom.item()
+            tot_elems += denom.item()
 
         if len(loader) > 0 and failed / len(loader) > self.max_batch_failure_rate:
             logger.critical("Too many failed batches. Aborting epoch.")
@@ -549,20 +541,17 @@ class ModelTrainer:
                 logger.warning("No sample for export.")
                 return
 
-            # Create a fresh, un-compiled model instance for export to avoid
-            # conflicts between torch.compile's specialization and torch.export's
-            # need for a generic, traceable graph.
+            # Create fresh un-compiled model for export
             logger.info("Creating a fresh, un-compiled model instance for export.")
             model_for_export = create_prediction_model(
                 self.cfg, device=self.device, compile_model=False
             )
-            # Load the trained weights. .state_dict() works correctly on compiled models.
+            # Load trained weights
             if hasattr(self.model, '_orig_mod'):
                 state_dict = self.model._orig_mod.state_dict()
             else:
                 state_dict = self.model.state_dict()
             model_for_export.load_state_dict(state_dict)
-
 
             inp, masks, _, _ = sample
             example = {
@@ -576,5 +565,6 @@ class ModelTrainer:
             export_model(model_for_export, example, path, self.cfg)
         except Exception as e:
             logger.error(f"Model export failed: {e}", exc_info=True)
+
 
 __all__ = ["ModelTrainer"]
