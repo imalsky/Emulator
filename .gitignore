@@ -18,3 +18,5 @@ old/
 codebase_v*
 
 tuning_results/
+
+models/*
