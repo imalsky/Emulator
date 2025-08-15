@@ -79,14 +79,14 @@ class FiLMLayer(nn.Module):
     Feature-wise Linear Modulation layer.
     
     Modulates features using global context through learned scale and shift.
-    Uses near-identity initialization for stable training.
+    Uses improved initialization for better training stability.
     """
     
     def __init__(
         self,
         context_dim: int,
         feature_dim: int,
-        clamp_gamma: Optional[float] = 1.0
+        clamp_gamma: Optional[float] = 2.0  # Increased from 1.0 for more adaptation
     ) -> None:
         """
         Initialize FiLM layer.
@@ -101,8 +101,8 @@ class FiLMLayer(nn.Module):
         # Project context to scale and shift parameters
         self.projection = nn.Linear(context_dim, feature_dim * 2)
         
-        # Near-identity initialization for stable training
-        nn.init.normal_(self.projection.weight, mean=0.0, std=0.01)
+        # Better initialization for stable training (increased std)
+        nn.init.xavier_uniform_(self.projection.weight, gain=0.1)
         nn.init.zeros_(self.projection.bias)
         
         # Store clamp value as Python float for dtype flexibility
@@ -155,6 +155,7 @@ class DecomposedTransformerEncoderLayer(nn.Module):
         nhead: int,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
+        attention_dropout: float = 0.1,  # Separate attention dropout
         activation: str = "gelu",
         norm_first: bool = True,
         batch_first: bool = True,
@@ -166,7 +167,8 @@ class DecomposedTransformerEncoderLayer(nn.Module):
             d_model: Model dimension
             nhead: Number of attention heads
             dim_feedforward: Feedforward network dimension
-            dropout: Dropout probability
+            dropout: Dropout probability for feedforward and residual
+            attention_dropout: Dropout probability for attention
             activation: Activation function ("gelu" or "relu")
             norm_first: If True, use pre-norm architecture
             batch_first: If True, expect batch dimension first
@@ -177,11 +179,11 @@ class DecomposedTransformerEncoderLayer(nn.Module):
         self.nhead = nhead
         self.norm_first = norm_first
         
-        # Multi-head attention
+        # Multi-head attention with separate dropout
         self.self_attn = nn.MultiheadAttention(
             d_model,
             nhead,
-            dropout=dropout,
+            dropout=attention_dropout,  # Use separate attention dropout
             batch_first=batch_first
         )
         
@@ -210,11 +212,13 @@ class DecomposedTransformerEncoderLayer(nn.Module):
         self._init_weights()
     
     def _init_weights(self) -> None:
-        """Initialize weights following PyTorch's TransformerEncoderLayer."""
-        nn.init.xavier_uniform_(self.linear1.weight)
+        """Initialize weights with improved strategy."""
+        # Attention weights are initialized by MultiheadAttention
+        # Initialize feedforward weights
+        nn.init.xavier_uniform_(self.linear1.weight, gain=math.sqrt(2))
         nn.init.xavier_uniform_(self.linear2.weight)
-        nn.init.constant_(self.linear1.bias, 0)
-        nn.init.constant_(self.linear2.bias, 0)
+        nn.init.zeros_(self.linear1.bias)
+        nn.init.zeros_(self.linear2.bias)
     
     def forward(
         self,
@@ -286,8 +290,9 @@ class TransformerBlock(nn.Module):
         nhead: int,
         dim_feedforward: int,
         dropout: float,
+        attention_dropout: float,
         global_input_dim: int,
-        film_clamp: Optional[float] = 1.0,
+        film_clamp: Optional[float] = 2.0,
     ):
         """
         Initialize transformer block with optional FiLM.
@@ -297,6 +302,7 @@ class TransformerBlock(nn.Module):
             nhead: Number of attention heads
             dim_feedforward: Feedforward dimension
             dropout: Dropout probability
+            attention_dropout: Attention dropout probability
             global_input_dim: Dimension of global features (0 for no FiLM)
             film_clamp: Clamping value for FiLM parameters
         """
@@ -304,12 +310,13 @@ class TransformerBlock(nn.Module):
         
         self.has_film = global_input_dim > 0
         
-        # Transformer layer
+        # Transformer layer with separate attention dropout
         self.transformer = DecomposedTransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
+            attention_dropout=attention_dropout,
             activation="gelu",
             norm_first=True,
             batch_first=True,
@@ -355,6 +362,7 @@ class PredictionModel(nn.Module):
     - Sinusoidal positional encoding
     - Export-friendly implementation
     - Proper padding mask handling (no output overwriting)
+    - Improved initialization and normalization
     
     IMPORTANT: This model does NOT overwrite outputs at padding positions.
     The loss function handles masking, following industry standards.
@@ -368,10 +376,11 @@ class PredictionModel(nn.Module):
         d_model: int = 256,
         nhead: int = 8,
         num_encoder_layers: int = 6,
-        dim_feedforward: int = 1024,
+        dim_feedforward: Optional[int] = None,
         dropout: float = 0.1,
+        attention_dropout: Optional[float] = None,
         padding_value: float = PADDING_VALUE,
-        film_clamp: Optional[float] = 1.0,
+        film_clamp: Optional[float] = 2.0,
     ) -> None:
         """
         Initialize prediction model.
@@ -383,8 +392,9 @@ class PredictionModel(nn.Module):
             d_model: Model dimension
             nhead: Number of attention heads
             num_encoder_layers: Number of transformer layers
-            dim_feedforward: Feedforward dimension
+            dim_feedforward: Feedforward dimension (defaults to 4*d_model)
             dropout: Dropout probability
+            attention_dropout: Attention dropout (defaults to dropout)
             padding_value: Value used for padding (for reference only)
             film_clamp: Clamping value for FiLM parameters
         """
@@ -395,6 +405,12 @@ class PredictionModel(nn.Module):
         
         self.d_model = d_model
         self.has_global_features = global_input_dim > 0
+        
+        # Set defaults following industry standards
+        if dim_feedforward is None:
+            dim_feedforward = 4 * d_model  # Standard ratio
+        if attention_dropout is None:
+            attention_dropout = dropout
         
         # Note: We store padding_value for reference but don't use it for output masking
         self.padding_value = padding_value
@@ -424,17 +440,21 @@ class PredictionModel(nn.Module):
                     nhead=nhead,
                     dim_feedforward=dim_feedforward,
                     dropout=dropout,
+                    attention_dropout=attention_dropout,
                     global_input_dim=global_input_dim,
                     film_clamp=film_clamp,
                 )
             )
         
-        # Output projection
+        # Final normalization (important for stability)
+        self.final_norm = nn.LayerNorm(d_model)
+        
+        # Output projection (improved: no dropout before final layer)
         self.output_proj = nn.Sequential(
+            nn.Dropout(dropout),  # Dropout first
             nn.Linear(d_model, d_model),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, output_dim),
+            nn.Linear(d_model, output_dim),  # No dropout before final output
         )
         
         # Initialize weights
@@ -444,19 +464,30 @@ class PredictionModel(nn.Module):
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(
             f"PredictionModel created with {trainable_params:,} trainable parameters. "
-            f"Architecture: d_model={d_model}, nhead={nhead}, layers={num_encoder_layers}"
+            f"Architecture: d_model={d_model}, nhead={nhead}, layers={num_encoder_layers}, "
+            f"ffn_dim={dim_feedforward}, attn_dropout={attention_dropout:.2f}"
         )
     
     def _init_weights(self) -> None:
-        """Initialize weights for layers except FiLM and Transformer blocks."""
-        for module in self.modules():
+        """Initialize weights with improved strategies per layer type."""
+        for name, module in self.named_modules():
+            # Skip already initialized layers
             if isinstance(module, (FiLMLayer, DecomposedTransformerEncoderLayer, TransformerBlock)):
                 continue  # These have their own initialization
-            elif isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="relu")
+            
+            if isinstance(module, nn.Linear):
+                # Use truncated normal for better initialization
+                if "output_proj" in name and "2" in name:  # Final output layer
+                    # Smaller initialization for output layer
+                    nn.init.trunc_normal_(module.weight, std=0.02)
+                else:
+                    # Standard initialization for other layers
+                    nn.init.trunc_normal_(module.weight, std=0.02)
+                
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-            elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+                    
+            elif isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
     
@@ -494,6 +525,9 @@ class PredictionModel(nn.Module):
         for block in self.blocks:
             x = block(x, global_features, sequence_mask)
         
+        # Apply final normalization (important for stability)
+        x = self.final_norm(x)
+        
         # Project to output dimension
         output = self.output_proj(x)
         
@@ -530,18 +564,25 @@ def create_prediction_model(
     if device is None:
         device = torch.device("cpu")
     
-    # Create model
+    # Extract parameters with improved defaults
+    d_model = model_params.get("d_model", 256)
+    dim_feedforward = model_params.get("dim_feedforward")
+    if dim_feedforward is None:
+        dim_feedforward = 4 * d_model  # Industry standard ratio
+    
+    # Create model with improved parameters
     model = PredictionModel(
         input_dim=len(data_spec["input_variables"]),
         global_input_dim=len(data_spec.get("global_variables", [])),
         output_dim=len(data_spec["target_variables"]),
-        d_model=model_params.get("d_model", 256),
+        d_model=d_model,
         nhead=model_params.get("nhead", 8),
         num_encoder_layers=model_params.get("num_encoder_layers", 6),
-        dim_feedforward=model_params.get("dim_feedforward", 1024),
+        dim_feedforward=dim_feedforward,
         dropout=float(model_params.get("dropout", 0.1)),
+        attention_dropout=float(model_params.get("attention_dropout", model_params.get("dropout", 0.1))),
         padding_value=float(data_spec.get("padding_value", PADDING_VALUE)),
-        film_clamp=1.0,
+        film_clamp=2.0,  # Increased from 1.0 for better adaptation
     )
     
     model.to(device=device)

@@ -1,298 +1,314 @@
 #!/usr/bin/env python3
-"""
-Evaluate and visualize model predictions on test data.
-Creates comparison plots of true vs predicted atmospheric fluxes.
-"""
+"""Benchmark model inference speed across batch sizes on CPU."""
 
 import json
+import time
 import sys
 from pathlib import Path
+from typing import Dict, Tuple, Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 
 # Configuration
 MODEL_NAME = "trained_model"
-NUM_PROFILES = 2
+BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
+N_WARMUP = 10
+N_RUNS = 50
+DEVICE = torch.device("cpu")
 
 # Setup paths
 ROOT = Path(__file__).parent.parent
 sys.path.extend([str(ROOT), str(ROOT / "src")])
 
-from normalizer import DataNormalizer
 from model import create_prediction_model
+from utils import load_config
 
 
-def remap_layer_keys(state_dict):
+def load_model(model_dir: Path) -> Tuple[torch.nn.Module, float, str, Dict]:
     """
-    Remap checkpoint keys from old 'layers' structure to new 'blocks' structure.
+    Load model from checkpoint or exported format.
     
-    Old architecture: layers.0 (initial_film), layers.1 (transformer0), layers.2 (film0), ...
-    New architecture: initial_film, blocks.0.transformer, blocks.0.film, ...
+    Returns:
+        Tuple of (model, size_mb, model_type, config)
     """
-    remapped = {}
-    
-    for key, value in state_dict.items():
-        # Remove any _orig_mod prefix from compiled models
-        key = key.replace("_orig_mod.", "")
-        
-        if not key.startswith("layers."):
-            remapped[key] = value
-            continue
-            
-        # Parse layer index and remaining path
-        parts = key.split(".", 2)
-        layer_idx = int(parts[1])
-        rest = parts[2] if len(parts) > 2 else ""
-        
-        # Map to new structure
-        if layer_idx == 0:
-            remapped[f"initial_film.{rest}"] = value
-        elif layer_idx % 2 == 1:  # Odd = transformer
-            block_idx = layer_idx // 2
-            remapped[f"blocks.{block_idx}.transformer.{rest}"] = value
-        else:  # Even > 0 = film
-            block_idx = (layer_idx - 2) // 2
-            remapped[f"blocks.{block_idx}.film.{rest}"] = value
-    
-    return remapped
-
-
-def load_model(model_dir):
-    """Load trained model and configuration."""
-    # Find config file
-    config_files = list(model_dir.glob("*_config.json"))
-    if not config_files:
+    # Load configuration
+    config_path = next(model_dir.glob("*_config.json"), model_dir / "config.json")
+    if not config_path.exists():
         raise FileNotFoundError(f"No config found in {model_dir}")
+    config = load_config(config_path)
     
-    with open(config_files[0]) as f:
-        config = json.load(f)
+    # Try loading exported model first
+    exported_paths = sorted(model_dir.glob("*_exported*.pt2"))
+    if exported_paths:
+        # Prefer static export if available
+        static = [p for p in exported_paths if "static" in p.name]
+        export_path = static[0] if static else exported_paths[0]
+        
+        try:
+            print(f"Loading exported model: {export_path.name}")
+            exported_prog = torch.export.load(str(export_path))
+            model = exported_prog.module()
+            model.eval()
+            size_mb = export_path.stat().st_size / (1024 * 1024)
+            return model, size_mb, f"exported", config
+        except Exception as e:
+            print(f"Failed to load export ({e}), falling back to checkpoint")
     
-    # Load checkpoint
+    # Load from checkpoint
     checkpoint_path = model_dir / "best_model.pt"
     if not checkpoint_path.exists():
-        raise FileNotFoundError(f"No checkpoint at {checkpoint_path}")
+        raise FileNotFoundError(f"No checkpoint found: {checkpoint_path}")
     
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    print(f"Loading model from epoch {checkpoint.get('epoch', 'unknown')}")
+    print(f"Loading checkpoint: {checkpoint_path.name}")
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
     
-    # Create model and load weights
-    model = create_prediction_model(config, device=torch.device("cpu"), compile_model=False)
-    state_dict = remap_layer_keys(checkpoint.get("state_dict", checkpoint))
+    # Create model
+    model = create_prediction_model(config, device=DEVICE, compile_model=False)
+    
+    # Load weights
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    # Remove compilation wrapper if present
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict, strict=False)
     model.eval()
     
-    return model, config
+    size_mb = checkpoint_path.stat().st_size / (1024 * 1024)
+    return model, size_mb, "checkpoint", config
 
 
-def load_test_data(config, num_samples=2):
-    """Load random samples from test/validation set."""
-    # Try test directory first, fall back to validation
-    data_dir = ROOT / "data/processed/test"
-    if not data_dir.exists():
-        data_dir = ROOT / "data/processed/val"
+def get_model_dimensions(config: Dict) -> Tuple[int, int, int]:
+    """
+    Extract model dimensions from config.
     
-    # Load metadata
-    with open(data_dir / "metadata.json") as f:
-        metadata = json.load(f)
+    Returns:
+        Tuple of (sequence_length, input_dim, global_dim)
+    """
+    data_spec = config.get("data_specification", {})
+    model_params = config.get("model_hyperparameters", {})
     
-    # Pick random shard
-    shards = sorted((data_dir / "sequence_inputs").glob("shard_*.npy"))
-    shard = np.random.choice(shards)
+    # Get dimensions
+    input_vars = data_spec.get("input_variables", [])
+    global_vars = data_spec.get("global_variables", [])
+    seq_length = model_params.get("max_sequence_length", 64)
     
-    # Load arrays
-    sequences = np.load(data_dir / "sequence_inputs" / shard.name)
-    targets = np.load(data_dir / "targets" / shard.name)
+    return seq_length, len(input_vars), len(global_vars)
+
+
+def create_batch(batch_size: int, seq_len: int, input_dim: int, global_dim: int) -> Dict[str, torch.Tensor]:
+    """Create dummy batch for benchmarking."""
+    # All tensors on CPU, float32
+    batch = {
+        "sequence": torch.randn(batch_size, seq_len, input_dim, dtype=torch.float32, device=DEVICE)
+    }
     
-    # Load global features if present
-    globals_array = None
-    if config["data_specification"].get("global_variables"):
-        globals_path = data_dir / "globals" / shard.name
-        if globals_path.exists():
-            globals_array = np.load(globals_path)
+    if global_dim > 0:
+        batch["global_features"] = torch.randn(batch_size, global_dim, dtype=torch.float32, device=DEVICE)
     
-    # Select random samples
-    indices = np.random.choice(len(sequences), min(num_samples, len(sequences)), replace=False)
-    padding_value = config["data_specification"]["padding_value"]
+    # Add padding mask (no padding for benchmark)
+    batch["sequence_mask"] = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=DEVICE)
     
-    samples = []
-    for idx in indices:
-        # Create tensors
-        seq_tensor = torch.from_numpy(sequences[idx]).float()
-        tgt_tensor = torch.from_numpy(targets[idx]).float()
+    return batch
+
+
+def benchmark_model(
+    model: torch.nn.Module,
+    seq_len: int,
+    input_dim: int, 
+    global_dim: int,
+    batch_sizes: list = BATCH_SIZES
+) -> Dict[str, list]:
+    """
+    Benchmark model inference across batch sizes.
+    
+    Returns:
+        Dictionary with batch_size, latency_ms, throughput, and latency_per_sample
+    """
+    results = {
+        "batch_size": [],
+        "latency_ms": [],
+        "latency_std": [],
+        "throughput": [],
+        "latency_per_sample": []
+    }
+    
+    print(f"\nBenchmarking with {N_WARMUP} warmup and {N_RUNS} timed runs per batch size")
+    print("-" * 60)
+    
+    # Force CPU and ensure no gradients
+    model = model.to(DEVICE)
+    model.eval()
+    torch.set_grad_enabled(False)
+    
+    for bs in batch_sizes:
+        batch = create_batch(bs, seq_len, input_dim, global_dim)
         
-        # Identify padding positions
-        is_padding = torch.all(torch.abs(seq_tensor - padding_value) < 1e-6, dim=-1)
+        # Warmup runs
+        for _ in range(N_WARMUP):
+            with torch.no_grad():
+                _ = model(**batch)
         
-        sample = {
-            "sequence": seq_tensor,
-            "target": tgt_tensor,
-            "padding_mask": is_padding,  # True = padding (for model)
-            "valid_mask": ~is_padding,   # True = valid (for plotting)
-        }
+        # Clear any caches
+        if hasattr(torch, '_C') and hasattr(torch._C, '_jit_clear_class_registry'):
+            torch._C._jit_clear_class_registry()
         
-        if globals_array is not None:
-            sample["global_features"] = torch.from_numpy(globals_array[idx]).float()
+        # Timed runs
+        times_ms = []
+        for _ in range(N_RUNS):
+            # Force CPU sync (though not needed for CPU)
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            
+            start = time.perf_counter()
+            with torch.no_grad():
+                _ = model(**batch)
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            times_ms.append(elapsed_ms)
         
-        samples.append(sample)
-    
-    return samples
-
-
-def run_inference(model, sample):
-    """Run model inference on a single sample."""
-    with torch.no_grad():
-        # Prepare inputs with batch dimension
-        inputs = {
-            "sequence": sample["sequence"].unsqueeze(0),
-            "sequence_mask": sample["padding_mask"].unsqueeze(0),
-        }
+        # Calculate statistics
+        mean_ms = np.mean(times_ms)
+        std_ms = np.std(times_ms)
+        throughput = bs / (mean_ms / 1000)  # samples per second
+        latency_per_sample = mean_ms / bs
         
-        if "global_features" in sample:
-            inputs["global_features"] = sample["global_features"].unsqueeze(0)
+        # Store results
+        results["batch_size"].append(bs)
+        results["latency_ms"].append(float(mean_ms))
+        results["latency_std"].append(float(std_ms))
+        results["throughput"].append(float(throughput))
+        results["latency_per_sample"].append(float(latency_per_sample))
         
-        # Forward pass
-        output = model(**inputs)
-        return output.squeeze(0)
-
-
-def denormalize(tensor, variable_name, norm_metadata):
-    """Denormalize a tensor using saved statistics."""
-    method = norm_metadata["normalization_methods"].get(variable_name, "none")
-    stats = norm_metadata["per_key_stats"].get(variable_name, {})
+        print(f"BS={bs:3d}: {mean_ms:7.2f} ± {std_ms:5.2f} ms | "
+              f"{throughput:8.1f} samples/s | "
+              f"{latency_per_sample:6.2f} ms/sample")
     
-    if method != "none" and stats:
-        stats["method"] = method  # Ensure method is in stats
-        result = DataNormalizer.denormalize_tensor(tensor, method, stats)
-        return result.cpu().numpy()
+    torch.set_grad_enabled(True)  # Re-enable gradients
+    return results
+
+
+def plot_results(results: Dict, model_info: Dict, save_dir: Path) -> None:
+    """Create benchmark visualization plots."""
+    save_dir.mkdir(parents=True, exist_ok=True)
     
-    return tensor.cpu().numpy()
-
-
-def calculate_errors(predictions, targets):
-    """Calculate percent error, capped at 10000%."""
-    errors = 100 * np.abs((predictions - targets) / np.maximum(np.abs(targets), 1e-10))
-    return np.minimum(errors, 1e4)
-
-
-def create_plots(samples, model, config, norm_metadata, output_path):
-    """Create comparison plots for model evaluation."""
-    # Get variable names and indices
-    input_vars = config["data_specification"]["input_variables"]
-    target_vars = config["data_specification"]["target_variables"]
-    
-    pressure_idx = input_vars.index("pressure_bar")
-    thermal_idx = target_vars.index("net_thermal_flux")
-    reflected_idx = target_vars.index("net_reflected_flux")
-    
-    # Setup figure
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    colors = plt.cm.tab10(np.arange(len(samples)))
     
-    for i, sample in enumerate(samples):
-        # Run inference
-        predictions = run_inference(model, sample)
-        
-        # Get valid (non-padded) data points
-        valid_indices = sample["valid_mask"].nonzero(as_tuple=False).squeeze(-1)
-        if valid_indices.numel() == 0:
-            continue
-        
-        # Extract valid data
-        seq_valid = sample["sequence"][valid_indices]
-        tgt_valid = sample["target"][valid_indices]
-        pred_valid = predictions[valid_indices]
-        
-        # Denormalize all variables
-        pressure = denormalize(seq_valid[:, pressure_idx], "pressure_bar", norm_metadata)
-        thermal_true = denormalize(tgt_valid[:, thermal_idx], "net_thermal_flux", norm_metadata)
-        thermal_pred = denormalize(pred_valid[:, thermal_idx], "net_thermal_flux", norm_metadata)
-        reflected_true = denormalize(tgt_valid[:, reflected_idx], "net_reflected_flux", norm_metadata)
-        reflected_pred = denormalize(pred_valid[:, reflected_idx], "net_reflected_flux", norm_metadata)
-        
-        # Calculate errors
-        thermal_error = calculate_errors(thermal_pred, thermal_true)
-        reflected_error = calculate_errors(reflected_pred, reflected_true)
-        
-        # Print summary
-        print(f"\nProfile {i+1}:")
-        print(f"  Points: {valid_indices.numel()}")
-        print(f"  Mean error: Thermal={thermal_error.mean():.1f}%, Reflected={reflected_error.mean():.1f}%")
-        
-        # Plot results
-        color = colors[i]
-        
-        # Thermal flux comparison
-        axes[0, 0].plot(thermal_true, pressure, "o-", color=color, alpha=0.7, 
-                       label=f"True {i+1}", markersize=3)
-        axes[0, 0].plot(thermal_pred, pressure, "x--", color=color, alpha=0.9,
-                       label=f"Pred {i+1}", markersize=3)
-        
-        # Reflected flux comparison
-        axes[0, 1].plot(reflected_true, pressure, "o-", color=color, alpha=0.7, markersize=3)
-        axes[0, 1].plot(reflected_pred, pressure, "x--", color=color, alpha=0.9, markersize=3)
-        
-        # Error plots
-        axes[1, 0].semilogx(thermal_error, pressure, color=color, label=f"Profile {i+1}")
-        axes[1, 1].semilogx(reflected_error, pressure, color=color)
+    bs = results["batch_size"]
     
-    # Format all axes
-    for ax in axes.flat:
-        ax.set_yscale("log")
-        ax.set_ylim(1e2, 1e-5)
-        ax.grid(True, which="both", alpha=0.3)
-        ax.set_ylabel("Pressure (bar)")
+    # 1. Latency with error bars
+    axes[0, 0].errorbar(bs, results["latency_ms"], yerr=results["latency_std"], 
+                        marker='o', capsize=3, capthick=1)
+    axes[0, 0].set_xlabel("Batch Size")
+    axes[0, 0].set_ylabel("Latency (ms)")
+    axes[0, 0].set_title("Inference Latency")
+    axes[0, 0].set_xscale("log", base=2)
+    axes[0, 0].grid(True, alpha=0.3)
     
-    # Format flux axes
-    axes[0, 0].set_xscale("symlog")
-    axes[0, 1].set_xscale("symlog")
-    axes[0, 0].set_xlabel("Flux (W/m²)")
-    axes[0, 1].set_xlabel("Flux (W/m²)")
+    # 2. Throughput
+    axes[0, 1].plot(bs, results["throughput"], "o-", color="green")
+    axes[0, 1].set_xlabel("Batch Size")
+    axes[0, 1].set_ylabel("Throughput (samples/s)")
+    axes[0, 1].set_title("Inference Throughput")
+    axes[0, 1].set_xscale("log", base=2)
+    axes[0, 1].grid(True, alpha=0.3)
     
-    # Format error axes
-    for ax in axes[1, :]:
-        ax.set_xlim(1e-2, 1e4)
-        ax.set_xlabel("Percent Error (%)")
+    # 3. Latency per sample
+    axes[1, 0].plot(bs, results["latency_per_sample"], "o-", color="orange")
+    axes[1, 0].set_xlabel("Batch Size")
+    axes[1, 0].set_ylabel("Latency per Sample (ms)")
+    axes[1, 0].set_title("Amortized Latency")
+    axes[1, 0].set_xscale("log", base=2)
+    axes[1, 0].grid(True, alpha=0.3)
     
-    # Add titles and legends
-    axes[0, 0].set_title("Net Thermal Flux")
-    axes[0, 1].set_title("Net Reflected Flux")
-    axes[1, 0].set_title("Thermal Error")
-    axes[1, 1].set_title("Reflected Error")
+    # 4. Efficiency (samples per second per batch size)
+    efficiency = [t/b for t, b in zip(results["throughput"], bs)]
+    axes[1, 1].plot(bs, efficiency, "o-", color="purple")
+    axes[1, 1].set_xlabel("Batch Size")
+    axes[1, 1].set_ylabel("Efficiency (throughput/batch_size)")
+    axes[1, 1].set_title("Batching Efficiency")
+    axes[1, 1].set_xscale("log", base=2)
+    axes[1, 1].grid(True, alpha=0.3)
     
-    axes[0, 0].legend(fontsize=8, loc="best")
-    axes[1, 0].legend(fontsize=8, loc="best")
+    # Add overall title
+    model_type = model_info["type"]
+    size_mb = model_info["size_mb"]
+    plt.suptitle(f"CPU Inference Benchmark | {model_type} ({size_mb:.1f} MB)", fontsize=14)
     
-    # Save figure
     plt.tight_layout()
+    output_path = save_dir / "inference_benchmark.png"
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    print(f"\n✓ Saved plot to: {output_path}")
+    print(f"\n✓ Saved benchmark plot: {output_path}")
+    plt.close()
+
+
+def save_results(results: Dict, model_info: Dict, save_dir: Path) -> None:
+    """Save benchmark results to JSON."""
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Add metadata to results
+    full_results = {
+        "model": model_info,
+        "benchmark_config": {
+            "warmup_runs": N_WARMUP,
+            "timed_runs": N_RUNS,
+            "device": str(DEVICE),
+        },
+        "results": results,
+        "summary": {
+            "best_throughput": max(results["throughput"]),
+            "best_throughput_batch": results["batch_size"][np.argmax(results["throughput"])],
+            "min_latency": min(results["latency_ms"]),
+            "min_latency_batch": results["batch_size"][np.argmin(results["latency_ms"])],
+        }
+    }
+    
+    output_path = save_dir / "benchmark_results.json"
+    with open(output_path, "w") as f:
+        json.dump(full_results, f, indent=2)
+    print(f"✓ Saved results: {output_path}")
 
 
 def main():
-    """Main evaluation pipeline."""
+    """Main benchmark pipeline."""
+    print("=" * 60)
+    print("CPU Inference Benchmark")
+    print("=" * 60)
+    
     # Setup paths
     model_dir = ROOT / "models" / MODEL_NAME
-    plot_dir = model_dir / "plots"
-    plot_dir.mkdir(exist_ok=True)
+    if not model_dir.exists():
+        raise FileNotFoundError(f"Model directory not found: {model_dir}")
     
-    # Load model and metadata
-    print(f"Evaluating model: {MODEL_NAME}")
-    model, config = load_model(model_dir)
+    output_dir = model_dir / "benchmark"
     
-    # Load normalization metadata
-    norm_path = ROOT / "data/processed/normalization_metadata.json"
-    with open(norm_path) as f:
-        norm_metadata = json.load(f)
+    # Load model
+    print(f"\nLoading model: {MODEL_NAME}")
+    model, size_mb, model_type, config = load_model(model_dir)
+    seq_len, input_dim, global_dim = get_model_dimensions(config)
     
-    # Load test samples
-    samples = load_test_data(config, NUM_PROFILES)
-    print(f"Loaded {len(samples)} test samples")
+    model_info = {
+        "name": MODEL_NAME,
+        "type": model_type,
+        "size_mb": size_mb,
+        "seq_length": seq_len,
+        "input_dim": input_dim,
+        "global_dim": global_dim,
+    }
     
-    # Create evaluation plots
-    output_path = plot_dir / "model_predictions.png"
-    create_plots(samples, model, config, norm_metadata, output_path)
+    print(f"Model type: {model_type} ({size_mb:.1f} MB)")
+    print(f"Dimensions: seq={seq_len}, input={input_dim}, global={global_dim}")
+    
+    # Run benchmark
+    results = benchmark_model(model, seq_len, input_dim, global_dim, BATCH_SIZES)
+    
+    # Save and plot results
+    save_results(results, model_info, output_dir)
+    plot_results(results, model_info, output_dir)
+    
+    print("\n" + "=" * 60)
+    print("Benchmark complete!")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

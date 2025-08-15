@@ -285,19 +285,35 @@ class DataNormalizer:
             
             # Collect values for quantile computation
             if "values" in key_acc:
-                key_acc["total_values_seen"] += valid_data.numel()
-                current_stored_size = key_acc["values"].numel()
-                
-                if current_stored_size + valid_data.numel() <= memory_limit:
-                    key_acc["values"] = torch.cat([key_acc["values"], valid_data])
+                vals = valid_data.flatten()
+                if vals.numel() == 0:
+                    # nothing to do; do NOT change total_values_seen
+                    pass
                 else:
-                    # Reservoir sampling for memory efficiency
-                    self._approximated_quantile_keys.add(key)
-                    combined_data = torch.cat([key_acc["values"], valid_data])
-                    perm = torch.randperm(combined_data.numel(), device=self.device)[
-                        :memory_limit
-                    ]
-                    key_acc["values"] = combined_data[perm]
+                    # Use the previous total (do not pre-increment anywhere else)
+                    t_prev = int(key_acc.get("total_values_seen", 0))
+                    k = key_acc["values"].numel()
+
+                    # Fill reservoir up to memory_limit
+                    if k < memory_limit:
+                        take = min(vals.numel(), memory_limit - k)
+                        if take > 0:
+                            key_acc["values"] = torch.cat([key_acc["values"], vals[:take]])
+                        t_prev += take
+                        vals = vals[take:]
+
+                    # Standard reservoir sampling for the remainder
+                    for i in range(vals.numel()):
+                        t_prev += 1
+                        j = torch.randint(0, t_prev, (1,), device=vals.device).item()
+                        if j < memory_limit:
+                            key_acc["values"][j] = vals[i]
+
+                    key_acc["total_values_seen"] = t_prev
+                    
+                    # Mark as approximated if we've seen more than memory_limit
+                    if t_prev > memory_limit:
+                        self._approximated_quantile_keys.add(key)
             
             # Update min/max
             if "max" in key_acc:

@@ -714,6 +714,10 @@ class ModelTrainer:
             # Accumulate statistics
             total_loss += loss.item() * num_valid.item()
             total_elements += num_valid.item()
+            
+            # Step the profiler after each batch (moved from end of epoch)
+            if self.profiler is not None:
+                self.profiler.step()
         
         # Check failure rate
         if len(loader) > 0 and failed_batches / len(loader) > self.max_batch_failure_rate:
@@ -733,10 +737,7 @@ class ModelTrainer:
                 f"Epoch complete. {failed_batches} batches were all padding. "
                 f"Processed {total_elements} valid elements."
             )
-        
-        if self.profiler is not None:
-            self.profiler.step()
-        
+                
         return total_loss / total_elements
     
     def _log_epoch_results(

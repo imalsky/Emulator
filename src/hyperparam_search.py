@@ -57,7 +57,6 @@ class AggressivePruner(optuna.pruners.BasePruner):
         )
         self.patience = patience
         self.min_improvement = min_improvement
-        # FIXED: Removed unused _trial_best dictionary
     
     def prune(self, study: optuna.Study, trial: optuna.FrozenTrial) -> bool:
         """

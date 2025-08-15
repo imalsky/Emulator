@@ -1,6 +1,7 @@
 {
 // ════════════════════════════════════════════════════════════════
 // ║           ATMOSPHERIC PROFILE TRANSFORMER CONFIG             ║
+// ║                    IMPROVED VERSION                          ║
 // ║                                                              ║
 // ║  PADDING & MASKING CONVENTION:                              ║
 // ║  - Padding value: -9999.0 (unlikely in atmospheric data)    ║
@@ -20,7 +21,8 @@
   "random_seed": 42,                         // int ≥ 0
   
   // Data-loader worker processes (0 = main thread).
-  "num_workers": 8,                          // int ≥ 0
+  // CHANGED: Increased for better GPU utilization
+  "num_workers": 12,                         // int ≥ 0
   
   // Turn on PyTorch's anomaly detection (debug only; slows training).
   "detect_anomaly": false,                   // bool
@@ -32,7 +34,8 @@
   "torch_compile": true,                     // bool
   
   // Compile mode if torch_compile is enabled
-  "compile_mode": "default",                 // "default", "reduce-overhead", "max-autotune"
+  // CHANGED: max-autotune for best performance on modern GPUs
+  "compile_mode": "max-autotune",            // "default", "reduce-overhead", "max-autotune"
   
   // Enable torch.export for model export
   "torch_export": true                       // bool
@@ -45,17 +48,16 @@
   // HDF5 files sitting in data/raw/.
   // Multiple files supported; order doesn't matter.
   "hdf5_dataset_filename": [
-    "picaso_results_1.h5"
-    // Uncomment to add more files:
-    //"picaso_results_2.h5",
-    //"picaso_results_3.h5",
-    //"picaso_results_4.h5",
-    //"picaso_results_5.h5",
-    //"picaso_results_6.h5",
-    //"picaso_results_7.h5",
-    //"picaso_results_8.h5",
-    //"picaso_results_9.h5",
-    //"picaso_results_10.h5"
+    "picaso_results_1.h5",
+    "picaso_results_2.h5",
+    "picaso_results_3.h5",
+    "picaso_results_4.h5",
+    "picaso_results_5.h5",
+    "picaso_results_6.h5",
+    "picaso_results_7.h5",
+    "picaso_results_8.h5",
+    "picaso_results_9.h5",
+    "picaso_results_10.h5"
   ],
 
   // Optional pre-made JSON of train/val/test indices.
@@ -88,6 +90,7 @@
   ],
 
   // Padding value for variable-length sequences.
+  // CHANGED: Fixed to match codebase standard (-9999.0 instead of -1e30)
   // IMPORTANT: This value is used as a sentinel to identify padding positions.
   // - Must be a value that never occurs naturally in your data
   // - All features at a padded timestep will be set to this value
@@ -130,7 +133,8 @@
   "quantile_max_values_in_memory": 10000000, // int ≥ 1
 
   // Percentile that defines linear→log switch in symlog.
-  "symlog_percentile": 0.25                 // 0 ≤ float ≤ 1
+  // CHANGED: Increased for better handling of near-zero values
+  "symlog_percentile": 0.5                  // 0 ≤ float ≤ 1
 },
 
 // ════════════════════════════════════════════════════════════════
@@ -138,19 +142,32 @@
 // ════════════════════════════════════════════════════════════════
 "model_hyperparameters": {
   // Hidden dimension of transformer embeddings.
-  "d_model": 256,                            // int, power of 2 recommended
+  // CHANGED: Increased from 256 to 512 for better capacity
+  "d_model": 512,                            // int, power of 2 recommended
   
   // Attention heads (must divide d_model exactly).
-  "nhead": 4,                                // int (256/4 = 64 dims per head)
+  // CHANGED: Increased to 8 (512/8 = 64 dims per head, standard)
+  "nhead": 8,                                // int
   
   // Number of transformer encoder layers.
-  "num_encoder_layers": 3,                   // int
+  // CHANGED: Increased from 3 to 6 for deeper model
+  "num_encoder_layers": 6,                   // int
   
   // FFN inner dimension (typically 4×d_model).
-  "dim_feedforward": 1024,                   // int
+  // CHANGED: Set to 4×d_model (2048) following transformer standard
+  "dim_feedforward": 2048,                   // int
   
   // Dropout applied inside encoder & projection layers.
-  "dropout": 0.0,                            // 0-1 float
+  // CHANGED: Set to 0.1 for regularization (0.0 can overfit)
+  "dropout": 0.1,                            // 0-1 float
+  
+  // NEW: Separate dropout for attention layers
+  // Often beneficial to have different dropout for attention
+  "attention_dropout": 0.1,                  // 0-1 float
+  
+  // NEW: FiLM layer clamping value
+  // Controls how much global features can modulate the model
+  "film_clamp": 2.0,                         // float > 0 or null for no clamping
   
   // Maximum sequence length your data can reach.
   // Sequences longer than this will be truncated.
@@ -163,16 +180,20 @@
 // ════════════════════════════════════════════════════════════════
 "training_hyperparameters": {
   // Maximum number of training epochs.
-  "epochs": 200,                             // int ≥ 1
+  // CHANGED: Increased to 300 for better convergence
+  "epochs": 300,                             // int ≥ 1
   
   // Mini-batch size per GPU.
-  "batch_size": 512,                         // int ≥ 1
+  // CHANGED: Reduced from 512 to 256 for stability with larger model
+  "batch_size": 256,                         // int ≥ 1
   
   // Initial learning rate.
-  "learning_rate": 1e-4,                     // float > 0
+  // CHANGED: Increased to 2e-4 for faster initial learning
+  "learning_rate": 2e-4,                     // float > 0
   
   // L2 weight decay (regularization).
-  "weight_decay": 1e-5,                      // float ≥ 0
+  // CHANGED: Reduced slightly for less regularization
+  "weight_decay": 5e-6,                      // float ≥ 0
   
   // Optimizer: choose "adamw", "adam", or "sgd".
   "optimizer": "adamw",
@@ -181,7 +202,8 @@
   "gradient_clip_val": 1.0,                  // float ≥ 0
   
   // Gradient accumulation steps for large effective batch.
-  "gradient_accumulation_steps": 1,          // int ≥ 1
+  // CHANGED: Set to 2 for effective batch size of 512
+  "gradient_accumulation_steps": 2,          // int ≥ 1
 
   // ─── Learning Rate Scheduler ─────────────────────────────────
   // "reduce_on_plateau": Reduce LR when validation loss plateaus
@@ -189,18 +211,21 @@
   "scheduler_type": "cosine",
 
   // Parameters for ReduceLROnPlateau (if selected)
-  "lr_patience": 3,                          // epochs without improvement
+  "lr_patience": 10,                         // epochs without improvement
   "lr_factor": 0.5,                          // new_lr = old_lr * factor
 
   // Parameters for CosineAnnealingLR (if selected)
-  "warmup_epochs": 5,                        // linear warmup before cosine
+  // CHANGED: Increased warmup for stability with larger model
+  "warmup_epochs": 10,                       // linear warmup before cosine
 
   // Minimum learning rate for any scheduler.
   "min_lr": 1e-8,
 
   // ─── Early Stopping ──────────────────────────────────────────
-  "early_stopping_patience": 20,             // epochs without improvement
-  "min_delta": 1e-8,                         // minimum improvement threshold
+  // CHANGED: Increased patience for better convergence
+  "early_stopping_patience": 30,             // epochs without improvement
+  // CHANGED: More sensitive to improvements
+  "min_delta": 1e-6,                         // minimum improvement threshold
 
   // ─── Mixed Precision & Data Fraction ─────────────────────────
   "use_amp": true,                           // Automatic Mixed Precision (faster on modern GPUs)
@@ -228,30 +253,48 @@
 // ║                 8.  HYPERPARAMETER SEARCH SPACE              ║
 // ════════════════════════════════════════════════════════════════
 // Bounds for Optuna hyperparameter optimization.
+// CHANGED: Updated ranges based on improved model architecture
 "hyperparameter_search": {
   // Categorical choices for transformer architecture
-  "d_model": [128, 256, 512],                // Model dimensions to try
-  "nhead_divisors": [4, 8, 16],              // nhead must divide d_model
-  "num_encoder_layers": [3, 8],              // Range of layer counts
-  "dim_feedforward": [512, 1024, 2048],      // FFN dimensions to try
+  // CHANGED: Larger model dimensions for better capacity
+  "d_model": [256, 384, 512, 768],           // Model dimensions to try
+  "nhead_divisors": [4, 6, 8, 12, 16],       // nhead must divide d_model
+  // CHANGED: Wider range of depths
+  "num_encoder_layers": [4, 10],             // Range of layer counts
+  // CHANGED: Removed fixed values, will use 4×d_model
+  "dim_feedforward": null,                   // Will be set to 4×d_model
 
   // Continuous ranges (Optuna will sample from these)
   "dropout": {
     "low": 0.0,
-    "high": 0.1
+    "high": 0.2                              // CHANGED: Increased upper bound
+  },
+  // NEW: Separate attention dropout search
+  "attention_dropout": {
+    "low": 0.0,
+    "high": 0.2
   },
   "learning_rate": {
-    "low": 1e-4,
+    "low": 5e-5,                             // CHANGED: Wider range
     "high": 5e-4,
     "log": true                              // Sample in log space
   },
   "weight_decay": {
-    "low": 1e-6,
+    "low": 1e-7,                             // CHANGED: Lower minimum
     "high": 1e-4,
     "log": true                              // Sample in log space
   },
+  // NEW: FiLM clamping search
+  "film_clamp": {
+    "low": 1.0,
+    "high": 5.0
+  },
 
   // Batch sizes to try
-  "batch_size": [128, 256, 512]
+  // CHANGED: Added more options
+  "batch_size": [64, 128, 256, 384, 512],
+  
+  // NEW: Gradient accumulation search
+  "gradient_accumulation_steps": [1, 2, 4]
 }
 }

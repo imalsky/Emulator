@@ -218,9 +218,16 @@ class AtmosphericDataset(Dataset):
         
         # Early exit if nothing to load
         if n_samples == 0:
-            self.ram_sequences = np.array([])
-            self.ram_targets = np.array([])
-            self.ram_globals = np.array([]) if self.has_globals else None
+            self.ram_sequences = np.zeros(
+                (0, self.sequence_length, len(self.input_variables)), dtype=self._seq_dtype
+            )
+            self.ram_targets = np.zeros(
+                (0, self.sequence_length, len(self.target_variables)), dtype=self._tgt_dtype
+            )
+            self.ram_globals = (
+                np.zeros((0, len(self.global_variables)), dtype=self._glb_dtype)
+                if self.has_globals else None
+            )
             self.ram_index_map = {}
             return
         

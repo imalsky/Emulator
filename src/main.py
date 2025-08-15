@@ -271,72 +271,74 @@ def run_training_with_profiler(
     original_epochs = config["training_hyperparameters"]["epochs"]
     config["training_hyperparameters"]["epochs"] = profile_config["epochs"]
     
-    logger.info("Starting training with PyTorch profiler...")
-    logger.info(f"Profiling {profile_config['epochs']} epoch(s)")
-    logger.info(
-        f"Profile schedule: wait={profile_config['wait']}, "
-        f"warmup={profile_config['warmup']}, active={profile_config['active']}"
-    )
-    
-    # Create profiler schedule
-    prof_schedule = schedule(
-        wait=profile_config["wait"],
-        warmup=profile_config["warmup"],
-        active=profile_config["active"],
-        repeat=1
-    )
-    
-    # Profile trace directory
-    trace_dir = model_save_dir / "profiler_traces"
-    ensure_dirs(trace_dir)
-    
-    # Run training with profiler
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        schedule=prof_schedule,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_dir)),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-        with_modules=True
-    ) as prof:
-        
-        collate_fn = create_collate_fn(padding_val)
-        
-        # Pass profiler to trainer cleanly (no monkey-patching)
-        trainer = ModelTrainer(
-            config=config,
-            device=device,
-            save_dir=model_save_dir,
-            processed_dir=processed_dir,
-            splits=splits,
-            collate_fn=collate_fn,
-            profiler=prof,  # Pass profiler here
+    try:
+        logger.info("Starting training with PyTorch profiler...")
+        logger.info(f"Profiling {profile_config['epochs']} epoch(s)")
+        logger.info(
+            f"Profile schedule: wait={profile_config['wait']}, "
+            f"warmup={profile_config['warmup']}, active={profile_config['active']}"
         )
         
-        trainer.train()
-    
-    # Export profiler results
-    chrome_trace_path = trace_dir / "chrome_trace.json"
-    prof.export_chrome_trace(str(chrome_trace_path))
-    logger.info(f"Chrome trace saved to: {chrome_trace_path}")
-    
-    # Print profiler summary
-    logger.info("\n=== Profiler Summary ===")
-    logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-    
-    # Export detailed stats
-    stats_path = trace_dir / "profiler_stats.txt"
-    with open(stats_path, "w") as f:
-        f.write(prof.key_averages().table(sort_by="cuda_time_total"))
-    logger.info(f"Detailed stats saved to: {stats_path}")
-    
-    # Restore original epochs
-    config["training_hyperparameters"]["epochs"] = original_epochs
-    
-    logger.info("\nProfiling complete! View results with:")
-    logger.info(f"  tensorboard --logdir={trace_dir}")
-    logger.info(f"  chrome://tracing (load {chrome_trace_path})")
+        # Create profiler schedule
+        prof_schedule = schedule(
+            wait=profile_config["wait"],
+            warmup=profile_config["warmup"],
+            active=profile_config["active"],
+            repeat=1
+        )
+        
+        # Profile trace directory
+        trace_dir = model_save_dir / "profiler_traces"
+        ensure_dirs(trace_dir)
+        
+        # Run training with profiler
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=prof_schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_dir)),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_modules=True
+        ) as prof:
+            
+            collate_fn = create_collate_fn(padding_val)
+            
+            # Pass profiler to trainer
+            trainer = ModelTrainer(
+                config=config,
+                device=device,
+                save_dir=model_save_dir,
+                processed_dir=processed_dir,
+                splits=splits,
+                collate_fn=collate_fn,
+                profiler=prof,
+            )
+            
+            trainer.train()
+        
+        # Export profiler results - only executed if no exceptions
+        chrome_trace_path = trace_dir / "chrome_trace.json"
+        prof.export_chrome_trace(str(chrome_trace_path))
+        logger.info(f"Chrome trace saved to: {chrome_trace_path}")
+        
+        # Print profiler summary
+        logger.info("\n=== Profiler Summary ===")
+        logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+        
+        # Export detailed stats
+        stats_path = trace_dir / "profiler_stats.txt"
+        with open(stats_path, "w") as f:
+            f.write(prof.key_averages().table(sort_by="cuda_time_total"))
+        logger.info(f"Detailed stats saved to: {stats_path}")
+        
+        logger.info("\nProfiling complete! View results with:")
+        logger.info(f"  tensorboard --logdir={trace_dir}")
+        logger.info(f"  chrome://tracing (load {chrome_trace_path})")
+        
+    finally:
+        # Restore original epochs - guaranteed to execute
+        config["training_hyperparameters"]["epochs"] = original_epochs
 
 
 def run_train(
