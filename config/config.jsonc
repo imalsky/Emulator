@@ -164,8 +164,8 @@
   
   // NEW: FiLM layer clamping value
   // Controls how much global features can modulate the model
-  "film_clamp": 999.0,                         // float > 0 or null for no clamping
-  
+  "film_clamp": 50.0,                         // float > 0 or null for no clamping
+
   // Maximum sequence length your data can reach.
   // Sequences longer than this will be truncated.
   // Sequences shorter than this will be right-padded.
@@ -178,26 +178,26 @@
 "training_hyperparameters": {
   // Maximum number of training epochs.
   // CHANGED: Increased to 300 for better convergence
-  "epochs": 300,                             // int ≥ 1
-  
+  "epochs": 50,                             // int ≥ 1
+
   // Mini-batch size per GPU.
   // CHANGED: Reduced from 512 to 256 for stability with larger model
   "batch_size": 256,                         // int ≥ 1
-  
+
   // Initial learning rate.
   // CHANGED: Increased to 2e-4 for faster initial learning
   "learning_rate": 2e-4,                     // float > 0
-  
+
   // L2 weight decay (regularization).
   // CHANGED: Reduced slightly for less regularization
-  "weight_decay": 1e-6,                      // float ≥ 0
-  
+  "weight_decay": 1e-5,                      // float ≥ 0
+
   // Optimizer: choose "adamw", "adam", or "sgd".
   "optimizer": "adamw",
-  
+
   // Gradient clipping value (0 disables).
-  "gradient_clip_val": 1.0,                  // float ≥ 0
-  
+  "gradient_clip_val": 2.0,                  // float ≥ 0
+
   // Gradient accumulation steps for large effective batch.
   // CHANGED: Set to 2 for effective batch size of 512
   "gradient_accumulation_steps": 1,          // int ≥ 1
@@ -205,12 +205,12 @@
   // ─── Learning Rate Scheduler ─────────────────────────────────
   // "reduce_on_plateau": Reduce LR when validation loss plateaus
   // "cosine": Cosine annealing with optional warmup
-  //"scheduler_type": "cosine",
+  "scheduler_type": "cosine",
 
-  "scheduler_type": "reduce_on_plateau",
-  "lr_patience": 10,              // epochs with no improvement before LR is reduced
-  "lr_factor": 0.5,               // multiply LR by this factor on plateau
-  "min_lr": 1e-8,                 // already present; keep here
+  //"scheduler_type": "reduce_on_plateau",
+  //"lr_patience": 10,              // epochs with no improvement before LR is reduced
+  //"lr_factor": 0.5,               // multiply LR by this factor on plateau
+  //"min_lr": 1e-8,                 // already present; keep here
 
 
 
@@ -226,7 +226,7 @@
 
   // ─── Mixed Precision & Data Fraction ─────────────────────────
   "use_amp": true,                           // Automatic Mixed Precision (faster on modern GPUs)
-  
+
   // Fraction of dataset to use (for quick experiments).
   "dataset_fraction_to_use": 1.0,            // 0-1 float
 
@@ -251,24 +251,14 @@
 // ════════════════════════════════════════════════════════════════
 // Comment out any parameter you don't want to explore
 // The search will use the default value from model/training_hyperparameters
-"hyperparameter_search": {
-  // ========== MODEL ARCHITECTURE ==========
-  
-  // Model dimension (embedding size)
-  // Expanded range to include smaller and larger models
-  "d_model": [128, 256, 512, 640, 768, 896, 1024],
-  
-  // Number of attention heads
-  // Must divide d_model evenly - expanded options
-  "nhead_divisors": [2, 4, 6, 8, 10, 12],
-  
-  // Number of transformer layers (depth)
-  // Expanded range for both shallow and deep models
-  "num_encoder_layers": [2, 8],  // [min, max] range
-  
-  // Feed-forward network dimension
-  // Now including this as it's important for capacity
-  // Common ratios: 2x, 3x, 4x, 5x, 6x of d_model
-  "dim_feedforward": [512, 768, 1024, 1536, 2048, 3072, 4096]
-}
+    "hyperparameter_search": {
+
+        "d_model": [128, 256, 384, 512, 768, 1024],
+        "nhead_divisors": [4, 8, 16],
+        "num_encoder_layers": [2, 4, 6, 8],
+        "dim_feedforward": [512, 1024, 2048, 4096],
+        "dropout": {"low": 0.05, "high": 0.2},
+        "attention_dropout": {"low": 0.0, "high": 0.2},
+        "batch_size": [128, 256, 512]
+    }
 }
