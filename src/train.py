@@ -8,7 +8,7 @@ Features:
 - Gradient accumulation for large effective batch sizes
 - Early stopping with patience
 - Learning rate scheduling
-- Hardware-specific optimizations (A100 detection)
+- Hardware-specific optimizations
 - Proper loss masking for padded sequences
 
 PADDING CONVENTION:
@@ -193,12 +193,11 @@ class ModelTrainer:
             "max_batch_failure_rate", DEFAULT_MAX_BATCH_FAILURE_RATE
         )
         
-        # Apply A100-specific optimizations
-        if self.device.type == "cuda" and "A100" in torch.cuda.get_device_name(0):
-            logger.info("Detected A100 GPU - applying performance optimizations")
+        if self.device.type == "cuda":
+            logger.info("Applying GPU performance optimizations")
             
             if not train_params.get("use_amp", False):
-                logger.info("Enabling AMP for A100")
+                logger.info("Enabling AMP")
                 train_params["use_amp"] = True
             
             current_batch_size = train_params.get("batch_size", DEFAULT_BATCH_SIZE)
@@ -450,14 +449,6 @@ class ModelTrainer:
         
         if self.use_amp:
             logger.info("AMP (Automatic Mixed Precision) enabled.")
-        
-        # Log effective batch size
-        eff_bs = tp.get("batch_size", DEFAULT_BATCH_SIZE) * self.accumulation_steps
-        logger.info(
-            f"Effective batch size: {eff_bs} "
-            f"(batch_size={tp.get('batch_size', DEFAULT_BATCH_SIZE)} × "
-            f"accumulation={self.accumulation_steps})"
-        )
     
     def _setup_logging(self) -> None:
         """Setup training log file."""
@@ -586,18 +577,29 @@ class ModelTrainer:
         # Load best model checkpoint
         checkpoint_path = self.save_dir / "best_model.pt"
         if checkpoint_path.exists():
-            state = torch.load(checkpoint_path, map_location=self.device)
+            state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             state_dict = state["state_dict"]
             
             # Handle compiled model state dict
-            if any(k.startswith("_orig_mod.") for k in state_dict):
-                state_dict = {
-                    k.replace("_orig_mod.", ""): v
-                    for k, v in state_dict.items()
-                }
-            
+            if hasattr(self.model, '_orig_mod'):
+                # Current model is compiled, but saved state might not be
+                if not any(k.startswith("_orig_mod.") for k in state_dict):
+                    # Add _orig_mod. prefix to match compiled model
+                    state_dict = {
+                        f"_orig_mod.{k}": v
+                        for k, v in state_dict.items()
+                    }
+            else:
+                # Current model is not compiled, but saved state might be
+                if any(k.startswith("_orig_mod.") for k in state_dict):
+                    # Remove _orig_mod. prefix
+                    state_dict = {
+                        k.replace("_orig_mod.", ""): v
+                        for k, v in state_dict.items()
+                    }
+
             self.model.load_state_dict(state_dict, strict=True)
-            logger.info(f"Loaded best model from epoch {state['epoch']}")
+            #logger.info(f"Loaded best model from epoch {state['epoch']}")
         
         # Run test evaluation
         test_loss = self._run_epoch(self.test_loader, is_train=False)
@@ -791,7 +793,7 @@ class ModelTrainer:
         # Save checkpoint
         checkpoint_path = self.save_dir / "best_model.pt"
         torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Saved best model (epoch {self.best_epoch}).")
+        #logger.info(f"Saved best model (epoch {self.best_epoch}).")
         
         # Export model for deployment
         self._export_model()
@@ -806,10 +808,7 @@ class ModelTrainer:
                 return
             
             # Create fresh un-compiled model for export
-            logger.info("Creating a fresh, un-compiled model instance for export.")
-            model_for_export = create_prediction_model(
-                self.cfg, device=self.device, compile_model=False
-            )
+            model_for_export = create_prediction_model(self.cfg, device=self.device, compile_model=False)
             
             # Load trained weights
             if hasattr(self.model, '_orig_mod'):
@@ -823,7 +822,7 @@ class ModelTrainer:
             inputs, masks, _, _ = sample
             example = {
                 "sequence": inputs["sequence"][:1],
-                "sequence_mask": masks["sequence"][:1],  # True = padding
+                "sequence_mask": masks["sequence"][:1],
             }
             if "global_features" in inputs:
                 example["global_features"] = inputs["global_features"][:1]
@@ -834,6 +833,16 @@ class ModelTrainer:
             
         except Exception as e:
             logger.error(f"Model export failed: {e}", exc_info=True)
+        finally:
+            # CRITICAL: Clean up the temporary model
+            if 'model_for_export' in locals():
+                del model_for_export
+            
+            # Force garbage collection and clear GPU cache
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 __all__ = ["ModelTrainer", "DevicePrefetchLoader"]

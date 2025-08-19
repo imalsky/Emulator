@@ -1,315 +1,234 @@
 #!/usr/bin/env python3
-"""Benchmark model inference speed across batch sizes on CPU."""
+"""Test model predictions with denormalization and log scale."""
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-import json
-import time
 import sys
+sys.path.append("../src")
+
 from pathlib import Path
-from typing import Dict, Tuple, Optional
-
-import numpy as np
 import torch
+import numpy as np
 import matplotlib.pyplot as plt
+import json
 
-# Configuration
-MODEL_NAME = "trained_model"
-BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
-N_WARMUP = 10
-N_RUNS = 50
-DEVICE = torch.device("cpu")
-
-# Setup paths
-ROOT = Path(__file__).parent.parent
-sys.path.extend([str(ROOT), str(ROOT / "src")])
-
+from dataset import create_dataset, create_collate_fn
 from model import create_prediction_model
-from utils import load_config
+from normalizer import DataNormalizer
+from utils import load_config, PADDING_VALUE
 
+plt.style.use('science.mplstyle')
 
-def load_model(model_dir: Path) -> Tuple[torch.nn.Module, float, str, Dict]:
-    """
-    Load model from checkpoint or exported format.
-    
-    Returns:
-        Tuple of (model, size_mb, model_type, config)
-    """
-    # Load configuration
-    config_path = next(model_dir.glob("*_config.json"), model_dir / "config.json")
-    if not config_path.exists():
-        raise FileNotFoundError(f"No config found in {model_dir}")
-    config = load_config(config_path)
-    
-    # Try loading exported model first
-    exported_paths = sorted(model_dir.glob("*_exported*.pt2"))
-    if exported_paths:
-        # Prefer static export if available
-        static = [p for p in exported_paths if "static" in p.name]
-        export_path = static[0] if static else exported_paths[0]
-        
-        try:
-            print(f"Loading exported model: {export_path.name}")
-            exported_prog = torch.export.load(str(export_path))
-            model = exported_prog.module()
-            model.eval()
-            size_mb = export_path.stat().st_size / (1024 * 1024)
-            return model, size_mb, f"exported", config
-        except Exception as e:
-            print(f"Failed to load export ({e}), falling back to checkpoint")
-    
-    # Load from checkpoint
-    checkpoint_path = model_dir / "best_model.pt"
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"No checkpoint found: {checkpoint_path}")
-    
-    print(f"Loading checkpoint: {checkpoint_path.name}")
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-    
-    # Create model
-    model = create_prediction_model(config, device=DEVICE, compile_model=False)
-    
-    # Load weights
-    state_dict = checkpoint.get("state_dict", checkpoint)
-    # Remove compilation wrapper if present
-    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    
-    size_mb = checkpoint_path.stat().st_size / (1024 * 1024)
-    return model, size_mb, "checkpoint", config
+MODEL_DIR = Path("../models/trained_model_v1")
+PROCESSED_DIR = Path("../data/processed/test")
+N_SAMPLES = 1
 
+def load_normalization_metadata():
+    """Load normalization metadata for denormalization."""
+    metadata_path = Path("../data/processed/normalization_metadata.json")
+    with open(metadata_path, 'r') as f:
+        return json.load(f)
 
-def get_model_dimensions(config: Dict) -> Tuple[int, int, int]:
-    """
-    Extract model dimensions from config.
+def denormalize_variable(data, var_name, norm_metadata):
+    """Denormalize a single variable."""
+    data_tensor = torch.from_numpy(data).float()
+    method = norm_metadata["normalization_methods"].get(var_name, "none")
+    stats = norm_metadata["per_key_stats"].get(var_name, {})
     
-    Returns:
-        Tuple of (sequence_length, input_dim, global_dim)
-    """
-    data_spec = config.get("data_specification", {})
-    model_params = config.get("model_hyperparameters", {})
-    
-    # Get dimensions
-    input_vars = data_spec.get("input_variables", [])
-    global_vars = data_spec.get("global_variables", [])
-    seq_length = model_params.get("max_sequence_length", 64)
-    
-    return seq_length, len(input_vars), len(global_vars)
+    if method != "none" and stats:
+        return DataNormalizer.denormalize_tensor(data_tensor, method, stats).numpy()
+    return data
 
-
-def create_batch(batch_size: int, seq_len: int, input_dim: int, global_dim: int) -> Dict[str, torch.Tensor]:
-    """Create dummy batch for benchmarking."""
-    # All tensors on CPU, float32
-    batch = {
-        "sequence": torch.randn(batch_size, seq_len, input_dim, dtype=torch.float32, device=DEVICE)
-    }
-    
-    if global_dim > 0:
-        batch["global_features"] = torch.randn(batch_size, global_dim, dtype=torch.float32, device=DEVICE)
-    
-    # Add padding mask (no padding for benchmark)
-    batch["sequence_mask"] = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=DEVICE)
-    
-    return batch
-
-
-def benchmark_model(
-    model: torch.nn.Module,
-    seq_len: int,
-    input_dim: int, 
-    global_dim: int,
-    batch_sizes: list = BATCH_SIZES
-) -> Dict[str, list]:
-    """
-    Benchmark model inference across batch sizes.
-    
-    Returns:
-        Dictionary with batch_size, latency_ms, throughput, and latency_per_sample
-    """
-    results = {
-        "batch_size": [],
-        "latency_ms": [],
-        "latency_std": [],
-        "throughput": [],
-        "latency_per_sample": []
-    }
-    
-    print(f"\nBenchmarking with {N_WARMUP} warmup and {N_RUNS} timed runs per batch size")
-    print("-" * 60)
-    
-    # Force CPU and ensure no gradients
-    model = model.to(DEVICE)
-    model.eval()
-    torch.set_grad_enabled(False)
-    
-    for bs in batch_sizes:
-        batch = create_batch(bs, seq_len, input_dim, global_dim)
-        
-        # Warmup runs
-        for _ in range(N_WARMUP):
-            with torch.no_grad():
-                _ = model(**batch)
-        
-        # Clear any caches
-        if hasattr(torch, '_C') and hasattr(torch._C, '_jit_clear_class_registry'):
-            torch._C._jit_clear_class_registry()
-        
-        # Timed runs
-        times_ms = []
-        for _ in range(N_RUNS):
-            # Force CPU sync (though not needed for CPU)
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            
-            start = time.perf_counter()
-            with torch.no_grad():
-                _ = model(**batch)
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            times_ms.append(elapsed_ms)
-        
-        # Calculate statistics
-        mean_ms = np.mean(times_ms)
-        std_ms = np.std(times_ms)
-        throughput = bs / (mean_ms / 1000)  # samples per second
-        latency_per_sample = mean_ms / bs
-        
-        # Store results
-        results["batch_size"].append(bs)
-        results["latency_ms"].append(float(mean_ms))
-        results["latency_std"].append(float(std_ms))
-        results["throughput"].append(float(throughput))
-        results["latency_per_sample"].append(float(latency_per_sample))
-        
-        print(f"BS={bs:3d}: {mean_ms:7.2f} ± {std_ms:5.2f} ms | "
-              f"{throughput:8.1f} samples/s | "
-              f"{latency_per_sample:6.2f} ms/sample")
-    
-    torch.set_grad_enabled(True)  # Re-enable gradients
-    return results
-
-
-def plot_results(results: Dict, model_info: Dict, save_dir: Path) -> None:
-    """Create benchmark visualization plots."""
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
-    bs = results["batch_size"]
-    
-    # 1. Latency with error bars
-    axes[0, 0].errorbar(bs, results["latency_ms"], yerr=results["latency_std"], 
-                        marker='o', capsize=3, capthick=1)
-    axes[0, 0].set_xlabel("Batch Size")
-    axes[0, 0].set_ylabel("Latency (ms)")
-    axes[0, 0].set_title("Inference Latency")
-    axes[0, 0].set_xscale("log", base=2)
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # 2. Throughput
-    axes[0, 1].plot(bs, results["throughput"], "o-", color="green")
-    axes[0, 1].set_xlabel("Batch Size")
-    axes[0, 1].set_ylabel("Throughput (samples/s)")
-    axes[0, 1].set_title("Inference Throughput")
-    axes[0, 1].set_xscale("log", base=2)
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    # 3. Latency per sample
-    axes[1, 0].plot(bs, results["latency_per_sample"], "o-", color="orange")
-    axes[1, 0].set_xlabel("Batch Size")
-    axes[1, 0].set_ylabel("Latency per Sample (ms)")
-    axes[1, 0].set_title("Amortized Latency")
-    axes[1, 0].set_xscale("log", base=2)
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # 4. Efficiency (samples per second per batch size)
-    efficiency = [t/b for t, b in zip(results["throughput"], bs)]
-    axes[1, 1].plot(bs, efficiency, "o-", color="purple")
-    axes[1, 1].set_xlabel("Batch Size")
-    axes[1, 1].set_ylabel("Efficiency (throughput/batch_size)")
-    axes[1, 1].set_title("Batching Efficiency")
-    axes[1, 1].set_xscale("log", base=2)
-    axes[1, 1].grid(True, alpha=0.3)
-    
-    # Add overall title
-    model_type = model_info["type"]
-    size_mb = model_info["size_mb"]
-    plt.suptitle(f"CPU Inference Benchmark | {model_type} ({size_mb:.1f} MB)", fontsize=14)
-    
-    plt.tight_layout()
-    output_path = save_dir / "inference_benchmark.png"
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    print(f"\n✓ Saved benchmark plot: {output_path}")
-    plt.close()
-
-
-def save_results(results: Dict, model_info: Dict, save_dir: Path) -> None:
-    """Save benchmark results to JSON."""
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Add metadata to results
-    full_results = {
-        "model": model_info,
-        "benchmark_config": {
-            "warmup_runs": N_WARMUP,
-            "timed_runs": N_RUNS,
-            "device": str(DEVICE),
-        },
-        "results": results,
-        "summary": {
-            "best_throughput": max(results["throughput"]),
-            "best_throughput_batch": results["batch_size"][np.argmax(results["throughput"])],
-            "min_latency": min(results["latency_ms"]),
-            "min_latency_batch": results["batch_size"][np.argmin(results["latency_ms"])],
-        }
-    }
-    
-    output_path = save_dir / "benchmark_results.json"
-    with open(output_path, "w") as f:
-        json.dump(full_results, f, indent=2)
-    print(f"✓ Saved results: {output_path}")
-
-
-def main():
-    """Main benchmark pipeline."""
-    print("=" * 60)
-    print("CPU Inference Benchmark")
-    print("=" * 60)
-    
-    # Setup paths
-    model_dir = ROOT / "models" / MODEL_NAME
-    if not model_dir.exists():
-        raise FileNotFoundError(f"Model directory not found: {model_dir}")
-    
-    output_dir = model_dir / "benchmark"
+def load_model_and_data():
+    """Load model and test data."""
+    config = load_config(MODEL_DIR / "train_config.json")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Load model
-    print(f"\nLoading model: {MODEL_NAME}")
-    model, size_mb, model_type, config = load_model(model_dir)
-    seq_len, input_dim, global_dim = get_model_dimensions(config)
+    model = create_prediction_model(config, device, compile_model=False)
+    checkpoint = torch.load(MODEL_DIR / "best_model.pt", map_location=device, weights_only=False)
+    state_dict = checkpoint["state_dict"]
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+    model.eval()
     
-    model_info = {
-        "name": MODEL_NAME,
-        "type": model_type,
-        "size_mb": size_mb,
-        "seq_length": seq_len,
-        "input_dim": input_dim,
-        "global_dim": global_dim,
-    }
+    # Load test data
+    test_dataset = create_dataset(PROCESSED_DIR, config, list(range(N_SAMPLES)))
+    collate_fn = create_collate_fn(PADDING_VALUE)
     
-    print(f"Model type: {model_type} ({size_mb:.1f} MB)")
-    print(f"Dimensions: seq={seq_len}, input={input_dim}, global={global_dim}")
-    
-    # Run benchmark
-    results = benchmark_model(model, seq_len, input_dim, global_dim, BATCH_SIZES)
-    
-    # Save and plot results
-    save_results(results, model_info, output_dir)
-    plot_results(results, model_info, output_dir)
-    
-    print("\n" + "=" * 60)
-    print("Benchmark complete!")
-    print("=" * 60)
+    return model, test_dataset, collate_fn, config, device
 
+def test_predictions():
+    """Test model on samples and visualize."""
+    model, dataset, collate_fn, config, device = load_model_and_data()
+    norm_metadata = load_normalization_metadata()
+    
+    target_vars = config["data_specification"]["target_variables"]
+    
+    # Find indices for thermal and reflected fluxes
+    thermal_idx = target_vars.index("net_thermal_flux") if "net_thermal_flux" in target_vars else None
+    reflected_idx = target_vars.index("net_reflected_flux") if "net_reflected_flux" in target_vars else None
+    
+    if thermal_idx is None or reflected_idx is None:
+        print("Error: thermal_flux or reflected_flux not found in target variables")
+        print(f"Available targets: {target_vars}")
+        return
+    
+    # Create figure with subplots for thermal and reflected fluxes
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Process each sample
+    for i in range(min(N_SAMPLES, len(dataset))):
+        inputs, targets = dataset[i]
+        
+        # Create batch
+        batch_inputs, batch_masks, batch_targets, target_masks = collate_fn([(inputs, targets)])
+        
+        # Move to device
+        for k in batch_inputs:
+            batch_inputs[k] = batch_inputs[k].to(device)
+        batch_masks["sequence"] = batch_masks["sequence"].to(device)
+        
+        # Predict
+        with torch.no_grad():
+            preds = model(
+                sequence=batch_inputs["sequence"],
+                global_features=batch_inputs.get("global_features"),
+                sequence_mask=batch_masks["sequence"]
+            )
+        
+        # Get predictions and targets
+        preds_np = preds.cpu().numpy()[0]
+        targets_np = batch_targets.numpy()[0]
+        mask_np = target_masks.numpy()[0]
+        
+        # Get valid positions (remove padding)
+        valid_mask = ~mask_np
+        valid_idx = np.where(valid_mask)[0]
+        
+        if len(valid_idx) == 0:
+            continue
+        
+        # Denormalize thermal flux
+        thermal_pred = denormalize_variable(
+            preds_np[valid_idx, thermal_idx], 
+            "net_thermal_flux", 
+            norm_metadata
+        )
+        thermal_target = denormalize_variable(
+            targets_np[valid_idx, thermal_idx], 
+            "net_thermal_flux", 
+            norm_metadata
+        )
+        
+        # Denormalize reflected flux
+        reflected_pred = denormalize_variable(
+            preds_np[valid_idx, reflected_idx], 
+            "net_reflected_flux", 
+            norm_metadata
+        )
+        reflected_target = denormalize_variable(
+            targets_np[valid_idx, reflected_idx], 
+            "net_reflected_flux", 
+            norm_metadata
+        )
+        
+        # Plot thermal flux with symlog scale
+        axes[0].plot(valid_idx, thermal_target, color='red',
+                    label=f"Target (Sample {i+1})", alpha=0.7, linewidth=2)
+        axes[0].plot(valid_idx, thermal_pred, '--', color='black',
+                    label=f"Prediction (Sample {i+1})", alpha=0.7, linewidth=2)
+        
+        # Plot reflected flux with symlog scale
+        axes[1].plot(valid_idx, reflected_target, color='red',
+                    label=f"Target (Sample {i+1})", alpha=0.7, linewidth=2)
+        axes[1].plot(valid_idx, reflected_pred, '--', color='black',
+                    label=f"Prediction (Sample {i+1})", alpha=0.7, linewidth=2)
+    
+    # Format thermal flux subplot with symlog scale
+    axes[0].set_yscale('symlog')
+    #axes[0].set_ylim(-1e10, 1e10)
+    axes[0].set_xlabel("Sequence Position")
+    axes[0].set_ylabel("Net Thermal Flux (Ergs/cm²)")
+    axes[0].set_title("Net Thermal Flux - Denormalized (Symlog Scale)")
+    axes[0].legend(loc="best", fontsize=8)
+    
+    # Format reflected flux subplot with symlog scale
+    axes[1].set_yscale('symlog')
+    #axes[1].set_ylim(-1e10, 1e10)
+    axes[1].set_xlabel("Sequence Position")
+    axes[1].set_ylabel("Net Reflected Flux (Ergs/cm²)")
+    axes[1].set_title("Net Reflected Flux - Denormalized (Symlog Scale)")
+    axes[1].legend(loc="best", fontsize=8)
+    
+    plt.tight_layout()
+    
+    # Save plot
+    save_path = MODEL_DIR / "plots" / "flux_predictions_denorm_log.png"
+    save_path.parent.mkdir(exist_ok=True)
+    plt.savefig(save_path, dpi=150)
+    print(f"Saved: {save_path}")
+    
+    # Calculate metrics for fluxes
+    print("\n" + "="*50)
+    print("DENORMALIZED METRICS (Physical Units)")
+    print("="*50)
+    
+    for flux_name in ["net_thermal_flux", "net_reflected_flux"]:
+        print(f"\n{flux_name}:")
+        
+        # Collect all predictions and targets for this flux
+        all_preds = []
+        all_targets = []
+        
+        flux_idx = target_vars.index(flux_name)
+        
+        for i in range(min(N_SAMPLES, len(dataset))):
+            inputs, targets = dataset[i]
+            batch_inputs, batch_masks, batch_targets, target_masks = collate_fn([(inputs, targets)])
+            
+            for k in batch_inputs:
+                batch_inputs[k] = batch_inputs[k].to(device)
+            batch_masks["sequence"] = batch_masks["sequence"].to(device)
+            
+            with torch.no_grad():
+                preds = model(
+                    sequence=batch_inputs["sequence"],
+                    global_features=batch_inputs.get("global_features"),
+                    sequence_mask=batch_masks["sequence"]
+                )
+            
+            preds_np = preds.cpu().numpy()[0]
+            targets_np = batch_targets.numpy()[0]
+            mask_np = target_masks.numpy()[0]
+            valid_mask = ~mask_np
+            
+            if np.any(valid_mask):
+                flux_pred = denormalize_variable(
+                    preds_np[valid_mask, flux_idx], 
+                    flux_name, 
+                    norm_metadata
+                )
+                flux_target = denormalize_variable(
+                    targets_np[valid_mask, flux_idx], 
+                    flux_name, 
+                    norm_metadata
+                )
+                all_preds.append(flux_pred)
+                all_targets.append(flux_target)
+        
+        if all_preds:
+            all_preds = np.concatenate(all_preds)
+            all_targets = np.concatenate(all_targets)
+            
+            mse = np.mean((all_preds - all_targets)**2)
+            rmse = np.sqrt(mse)
+            mae = np.mean(np.abs(all_preds - all_targets))
+            
+            print(f"  RMSE: {rmse:.3e} Ergs/cm²")
+            print(f"  MAE:  {mae:.3e} Ergs/cm²")
+            print(f"  Target Range: [{np.min(all_targets):.3e}, {np.max(all_targets):.3e}] Ergs/cm²")
+            print(f"  Pred Range:   [{np.min(all_preds):.3e}, {np.max(all_preds):.3e}] Ergs/cm²")
 
 if __name__ == "__main__":
-    main()
+    test_predictions()

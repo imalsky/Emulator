@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-hyperparam_search.py - Optuna hyperparameter optimization with aggressive pruning.
+hyperparam_search.py - Flexible Optuna hyperparameter optimization.
 
-This module orchestrates hyperparameter optimization using Optuna with:
-- Efficient data reuse (preprocessed data loaded once)
-- Aggressive early stopping for bad trials
-- Reduced configurations for faster exploration
+Features:
+- Supports optional parameters (comment out in config to use defaults)
+- Aggressive pruning for efficiency
+- Automatic handling of d_model/nhead compatibility
 """
 from __future__ import annotations
 
 import logging
 from argparse import Namespace
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import optuna
 from optuna.pruners import MedianPruner
@@ -21,19 +21,13 @@ import torch
 
 from dataset import create_collate_fn
 from train import ModelTrainer
-from utils import ensure_dirs, save_json, setup_logging
+from utils import ensure_dirs, save_json
 
 logger = logging.getLogger(__name__)
 
 
 class AggressivePruner(optuna.pruners.BasePruner):
-    """
-    Custom aggressive pruner combining multiple strategies.
-        
-    Prunes if ANY of the following conditions are met:
-    1. Current loss is worse than median of previous trials at same step
-    2. Loss hasn't improved for patience steps
-    """
+    """Custom aggressive pruner combining multiple strategies."""
     
     def __init__(
         self,
@@ -42,15 +36,6 @@ class AggressivePruner(optuna.pruners.BasePruner):
         patience: int = 2,
         min_improvement: float = 0.001,
     ):
-        """
-        Initialize aggressive pruner.
-        
-        Args:
-            n_startup_trials: Number of trials before pruning starts
-            n_warmup_steps: Number of steps before pruning in each trial
-            patience: Steps without improvement before pruning
-            min_improvement: Minimum improvement to reset patience
-        """
         self._median_pruner = MedianPruner(
             n_startup_trials=n_startup_trials,
             n_warmup_steps=n_warmup_steps,
@@ -59,28 +44,15 @@ class AggressivePruner(optuna.pruners.BasePruner):
         self.min_improvement = min_improvement
     
     def prune(self, study: optuna.Study, trial: optuna.FrozenTrial) -> bool:
-        """
-        Determine if trial should be pruned.
-        
-        Args:
-            study: Optuna study
-            trial: Current trial
-            
-        Returns:
-            True if trial should be pruned
-        """
-        # Check median pruner first (fast)
         if self._median_pruner.prune(study, trial):
             return True
         
-        # Check patience-based pruning
         step = trial.last_step
         if step is None or step < self.patience:
             return False
         
         values = list(trial.intermediate_values.values())
         if len(values) >= self.patience:
-            # Check if no improvement in last patience steps
             recent = values[-self.patience:]
             if min(recent) >= recent[0] - self.min_improvement:
                 return True
@@ -90,21 +62,10 @@ class AggressivePruner(optuna.pruners.BasePruner):
 
 def create_reduced_config(
     config: Dict[str, Any],
-    fraction: float = 0.1,  # Reduced from 0.2
-    max_epochs: int = 20,   # Reduced from 30
+    fraction: float = 0.1,
+    max_epochs: int = 20,
 ) -> Dict[str, Any]:
-    """
-    Create a reduced configuration for faster hyperparameter search.
-    
-    Args:
-        config: Original configuration
-        fraction: Fraction of data to use
-        max_epochs: Maximum epochs for trials
-        
-    Returns:
-        Modified configuration for faster trials
-    """
-    # Only modify what we need - avoid full deepcopy
+    """Create a reduced configuration for faster trials."""
     reduced_config = {
         "data_specification": config["data_specification"],
         "data_paths_config": config["data_paths_config"],
@@ -115,18 +76,75 @@ def create_reduced_config(
         "miscellaneous_settings": dict(config["miscellaneous_settings"]),
     }
     
-    # Reduce dataset size and epochs
     reduced_config["training_hyperparameters"]["dataset_fraction_to_use"] = fraction
     reduced_config["training_hyperparameters"]["epochs"] = max_epochs
-    reduced_config["training_hyperparameters"]["early_stopping_patience"] = 3  # More aggressive
-    reduced_config["training_hyperparameters"]["min_delta"] = 5e-4  # Less sensitive
+    reduced_config["training_hyperparameters"]["early_stopping_patience"] = 3
+    reduced_config["training_hyperparameters"]["min_delta"] = 5e-4
     
-    # Disable expensive features during trials
     reduced_config["miscellaneous_settings"]["torch_export"] = False
     reduced_config["miscellaneous_settings"]["torch_compile"] = False
     reduced_config["miscellaneous_settings"]["detect_anomaly"] = False
     
     return reduced_config
+
+
+def suggest_parameter(
+    trial: optuna.Trial,
+    name: str,
+    search_config: Optional[Union[List, Dict]],
+    default_value: Any,
+) -> Any:
+    """
+    Suggest a parameter value or use default if not in search space.
+    
+    Args:
+        trial: Optuna trial
+        name: Parameter name
+        search_config: Search configuration (None, list, or dict with low/high)
+        default_value: Default value to use if not searching
+        
+    Returns:
+        Suggested or default value
+    """
+    if search_config is None:
+        # Parameter not in search space, use default
+        logger.debug(f"Using default value for {name}: {default_value}")
+        return default_value
+    
+    if isinstance(search_config, list):
+        # Categorical parameter
+        return trial.suggest_categorical(name, search_config)
+    
+    elif isinstance(search_config, dict):
+        # Continuous parameter
+        if "low" in search_config and "high" in search_config:
+            if search_config.get("log", False):
+                return trial.suggest_float(
+                    name,
+                    search_config["low"],
+                    search_config["high"],
+                    log=True
+                )
+            elif "step" in search_config:
+                return trial.suggest_float(
+                    name,
+                    search_config["low"],
+                    search_config["high"],
+                    step=search_config["step"]
+                )
+            else:
+                return trial.suggest_float(
+                    name,
+                    search_config["low"],
+                    search_config["high"]
+                )
+        else:
+            logger.warning(f"Invalid search config for {name}, using default")
+            return default_value
+    
+    else:
+        logger.warning(f"Unknown search config type for {name}, using default")
+        return default_value
 
 
 def run_optuna(
@@ -138,55 +156,52 @@ def run_optuna(
     padding_val: float,
     model_save_dir: Path,
 ) -> None:
-    """
-    Run Optuna hyperparameter search with aggressive pruning.
-    
-    Args:
-        config: Configuration dictionary
-        args: Command line arguments
-        device: Compute device
-        processed_dir: Directory with preprocessed data
-        splits: Data splits
-        padding_val: Padding value
-        model_save_dir: Directory for saving results
-    """
+    """Run Optuna hyperparameter search with flexible parameter selection."""
     ensure_dirs(model_save_dir)
     
     # Get search space from config
     search_space = config.get("hyperparameter_search", {})
     if not search_space:
-        logger.error("'hyperparameter_search' section not found in config.")
+        logger.error(
+            "'hyperparameter_search' section not found in config. "
+            "Add it to define which parameters to optimize."
+        )
         return
     
-    # Pre-compute valid d_model/nhead combinations (faster than computing in trial)
-    valid_combinations = {}
-    for d_model in search_space["d_model"]:
-        valid_combinations[d_model] = [
-            n for n in search_space["nhead_divisors"] if d_model % n == 0
-        ]
+    # Get default values from config
+    default_model = config.get("model_hyperparameters", {})
+    default_train = config.get("training_hyperparameters", {})
     
-    # Create base config once
+    # Pre-compute all possible nhead values if searching both d_model and nhead
+    all_possible_nheads = set()
+    if "d_model" in search_space and "nhead_divisors" in search_space:
+        # For each possible d_model, find valid nhead values
+        for d_model in search_space["d_model"]:
+            for n in search_space["nhead_divisors"]:
+                if d_model % n == 0:
+                    all_possible_nheads.add(n)
+        
+        # Convert to sorted list for consistency
+        all_possible_nheads = sorted(list(all_possible_nheads))
+        
+        if not all_possible_nheads:
+            # If no valid combinations, use common divisors
+            all_possible_nheads = [4, 8, 16]
+        
+        logger.info(f"Using fixed nhead search space: {all_possible_nheads}")
+    
+    # Create base config for trials
     trial_config_base = create_reduced_config(config, fraction=0.1, max_epochs=20)
     
-    logger.info(
-        f"Using reduced config: {trial_config_base['training_hyperparameters']['dataset_fraction_to_use']:.0%} of data, "
-        f"max {trial_config_base['training_hyperparameters']['epochs']} epochs"
-    )
+    # Log which parameters will be searched
+    searchable_params = [k for k, v in search_space.items() if v is not None]
+    logger.info(f"Parameters to optimize: {searchable_params}")
     
     # Create collate function once
     collate_fn = create_collate_fn(padding_val)
     
     def objective(trial: optuna.Trial) -> float:
-        """
-        Objective function for a single trial.
-        
-        Args:
-            trial: Optuna trial
-            
-        Returns:
-            Best validation loss achieved
-        """
-        # Lightweight config update (no deepcopy)
+        """Objective function for a single trial."""
         trial_config = {
             "data_specification": trial_config_base["data_specification"],
             "data_paths_config": trial_config_base["data_paths_config"],
@@ -197,27 +212,106 @@ def run_optuna(
             "training_hyperparameters": {},
         }
         
-        # Model architecture
-        d_model = trial.suggest_categorical("d_model", search_space["d_model"])
-        nhead = trial.suggest_categorical("nhead", valid_combinations[d_model])
-        
-        layers_range = search_space["num_encoder_layers"]
-        num_encoder_layers = trial.suggest_int(
-            "num_encoder_layers", layers_range[0], layers_range[1]
+        # Model architecture parameters
+        d_model = suggest_parameter(
+            trial, "d_model",
+            search_space.get("d_model"),
+            default_model.get("d_model", 256)
         )
         
-        dim_feedforward = trial.suggest_categorical(
-            "dim_feedforward", search_space["dim_feedforward"]
+        # Handle nhead - must be divisor of d_model
+        if "nhead_divisors" in search_space and search_space["nhead_divisors"]:
+            # Suggest from all possible nheads, then validate
+            nhead = trial.suggest_categorical("nhead", all_possible_nheads)
+            
+            # If this combination is invalid, return a bad score
+            if d_model % nhead != 0:
+                logger.info(
+                    f"Trial {trial.number}: Invalid combination d_model={d_model}, "
+                    f"nhead={nhead} (not divisible). Skipping."
+                )
+                return float("inf")
+        else:
+            # Not searching nhead, use default
+            nhead = default_model.get("nhead", 8)
+            # Ensure compatibility
+            if d_model % nhead != 0:
+                # Find closest valid nhead
+                valid_nheads = [n for n in [4, 8, 16, 32] if d_model % n == 0]
+                if valid_nheads:
+                    nhead = valid_nheads[0]
+                else:
+                    nhead = 1  # Fallback
+        
+        # Handle num_encoder_layers (can be a range [min, max])
+        if "num_encoder_layers" in search_space:
+            layers_config = search_space["num_encoder_layers"]
+            if isinstance(layers_config, list) and len(layers_config) == 2:
+                num_encoder_layers = trial.suggest_int(
+                    "num_encoder_layers", layers_config[0], layers_config[1]
+                )
+            else:
+                num_encoder_layers = suggest_parameter(
+                    trial, "num_encoder_layers",
+                    layers_config,
+                    default_model.get("num_encoder_layers", 6)
+                )
+        else:
+            num_encoder_layers = default_model.get("num_encoder_layers", 6)
+        
+        dim_feedforward = suggest_parameter(
+            trial, "dim_feedforward",
+            search_space.get("dim_feedforward"),
+            default_model.get("dim_feedforward", 1024)
         )
         
-        dropout = trial.suggest_float("dropout", **search_space["dropout"])
+        dropout = suggest_parameter(
+            trial, "dropout",
+            search_space.get("dropout"),
+            default_model.get("dropout", 0.1)
+        )
+        
+        # Handle attention_dropout
+        attention_dropout = suggest_parameter(
+            trial, "attention_dropout",
+            search_space.get("attention_dropout"),
+            default_model.get("attention_dropout", dropout)  # Default to dropout value
+        )
+        
+        # Handle film_clamp
+        film_clamp = suggest_parameter(
+            trial, "film_clamp",
+            search_space.get("film_clamp"),
+            2.0  # Default value
+        )
         
         # Training parameters
-        learning_rate = trial.suggest_float("learning_rate", **search_space["learning_rate"])
-        batch_size = trial.suggest_categorical("batch_size", search_space["batch_size"])
-        weight_decay = trial.suggest_float("weight_decay", **search_space["weight_decay"])
+        learning_rate = suggest_parameter(
+            trial, "learning_rate",
+            search_space.get("learning_rate"),
+            default_train.get("learning_rate", 1e-4)
+        )
         
-        # Update config
+        batch_size = suggest_parameter(
+            trial, "batch_size",
+            search_space.get("batch_size"),
+            default_train.get("batch_size", 256)
+        )
+        
+        weight_decay = suggest_parameter(
+            trial, "weight_decay",
+            search_space.get("weight_decay"),
+            default_train.get("weight_decay", 1e-5)
+        )
+        
+        # Handle gradient_accumulation_steps
+        gradient_accumulation_steps = suggest_parameter(
+            trial, "gradient_accumulation_steps",
+            search_space.get("gradient_accumulation_steps"),
+            default_train.get("gradient_accumulation_steps", 1)
+        )
+        
+        # Update config with suggested values
         trial_config["model_hyperparameters"] = {
             **trial_config_base["model_hyperparameters"],
             "d_model": d_model,
@@ -225,6 +319,8 @@ def run_optuna(
             "num_encoder_layers": num_encoder_layers,
             "dim_feedforward": dim_feedforward,
             "dropout": dropout,
+            "attention_dropout": attention_dropout,
+            "film_clamp": film_clamp,
         }
         
         trial_config["training_hyperparameters"] = {
@@ -232,14 +328,19 @@ def run_optuna(
             "learning_rate": learning_rate,
             "batch_size": batch_size,
             "weight_decay": weight_decay,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
         }
         
         # Create trial directory
         trial_save_dir = model_save_dir / f"trial_{trial.number:04d}"
         ensure_dirs(trial_save_dir)
         
-        # Minimal logging - no per-trial log files
-        logger.info(f"Trial {trial.number}: d={d_model}, n={nhead}, L={num_encoder_layers}, lr={learning_rate:.1e}")
+        # Log trial parameters
+        logger.info(
+            f"Trial {trial.number}: d={d_model}, n={nhead}, L={num_encoder_layers}, "
+            f"ff={dim_feedforward}, lr={learning_rate:.1e}, bs={batch_size}, "
+            f"grad_acc={gradient_accumulation_steps}"
+        )
         
         try:
             # Create trainer
@@ -256,7 +357,7 @@ def run_optuna(
             # Train and get best validation loss
             best_val_loss = trainer.train()
             
-            # Save only essential results
+            # Save trial results
             save_json({
                 "trial": trial.number,
                 "loss": best_val_loss,
@@ -271,18 +372,16 @@ def run_optuna(
             logger.error(f"Trial {trial.number} failed: {e}")
             return float("inf")
     
-    # Create study with aggressive pruning
+    # Create study
     study_name = args.optuna_study_name or "atmospheric_transformer_study"
     storage_path = f"sqlite:///{model_save_dir / 'optuna_study.db'}"
     
-    # Simpler sampler with fewer startup trials
     sampler = TPESampler(
         seed=config.get("miscellaneous_settings", {}).get("random_seed", 42),
-        n_startup_trials=5,  # Reduced from 10
-        n_ei_candidates=20,  # Reduced from 24
+        n_startup_trials=5,
+        n_ei_candidates=20,
     )
     
-    # More aggressive pruner
     pruner = AggressivePruner(
         n_startup_trials=3,
         n_warmup_steps=2,
@@ -329,7 +428,7 @@ def run_optuna(
         for key, value in study.best_trial.params.items():
             logger.info(f"  {key}: {value}")
         
-        # Save best parameters and create final config
+        # Save results
         results_summary = {
             "best_value": study.best_value,
             "best_params": study.best_trial.params,
@@ -341,18 +440,16 @@ def run_optuna(
         
         # Create final config with best params
         final_config = dict(config)
-        final_config["model_hyperparameters"].update({
-            "d_model": study.best_trial.params["d_model"],
-            "nhead": study.best_trial.params["nhead"],
-            "num_encoder_layers": study.best_trial.params["num_encoder_layers"],
-            "dim_feedforward": study.best_trial.params["dim_feedforward"],
-            "dropout": study.best_trial.params["dropout"],
-        })
-        final_config["training_hyperparameters"].update({
-            "learning_rate": study.best_trial.params["learning_rate"],
-            "batch_size": study.best_trial.params["batch_size"],
-            "weight_decay": study.best_trial.params["weight_decay"],
-        })
+        
+        # Only update parameters that were actually searched
+        for param in ["d_model", "nhead", "num_encoder_layers", "dim_feedforward", 
+                      "dropout", "attention_dropout", "film_clamp"]:
+            if param in study.best_trial.params:
+                final_config["model_hyperparameters"][param] = study.best_trial.params[param]
+        
+        for param in ["learning_rate", "batch_size", "weight_decay", "gradient_accumulation_steps"]:
+            if param in study.best_trial.params:
+                final_config["training_hyperparameters"][param] = study.best_trial.params[param]
         
         save_json(final_config, model_save_dir / "best_config.json")
         logger.info(f"\nTrain with best params: python main.py train --config {model_save_dir / 'best_config.json'}")

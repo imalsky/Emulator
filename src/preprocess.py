@@ -27,7 +27,7 @@ from utils import compute_data_hash_with_stats, ensure_dirs, save_json
 logger = logging.getLogger(__name__)
 
 # Processing constants
-HDF5_READ_CHUNK_SIZE = 131072
+HDF5_READ_CHUNK_SIZE = 524288
 
 
 def _group_indices_by_file(indices: List[Tuple[str, int]]) -> Dict[str, List[int]]:
@@ -267,7 +267,7 @@ def preprocess_data(
     padding_value = data_spec["padding_value"]
     max_seq_len = config["model_hyperparameters"]["max_sequence_length"]
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     logger.info(f"Using device: {device} for normalization.")
     
     # Step 2: Process each split

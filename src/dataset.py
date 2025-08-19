@@ -76,6 +76,7 @@ class AtmosphericDataset(Dataset):
         
         self.dir_path = dir_path
         self.config = config
+
         # Keep the *requested* indices for reporting, but load using validated indices
         self.indices = list(indices)
         self.force_disk_loading = force_disk_loading
@@ -88,7 +89,9 @@ class AtmosphericDataset(Dataset):
         
         # Padding configuration for safe comparison
         self.padding_value = float(data_spec.get("padding_value", PADDING_VALUE))
-        self.padding_epsilon = 1e-6  # Tolerance for floating-point comparison
+
+        # Tolerance for floating-point comparison
+        self.padding_epsilon = 1e-6  
         
         # Load shard metadata first to determine structure
         self._load_metadata()
@@ -99,11 +102,7 @@ class AtmosphericDataset(Dataset):
         # Decide loading strategy and load data
         self._estimate_memory_and_load()
         
-        logger.info(
-            f"AtmosphericDataset initialized: {len(self)} samples from {dir_path} "
-            f"(mode: {'RAM' if self.ram_mode else 'disk cache'})"
-        )
-        logger.info(f"Padding value: {self.padding_value}, epsilon: {self.padding_epsilon}")
+        logger.info(f"AtmosphericDataset initialized: {len(self)} samples from {dir_path} ")
     
     def _validate_structure(self) -> None:
         """Validate that required directories exist based on metadata."""

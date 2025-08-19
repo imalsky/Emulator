@@ -475,7 +475,7 @@ def main() -> int:
         if device.type == "cuda":
             if torch.cuda.get_device_capability()[0] >= 8:
                 torch.set_float32_matmul_precision("high")
-                logger.info("Set float32 matmul precision to 'high' for A100/newer GPU")
+                logger.info("Set float32 matmul precision to 'high' for newer GPUs")
         
         # Setup paths
         raw_dir = args.data_dir / "raw"

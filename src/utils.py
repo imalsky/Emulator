@@ -463,53 +463,87 @@ def load_or_generate_splits(
 
 def compute_data_hash(config: Dict[str, Any], raw_hdf5_paths: List[Path]) -> str:
     """
-    Compute hash of configuration and data paths.
+    Compute hash of ONLY data-relevant configuration.
     
-    Args:
-        config: Configuration dictionary
-        raw_hdf5_paths: List of HDF5 file paths
-        
-    Returns:
-        Hexadecimal hash string
+    Only includes:
+    - shard_size
+    - hdf5_dataset_filename
+    - dataset_splits_filename  
+    - data_specification (entire section)
+    - normalization (entire section)
     """
     hasher = hashlib.new(HASH_ALGORITHM)
-    hasher.update(json.dumps(config, sort_keys=True).encode(UTF8_ENCODING))
     
+    # Create filtered config with only data-relevant parts
+    data_relevant_config = {}
+    
+    # Get shard_size from miscellaneous_settings
+    if "miscellaneous_settings" in config:
+        data_relevant_config["shard_size"] = config["miscellaneous_settings"].get("shard_size")
+    
+    # Get data paths config
+    if "data_paths_config" in config:
+        data_relevant_config["hdf5_dataset_filename"] = config["data_paths_config"].get("hdf5_dataset_filename")
+        data_relevant_config["dataset_splits_filename"] = config["data_paths_config"].get("dataset_splits_filename")
+    
+    # Get entire data_specification section
+    if "data_specification" in config:
+        data_relevant_config["data_specification"] = config["data_specification"]
+    
+    # Get entire normalization section
+    if "normalization" in config:
+        data_relevant_config["normalization"] = config["normalization"]
+    
+    # Hash only the filtered config
+    hasher.update(json.dumps(data_relevant_config, sort_keys=True).encode(UTF8_ENCODING))
+    
+    # Hash file paths (but not timestamps)
     for path in sorted(raw_hdf5_paths):
-        hasher.update(str(path).encode(UTF8_ENCODING))
+        hasher.update(str(path.name).encode(UTF8_ENCODING))  # Just filename, not full path
     
     return hasher.hexdigest()
 
 
 def compute_data_hash_with_stats(config: Dict[str, Any], raw_hdf5_paths: List[Path]) -> str:
     """
-    Compute hash including file modification times and sizes.
-    
-    More robust than compute_data_hash as it detects in-place file modifications.
-    
-    Args:
-        config: Configuration dictionary
-        raw_hdf5_paths: List of HDF5 file paths
-        
-    Returns:
-        Hexadecimal hash string
+    Compute hash including file sizes but NOT modification times.
+    Only includes data-relevant configuration sections.
     """
     hasher = hashlib.new(HASH_ALGORITHM)
     
-    # Hash the config
-    hasher.update(json.dumps(config, sort_keys=True).encode(UTF8_ENCODING))
+    # Create filtered config with only data-relevant parts
+    data_relevant_config = {}
     
-    # Hash file paths, sizes, and modification times
+    # Get shard_size from miscellaneous_settings
+    if "miscellaneous_settings" in config:
+        data_relevant_config["shard_size"] = config["miscellaneous_settings"].get("shard_size")
+    
+    # Get data paths config
+    if "data_paths_config" in config:
+        data_relevant_config["hdf5_dataset_filename"] = config["data_paths_config"].get("hdf5_dataset_filename")
+        data_relevant_config["dataset_splits_filename"] = config["data_paths_config"].get("dataset_splits_filename")
+    
+    # Get entire data_specification section
+    if "data_specification" in config:
+        data_relevant_config["data_specification"] = config["data_specification"]
+    
+    # Get entire normalization section  
+    if "normalization" in config:
+        data_relevant_config["normalization"] = config["normalization"]
+    
+    # Hash only the filtered config
+    hasher.update(json.dumps(data_relevant_config, sort_keys=True).encode(UTF8_ENCODING))
+    
+    # Hash file names and sizes (but NOT timestamps or full paths)
     for path in sorted(raw_hdf5_paths):
-        hasher.update(str(path).encode(UTF8_ENCODING))
+        hasher.update(str(path.name).encode(UTF8_ENCODING))  # Just filename
         
         if path.is_file():
             stat = path.stat()
-            # Include file size and modification time
+            # Include file size only
             hasher.update(str(stat.st_size).encode(UTF8_ENCODING))
-            hasher.update(str(stat.st_mtime_ns).encode(UTF8_ENCODING))
+            # REMOVED: modification time
         else:
-            # Mark missing files explicitly
             hasher.update(b"missing")
     
     return hasher.hexdigest()

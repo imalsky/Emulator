@@ -472,12 +472,12 @@ class PredictionModel(nn.Module):
         self._init_weights()
         
         # Log model statistics
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        logger.info(
-            f"PredictionModel created with {trainable_params:,} trainable parameters. "
-            f"Architecture: d_model={d_model}, nhead={nhead}, layers={num_encoder_layers}, "
-            f"ffn_dim={dim_feedforward}, attn_dropout={attention_dropout:.2f}"
-        )
+        #trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        #logger.info(
+        #    f"PredictionModel created with {trainable_params:,} trainable parameters. "
+        #    f"Architecture: d_model={d_model}, nhead={nhead}, layers={num_encoder_layers}, "
+        #    f"ffn_dim={dim_feedforward}, attn_dropout={attention_dropout:.2f}"
+        #)
     
     def _init_weights(self) -> None:
         """Initialize weights with improved strategies per layer type."""
@@ -629,7 +629,7 @@ def create_prediction_model(
         elif compile_enabled and device.type != "cuda":
             logger.info("torch.compile is only enabled for CUDA devices.")
     
-    logger.info(f"Model moved to device: {device}")
+    #logger.info(f"Model moved to device: {device}")
     return model
 
 
@@ -658,7 +658,7 @@ def export_model(
     if config is not None:
         export_enabled = config.get("miscellaneous_settings", {}).get("torch_export", True)
         if not export_enabled:
-            logger.info("Model export disabled in config - skipping.")
+            #logger.info("Model export disabled in config - skipping.")
             return
     
     model.eval()

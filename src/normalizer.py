@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_EPSILON = 1e-9
 DEFAULT_QUANTILE_MEMORY_LIMIT = 1_000_000
 DEFAULT_SYMLOG_PERCENTILE = 0.5
-STATS_CHUNK_SIZE = 8192
+STATS_CHUNK_SIZE = 32768
 NORMALIZED_VALUE_CLAMP = 50.0
 
 
@@ -47,7 +47,8 @@ class DataNormalizer:
     def __init__(self, *, config_data: Dict[str, Any]):
         """Initialize normalizer with configuration."""
         self.config = config_data
-        self.device = setup_device()
+        # FORCE CPU for statistics calculation - MPS is inefficient for this
+        self.device = torch.device("cpu")  # Changed from setup_device()
         self.norm_config = self.config.get("normalization", {})
         self.eps = float(self.norm_config.get("epsilon", DEFAULT_EPSILON))
         self.keys_to_process, self.key_methods = self._get_keys_and_methods()
