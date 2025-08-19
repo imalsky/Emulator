@@ -23,7 +23,7 @@ plt.style.use('science.mplstyle')
 
 MODEL_DIR = Path("../models/trained_model")
 PROCESSED_DIR = Path("../data/processed/test")
-N_SAMPLES = 5
+N_SAMPLES = 10
 
 
 def load_normalization_metadata():

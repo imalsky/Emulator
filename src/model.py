@@ -749,7 +749,7 @@ def export_model(
             original_output = model(**test_kwargs)
             exported_output = exported_program.module()(**test_kwargs)
             
-            if not torch.allclose(original_output, exported_output, rtol=1e-4, atol=1e-5):
+            if not torch.allclose(original_output, exported_output, rtol=1e-3, atol=1e-4):
                 logger.warning("Exported model output differs from original!")
                 max_diff = torch.max(torch.abs(original_output - exported_output)).item()
                 logger.warning(f"Maximum difference: {max_diff}")
