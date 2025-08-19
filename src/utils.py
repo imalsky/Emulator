@@ -214,27 +214,35 @@ def _json_serializer(obj: Any) -> Any:
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable.")
 
 
-def save_json(data: Dict[str, Any], path: Union[str, Path]) -> bool:
+def save_json(data: Dict[str, Any], path: Union[str, Path], compact: bool = False) -> bool:
     """
     Save dictionary to JSON file with custom serialization.
-    
+
     Args:
         data: Dictionary to save
         path: Output file path
-        
+        compact: If True, use minimal formatting for smaller files
+
     Returns:
         True if successful, False otherwise
     """
     try:
         json_path = Path(path)
         ensure_dirs(json_path.parent)
-        
+
         with json_path.open("w", encoding=UTF8_ENCODING) as f:
-            json.dump(data, f, indent=2, default=_json_serializer, ensure_ascii=False)
+            if compact:
+                # Minimal formatting for compact files
+                json.dump(data, f, default=_json_serializer,
+                          ensure_ascii=False, separators=(',', ':'))
+            else:
+                # Human-readable formatting
+                json.dump(data, f, indent=2, default=_json_serializer,
+                          ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
         return True
-        
+
     except (OSError, TypeError) as e:
         logger.error(f"Failed to save JSON to {path}: {e}", exc_info=True)
         return False
@@ -375,89 +383,97 @@ def get_config_str(config: Dict[str, Any], section: str, key: str, op_desc: str)
 
 
 def load_or_generate_splits(
-    config: Dict[str, Any],
-    data_root_dir: Path,
-    raw_hdf5_paths: List[Path],
-    model_save_dir: Path,
+        config: Dict[str, Any],
+        data_root_dir: Path,
+        raw_hdf5_paths: List[Path],
+        model_save_dir: Path,
 ) -> Tuple[Dict[str, List[Tuple[str, int]]], Path]:
     """
     Load existing dataset splits or generate new ones.
-    
+
     Args:
         config: Configuration dictionary
         data_root_dir: Root data directory
         raw_hdf5_paths: List of raw HDF5 files
         model_save_dir: Directory to save generated splits
-        
+
     Returns:
         Tuple of (splits dictionary, splits file path)
     """
     splits_path = None
-    
+
     try:
-        # Try to load existing splits
+        # Try to load existing splits from config
         splits_filename = get_config_str(
             config, "data_paths_config", "dataset_splits_filename", "dataset splits"
         )
         splits_path = data_root_dir / splits_filename
-        
+
         logger.info(f"Loading dataset splits from: {splits_path}")
-        
+
         if not splits_path.exists():
             raise FileNotFoundError(f"Splits file not found: {splits_path}")
-        
+
         with open(splits_path, "r", encoding=UTF8_ENCODING) as f:
-            splits = json.load(f)
-        
-        # Validate splits structure
-        required_keys = {"train", "validation", "test"}
-        if not required_keys.issubset(splits.keys()):
-            raise ValueError(f"Splits file must contain keys: {required_keys}")
-        
-        for key in required_keys:
-            if not isinstance(splits[key], list) or not splits[key]:
-                raise ValueError(f"Split '{key}' must be a non-empty list")
-        
-        # Convert lists to tuples for consistency
-        for split in splits.values():
-            for i, item in enumerate(split):
-                if isinstance(item, list) and len(item) == 2:
-                    split[i] = tuple(item)
-        
+            loaded_data = json.load(f)
+
+        # Handle both old and new formats
+        if "file_stems" in loaded_data:
+            # New compact format - decompress it
+            splits = decompress_splits(loaded_data)
+        else:
+            # Old verbose format
+            splits = loaded_data
+            # Validate splits structure
+            required_keys = {"train", "validation", "test"}
+            if not required_keys.issubset(splits.keys()):
+                raise ValueError(f"Splits file must contain keys: {required_keys}")
+
+            for key in required_keys:
+                if not isinstance(splits[key], list) or not splits[key]:
+                    raise ValueError(f"Split '{key}' must be a non-empty list")
+
+            # Convert lists to tuples for consistency
+            for split in splits.values():
+                for i, item in enumerate(split):
+                    if isinstance(item, list) and len(item) == 2:
+                        split[i] = tuple(item)
+
         logger.info(f"Loaded splits from {splits_path}")
         logger.info(
             f"Split sizes: {len(splits['train'])} train, "
             f"{len(splits['validation'])} val, {len(splits['test'])} test."
         )
         return splits, splits_path
-        
+
     except (KeyError, ValueError, FileNotFoundError, json.JSONDecodeError) as e:
         logger.info(f"Could not load splits file. Reason: {e}. Generating new splits.")
-    
+
     # Generate new splits
     logger.info("Generating new dataset splits...")
-    
+
     train_params = config.get("training_hyperparameters", {})
     val_frac = train_params.get("val_frac", 0.15)
     test_frac = train_params.get("test_frac", 0.15)
-    
+
     misc_settings = config.get("miscellaneous_settings", {})
     random_seed = misc_settings.get("random_seed", DEFAULT_SEED)
-    
+
     splits = generate_dataset_splits(
         raw_hdf5_paths=raw_hdf5_paths,
         val_frac=val_frac,
         test_frac=test_frac,
         random_seed=random_seed,
     )
-    
-    # Save generated splits
-    new_splits_path = model_save_dir / "splits_generated.json"
-    if save_json(splits, new_splits_path):
-        logger.info(f"Saved generated splits to {new_splits_path}")
+
+    # Save generated splits with CONSISTENT naming
+    new_splits_path = data_root_dir / "dataset_splits.json"  # Changed from model_save_dir
+    compressed = compress_splits(splits)
+    if save_json(compressed, new_splits_path, compact=True):
+        logger.info(f"Saved compressed splits to {new_splits_path}")
     else:
         logger.warning("Failed to save generated splits")
-    
+
     return splits, new_splits_path
 
 
@@ -549,6 +565,30 @@ def compute_data_hash_with_stats(config: Dict[str, Any], raw_hdf5_paths: List[Pa
     return hasher.hexdigest()
 
 
+def compress_splits(splits: Dict[str, List[Tuple[str, int]]]) -> Dict:
+    """Convert verbose format to compact format."""
+    # Extract unique file stems
+    file_stems = sorted(set(stem for split in splits.values()
+                            for stem, _ in split))
+    stem_to_idx = {stem: i for i, stem in enumerate(file_stems)}
+
+    compressed = {
+        "file_stems": file_stems,
+        "train": [[stem_to_idx[s], i] for s, i in splits["train"]],
+        "validation": [[stem_to_idx[s], i] for s, i in splits["validation"]],
+        "test": [[stem_to_idx[s], i] for s, i in splits["test"]]
+    }
+    return compressed
+
+def decompress_splits(compressed: Dict) -> Dict[str, List[Tuple[str, int]]]:
+    """Convert compact format back to verbose format."""
+    file_stems = compressed["file_stems"]
+    return {
+        "train": [(file_stems[s], i) for s, i in compressed["train"]],
+        "validation": [(file_stems[s], i) for s, i in compressed["validation"]],
+        "test": [(file_stems[s], i) for s, i in compressed["test"]]
+    }
+
 __all__ = [
     "DTYPE",
     "PADDING_VALUE",
@@ -566,4 +606,7 @@ __all__ = [
     "load_or_generate_splits",
     "compute_data_hash",
     "compute_data_hash_with_stats",
+    "compress_splits",
+    "decompress_splits"
+
 ]

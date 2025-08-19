@@ -7,7 +7,7 @@ import pandas as pd
 
 plt.style.use('science.mplstyle')
 
-MODEL_DIR = Path("../models/trained_model_v1")
+MODEL_DIR = Path("../models/trained_model")
 
 def plot_training():
     """Plot training curves."""

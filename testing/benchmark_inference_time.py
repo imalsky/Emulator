@@ -9,8 +9,8 @@ import torch
 import matplotlib.pyplot as plt
 
 # Configuration
-MODEL_DIR = Path("models/trained_model_v1")
-BATCH_SIZES = [1, 4, 16, 64, 256]
+MODEL_DIR = Path("../models/trained_model")
+BATCH_SIZES = [1, 4, 16]
 N_WARMUP = 5
 N_RUNS = 20
 

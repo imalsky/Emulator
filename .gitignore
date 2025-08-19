@@ -20,3 +20,5 @@ codebase_v*
 tuning_results/
 
 models/*
+
+rt_util/*

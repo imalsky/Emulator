@@ -79,158 +79,156 @@ def _get_raw_hdf5_paths(config: Dict[str, Any], raw_dir: Path) -> List[Path]:
 
 
 def _parse_arguments() -> argparse.Namespace:
-    """Parse command line arguments with subcommands."""
+    """Parse command line arguments with command flags."""
     parser = argparse.ArgumentParser(
         description="Atmospheric profile transformer pipeline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    
-    # Add subcommands
-    subparsers = parser.add_subparsers(dest='command', help='Command to run')
-    
-    # Common arguments for all commands
-    parent_parser = argparse.ArgumentParser(add_help=False)
-    parent_parser.add_argument(
+
+    # Command flags (mutually exclusive group)
+    command_group = parser.add_mutually_exclusive_group(required=True)
+    command_group.add_argument(
+        "--normalize",
+        action="store_true",
+        help="Preprocess and normalize the data"
+    )
+    command_group.add_argument(
+        "--train",
+        action="store_true",
+        help="Train a model with current config"
+    )
+    command_group.add_argument(
+        "--tune",
+        action="store_true",
+        help="Run hyperparameter optimization with Optuna"
+    )
+
+    # Common arguments
+    parser.add_argument(
         "--config",
         type=Path,
         default=DEFAULT_CONFIG_PATH,
         help="Path to configuration file.",
     )
-    parent_parser.add_argument(
+    parser.add_argument(
         "--data-dir",
         type=Path,
         default=DEFAULT_DATA_DIR,
         help="Root data directory (contains raw/ and processed/).",
     )
-    parent_parser.add_argument(
+    parser.add_argument(
         "--models-dir",
         type=Path,
         default=DEFAULT_MODELS_DIR,
         help="Directory for saved models.",
     )
-    
-    # Normalize command
-    normalize_parser = subparsers.add_parser(
-        'normalize',
-        parents=[parent_parser],
-        help='Preprocess and normalize the data'
-    )
-    normalize_parser.add_argument(
+
+    # Normalize-specific arguments
+    parser.add_argument(
         "--force",
         action="store_true",
-        help="Force re-normalization even if cached data exists.",
+        help="Force re-normalization even if cached data exists (only with --normalize).",
     )
-    
-    # Train command
-    train_parser = subparsers.add_parser(
-        'train',
-        parents=[parent_parser],
-        help='Train a model with current config'
-    )
-    train_parser.add_argument(
+
+    # Train-specific arguments
+    parser.add_argument(
         "--profile",
         action="store_true",
-        help="Enable PyTorch profiler for performance analysis.",
+        help="Enable PyTorch profiler for performance analysis (only with --train).",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--profile-wait",
         type=int,
         default=1,
-        help="Number of steps to wait before profiling.",
+        help="Number of steps to wait before profiling (only with --train --profile).",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--profile-warmup",
         type=int,
         default=1,
-        help="Number of warmup steps for profiler.",
+        help="Number of warmup steps for profiler (only with --train --profile).",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--profile-active",
         type=int,
         default=3,
-        help="Number of steps to actively profile.",
+        help="Number of steps to actively profile (only with --train --profile).",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--profile-epochs",
         type=int,
         default=1,
-        help="Number of epochs to profile (only used with --profile).",
+        help="Number of epochs to profile (only with --train --profile).",
     )
-    
-    # Tune command (hyperparameter search)
-    tune_parser = subparsers.add_parser(
-        'tune',
-        parents=[parent_parser],
-        help='Run hyperparameter optimization with Optuna'
-    )
-    tune_parser.add_argument(
+
+    # Tune-specific arguments
+    parser.add_argument(
         "--num-trials",
         type=int,
         default=50,
-        help="Number of Optuna trials for hyperparameter optimization.",
+        help="Number of Optuna trials for hyperparameter optimization (only with --tune).",
     )
-    tune_parser.add_argument(
+    parser.add_argument(
         "--optuna-study-name",
         type=str,
         default=None,
-        help="Optuna study name.",
+        help="Optuna study name (only with --tune).",
     )
-    tune_parser.add_argument(
+    parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume an existing Optuna study.",
+        help="Resume an existing Optuna study (only with --tune).",
     )
-    
+
     args = parser.parse_args()
-    
-    # Check that a command was specified
-    if args.command is None:
-        parser.print_help()
-        sys.exit(1)
-    
+
+    # Determine which command was selected
+    if args.normalize:
+        args.command = 'normalize'
+    elif args.train:
+        args.command = 'train'
+    elif args.tune:
+        args.command = 'tune'
+    else:
+        parser.error("No command specified. Use --normalize, --train, or --tune")
+
     return args
 
 
 def run_normalize(
-    config: Dict[str, Any],
-    raw_hdf5_paths: List[Path],
-    processed_dir: Path,
-    model_save_dir: Path,
-    force: bool = False,
+        config: Dict[str, Any],
+        raw_hdf5_paths: List[Path],
+        processed_dir: Path,
+        model_save_dir: Path,
+        force: bool = False,
 ) -> Dict[str, List[Tuple[str, int]]]:
     """
     Run data normalization step.
-    
+
     Args:
         config: Configuration dictionary
         raw_hdf5_paths: List of raw HDF5 files
         processed_dir: Directory for processed data
         model_save_dir: Directory for saving splits info
         force: If True, force reprocessing
-        
+
     Returns:
         Dictionary of data splits
     """
     logger.info("=== Running Data Normalization ===")
-    
+
     # Load or generate splits
     splits, splits_path = load_or_generate_splits(
         config, processed_dir.parent, raw_hdf5_paths, model_save_dir
     )
-    
-    # Save splits info
-    save_json(
-        {"splits_file": str(splits_path.resolve())},
-        model_save_dir / "splits_info.json",
-    )
-    
+
     # Force reprocessing if requested
     if force:
         logger.info("Force flag set - removing existing processed data")
         import shutil
         if processed_dir.exists():
             shutil.rmtree(processed_dir)
-    
+
     # Run preprocessing
     success = preprocess_data(
         config=config,
@@ -238,10 +236,10 @@ def run_normalize(
         splits=splits,
         processed_dir=processed_dir,
     )
-    
+
     if not success:
         raise RuntimeError("Preprocessing failed due to invalid data.")
-    
+
     logger.info("=== Data Normalization Complete ===")
     return splits
 

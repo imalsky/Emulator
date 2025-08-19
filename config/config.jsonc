@@ -134,7 +134,7 @@
 
   // Percentile that defines linear→log switch in symlog.
   // CHANGED: Increased for better handling of near-zero values
-  "symlog_percentile": 0.25                  // 0 ≤ float ≤ 1
+  "symlog_percentile": 0.01                  // 0 ≤ float ≤ 1
 },
 
 // ════════════════════════════════════════════════════════════════
@@ -164,7 +164,7 @@
   
   // NEW: FiLM layer clamping value
   // Controls how much global features can modulate the model
-  "film_clamp": 5.0,                         // float > 0 or null for no clamping
+  "film_clamp": 999.0,                         // float > 0 or null for no clamping
   
   // Maximum sequence length your data can reach.
   // Sequences longer than this will be truncated.

@@ -153,21 +153,21 @@ class ModelTrainer:
     - Model export for deployment
     - Correct padding mask handling throughout
     """
-    
+
     def __init__(
-        self,
-        config: Dict[str, Any],
-        device: torch.device,
-        save_dir: Path,
-        processed_dir: Path,
-        splits: Dict[str, List[Tuple[str, int]]],
-        collate_fn: Callable,
-        optuna_trial: Optional[optuna.Trial] = None,
-        profiler: Optional[Any] = None,
+            self,
+            config: Dict[str, Any],
+            device: torch.device,
+            save_dir: Path,
+            processed_dir: Path,
+            splits: Dict[str, List[Tuple[str, int]]],
+            collate_fn: Callable,
+            optuna_trial: Optional[optuna.Trial] = None,
+            profiler: Optional[Any] = None,
     ) -> None:
         """
         Initialize trainer.
-        
+
         Args:
             config: Configuration dictionary
             device: Compute device
@@ -176,6 +176,7 @@ class ModelTrainer:
             splits: Train/val/test splits
             collate_fn: Collation function for DataLoader
             optuna_trial: Optional Optuna trial for hyperparameter search
+            profiler: Optional profiler
         """
         self.cfg = config
         self.device = device
@@ -184,35 +185,39 @@ class ModelTrainer:
         self.current_epoch = 0
         self.trial = optuna_trial
         self.profiler = profiler
-        
+
         # Extract configuration
         misc_cfg = self.cfg.get("miscellaneous_settings", {})
         train_params = self.cfg.get("training_hyperparameters", {})
-        
+
         self.max_batch_failure_rate = train_params.get(
             "max_batch_failure_rate", DEFAULT_MAX_BATCH_FAILURE_RATE
         )
-        
+
         if self.device.type == "cuda":
             logger.info("Applying GPU performance optimizations")
-            
+
             if not train_params.get("use_amp", False):
                 logger.info("Enabling AMP")
                 train_params["use_amp"] = True
-            
+
             current_batch_size = train_params.get("batch_size", DEFAULT_BATCH_SIZE)
             if current_batch_size < 256:
                 logger.info(f"Increasing batch size from {current_batch_size} to 256")
                 train_params["batch_size"] = 256
-        
+
         # Enable anomaly detection if requested
         if misc_cfg.get("detect_anomaly", False):
             torch.autograd.set_detect_anomaly(True)
             logger.warning("Anomaly detection enabled - training will be slower.")
-        
-        # Save splits for reproducibility
-        save_json(splits, self.save_dir / "dataset_splits.json")
-        
+
+        # Import compress_splits from utils
+        from utils import compress_splits
+
+        # Save splits for reproducibility in COMPACT format
+        compressed_splits = compress_splits(splits)
+        save_json(compressed_splits, self.save_dir / "dataset_splits.json", compact=True)
+
         # Initialize components
         self._setup_datasets(processed_dir, splits)
         self._build_dataloaders(collate_fn, misc_cfg, train_params)
@@ -222,15 +227,15 @@ class ModelTrainer:
         self._setup_training_params(train_params)
         self._setup_logging()
         self._save_metadata()
-        
+
         # Check if validation set exists
         self.has_val = self.val_loader is not None and len(self.val_loader) > 0
-        
+
         # Clean up memory
         gc.collect()
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
-        
+
         logger.info("Trainer initialized. Padding convention: True = padding position")
     
     def _setup_datasets(
@@ -457,21 +462,22 @@ class ModelTrainer:
         
         self.best_val_loss = float("inf")
         self.best_epoch = -1
-    
+
     def _save_metadata(self) -> None:
         """Save training metadata."""
         metadata = {
             "device": str(self.device),
             "use_amp": self.use_amp,
             "effective_batch_size": (
-                self.cfg["training_hyperparameters"].get("batch_size", DEFAULT_BATCH_SIZE)
-                * self.accumulation_steps
+                    self.cfg["training_hyperparameters"].get("batch_size", DEFAULT_BATCH_SIZE)
+                    * self.accumulation_steps
             ),
             "num_parameters": sum(p.numel() for p in self.model.parameters()),
             "num_trainable": sum(p.numel() for p in self.model.parameters() if p.requires_grad),
             "padding_convention": "True = padding position (PyTorch standard)",
         }
-        save_json(metadata, self.save_dir / "training_metadata.json")
+        # Use compact format for metadata
+        save_json(metadata, self.save_dir / "training_metadata.json", compact=True)
     
     def train(self) -> float:
         """

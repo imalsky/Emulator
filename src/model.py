@@ -593,7 +593,7 @@ def create_prediction_model(
         dropout=float(model_params.get("dropout", 0.1)),
         attention_dropout=float(model_params.get("attention_dropout", model_params.get("dropout", 0.1))),
         padding_value=float(data_spec.get("padding_value", PADDING_VALUE)),
-        film_clamp=2.0,  # Increased from 1.0 for better adaptation
+        film_clamp=float(model_params.get("film_clamp", 2.0)),
     )
     
     model.to(device=device)
