@@ -21,9 +21,9 @@ from utils import load_config, PADDING_VALUE
 
 plt.style.use('science.mplstyle')
 
-MODEL_DIR = Path("../models/trained_model")
+MODEL_DIR = Path("../models/trained_model_v2")
 PROCESSED_DIR = Path("../data/processed/test")
-N_SAMPLES = 10
+N_SAMPLES = 3
 
 
 def load_normalization_metadata():

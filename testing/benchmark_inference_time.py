@@ -39,7 +39,7 @@ try:
 except Exception:
     pass
 
-MODEL_DIR = Path("../models/trained_model")
+MODEL_DIR = Path("../models/trained_model_v2")
 BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 N_WARMUP = 10          # Warmup iterations
 N_BENCHMARK = 50       # Benchmark iterations

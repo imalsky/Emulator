@@ -26,7 +26,7 @@ try:
 except:
     pass
 
-MODEL_DIR = Path("../models/trained_model")
+MODEL_DIR = Path("../models/trained_model_v2")
 PROCESSED_DIR = Path("../data/processed/test")
 N_SAMPLES = 100  # Use more samples for better statistics
 

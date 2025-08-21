@@ -72,11 +72,13 @@ class AggressivePruner(optuna.pruners.BasePruner):
 
     def __init__(
             self,
-            n_startup_trials: int = 5,
-            n_warmup_steps: int = 5,
-            patience: int = 3,
-            min_improvement: float = 0.0005,
+            n_startup_trials: int = 10,
+            n_warmup_steps: int = 10,
+            patience: int = 5,
+            min_improvement: float = 0.0001,  #
     ):
+
+
         self._median_pruner = MedianPruner(
             n_startup_trials=n_startup_trials,
             n_warmup_steps=n_warmup_steps,
@@ -96,6 +98,9 @@ class AggressivePruner(optuna.pruners.BasePruner):
         # Don't prune during warmup steps
         step = trial.last_step
         if step is None or step < self.n_warmup_steps:
+            return False
+
+        if step % 3 != 0:
             return False
 
         # Use median pruner
@@ -317,7 +322,7 @@ def run_optuna(
     # Create base config for trials (keeping original epochs)
     trial_config_base = create_reduced_config(
         config,
-        fraction=0.1,  # Use 10% of data for search
+        fraction=1.0,
         override_epochs=False  # Don't override epochs - use config value
     )
 
@@ -531,10 +536,10 @@ def run_optuna(
     warmup_steps = min(8, actual_epochs // 4)  # Adjust warmup based on total epochs
 
     pruner = AggressivePruner(
-        n_startup_trials=5,
+        n_startup_trials=10,
         n_warmup_steps=warmup_steps,
-        patience=3,
-        min_improvement=0.0005,
+        patience=5,
+        min_improvement=1e-5,
     )
 
     logger.info(f"Pruner settings: warmup_steps={warmup_steps} (based on {actual_epochs} epochs)")

@@ -210,7 +210,7 @@
   //"scheduler_type": "reduce_on_plateau",
   //"lr_patience": 10,              // epochs with no improvement before LR is reduced
   //"lr_factor": 0.5,               // multiply LR by this factor on plateau
-  //"min_lr": 1e-8,                 // already present; keep here
+  "min_lr": 1e-8,
 
 
 
@@ -259,6 +259,7 @@
         "dim_feedforward": [512, 1024, 2048, 4096],
         "dropout": {"low": 0.05, "high": 0.2},
         "attention_dropout": {"low": 0.0, "high": 0.2},
-        "batch_size": [128, 256, 512]
+        "batch_size": [128, 256, 512],
+        "learning_rate": {"low": 5e-5, "high": 5e-4, "log": true}
     }
 }
