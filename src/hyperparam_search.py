@@ -121,9 +121,9 @@ class AggressivePruner(optuna.pruners.BasePruner):
 
 def create_reduced_config(
         config: Dict[str, Any],
-        fraction: float = 0.1,
+        fraction: float = 1.0,
         override_epochs: bool = False,
-        max_epochs: int = 20,
+        max_epochs: int = 50,
 ) -> Dict[str, Any]:
     """
     Create a configuration for trials with specific optimizations.
@@ -533,13 +533,14 @@ def run_optuna(
 
     # Adjust pruner based on actual epochs being used
     actual_epochs = trial_config_base["training_hyperparameters"]["epochs"]
-    warmup_steps = min(8, actual_epochs // 4)  # Adjust warmup based on total epochs
+    warmup_epochs = trial_config_base["training_hyperparameters"].get("warmup_epochs", 0)
+    warmup_steps = max(warmup_epochs + 5, 12)  # was: min(8, actual_epochs // 4)
 
     pruner = AggressivePruner(
-        n_startup_trials=10,
+        n_startup_trials=10,  # keep
         n_warmup_steps=warmup_steps,
-        patience=5,
-        min_improvement=1e-5,
+        patience=10,  # was 5
+        min_improvement=5e-5,  # was 1e-5; avoid death by noise
     )
 
     logger.info(f"Pruner settings: warmup_steps={warmup_steps} (based on {actual_epochs} epochs)")

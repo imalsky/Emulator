@@ -31,14 +31,14 @@
   "shard_size": 10000,                        // int ≥ 1
   
   // Enable torch.compile for model optimization (requires PyTorch 2.0+)
-  "torch_compile": true,                     // bool
+  "torch_compile": false,                     // bool
   
   // Compile mode if torch_compile is enabled
   // CHANGED: max-autotune for best performance on modern GPUs
   "compile_mode": "default",            // "default", "reduce-overhead", "max-autotune"
   
   // Enable torch.export for model export
-  "torch_export": true                       // bool
+  "torch_export": false                       // bool
 },
 
 // ════════════════════════════════════════════════════════════════

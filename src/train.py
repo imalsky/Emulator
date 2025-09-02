@@ -202,7 +202,7 @@ class ModelTrainer:
                 train_params["use_amp"] = True
 
             current_batch_size = train_params.get("batch_size", DEFAULT_BATCH_SIZE)
-            if current_batch_size < 256:
+            if self.trial is None and current_batch_size < 256:
                 logger.info(f"Increasing batch size from {current_batch_size} to 256")
                 train_params["batch_size"] = 256
 

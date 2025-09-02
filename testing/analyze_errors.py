@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 """Analyze and visualize error distributions for model predictions."""
-import os
-
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 import sys
 
@@ -12,51 +9,35 @@ from pathlib import Path
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy import stats
 import json
-from typing import Dict, Tuple, List
 
 from dataset import create_dataset, create_collate_fn
-from model import create_prediction_model
 from normalizer import DataNormalizer
 from utils import load_config, PADDING_VALUE
 
-try:
-    plt.style.use('science.mplstyle')
-except:
-    pass
-
-MODEL_DIR = Path("../models/trained_model_v2")
+# Configuration
+MODEL_DIR = Path("../models/trained_model")
 PROCESSED_DIR = Path("../data/processed/test")
-N_SAMPLES = 100  # Use more samples for better statistics
+N_SAMPLES = 100
+MODEL_FILE = 'final_model.pt2'
 
 
 def load_model_and_data():
-    """Load model, config, and test dataset."""
-    config_paths = [
-        MODEL_DIR / "train_config.json",
-        MODEL_DIR / "best_config.json",
-        MODEL_DIR / "normalize_config.json"
-    ]
+    """Load exported model, config, and test dataset."""
+    config_path = MODEL_DIR / "train_config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config not found: {config_path}")
 
-    config = None
-    for config_path in config_paths:
-        if config_path.exists():
-            config = load_config(config_path)
-            break
-
-    if config is None:
-        raise FileNotFoundError(f"No config file found in {MODEL_DIR}")
-
+    config = load_config(config_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load model
-    model = create_prediction_model(config, device, compile_model=False)
-    checkpoint = torch.load(MODEL_DIR / "best_model.pt", map_location=device, weights_only=False)
-    state_dict = checkpoint["state_dict"]
-    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict)
-    model.eval()
+    # Load exported model
+    model_path = MODEL_DIR / MODEL_FILE
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
+    print(f"Loading model: {model_path}")
+    exported_model = torch.export.load(str(model_path))
 
     # Load normalization metadata
     metadata_path = Path("../data/processed/normalization_metadata.json")
@@ -67,33 +48,28 @@ def load_model_and_data():
     test_dataset = create_dataset(PROCESSED_DIR, config, list(range(min(N_SAMPLES, 1000))))
     collate_fn = create_collate_fn(PADDING_VALUE)
 
-    return model, test_dataset, collate_fn, config, norm_metadata, device
+    return exported_model, test_dataset, collate_fn, config, norm_metadata, device
 
 
-def collect_errors(model, dataset, collate_fn, config, norm_metadata, device) -> Dict:
-    """Collect prediction errors for all variables."""
+def collect_errors(model, dataset, collate_fn, config, norm_metadata, device):
+    """Collect prediction errors."""
     target_vars = config["data_specification"]["target_variables"]
+    all_errors = {var: [] for var in target_vars}
 
-    # Initialize error collectors
-    errors = {var: {'absolute': [], 'relative': [], 'signed': []} for var in target_vars}
-
-    # Process each sample
     for i in range(len(dataset)):
         inputs, targets = dataset[i]
         batch_inputs, batch_masks, batch_targets, target_masks = collate_fn([(inputs, targets)])
 
-        # Move to device
-        for k in batch_inputs:
-            batch_inputs[k] = batch_inputs[k].to(device)
-        batch_masks["sequence"] = batch_masks["sequence"].to(device)
+        # Run inference
+        model_inputs = {
+            "sequence": batch_inputs["sequence"].to(device),
+            "sequence_mask": batch_masks["sequence"].to(device)
+        }
+        if "global_features" in batch_inputs:
+            model_inputs["global_features"] = batch_inputs["global_features"].to(device)
 
-        # Predict
         with torch.no_grad():
-            preds = model(
-                sequence=batch_inputs["sequence"],
-                global_features=batch_inputs.get("global_features"),
-                sequence_mask=batch_masks["sequence"]
-            )
+            preds = model.module()(**model_inputs)
 
         # Get valid positions
         preds_np = preds.cpu().numpy()[0]
@@ -103,9 +79,8 @@ def collect_errors(model, dataset, collate_fn, config, norm_metadata, device) ->
         if not np.any(valid_mask):
             continue
 
-        # Calculate errors for each variable
+        # Calculate percent errors for each variable
         for var_idx, var_name in enumerate(target_vars):
-            # Get predictions and targets for this variable
             var_preds = preds_np[valid_mask, var_idx]
             var_targets = targets_np[valid_mask, var_idx]
 
@@ -124,221 +99,114 @@ def collect_errors(model, dataset, collate_fn, config, norm_metadata, device) ->
                 var_preds_denorm = var_preds
                 var_targets_denorm = var_targets
 
-            # Calculate errors
-            abs_error = np.abs(var_preds_denorm - var_targets_denorm)
-            signed_error = var_preds_denorm - var_targets_denorm
-
-            # Relative error with small epsilon to avoid division by zero
-            rel_error = abs_error / (np.abs(var_targets_denorm) + 1e-10)
-
-            errors[var_name]['absolute'].extend(abs_error.tolist())
-            errors[var_name]['relative'].extend(rel_error.tolist())
-            errors[var_name]['signed'].extend(signed_error.tolist())
+            # Calculate percent error
+            percent_error = 100 * np.abs(var_preds_denorm - var_targets_denorm) / (np.abs(var_targets_denorm) + 1e-10)
+            all_errors[var_name].extend(percent_error.tolist())
 
     # Convert to arrays
-    for var in errors:
-        for error_type in errors[var]:
-            errors[var][error_type] = np.array(errors[var][error_type])
+    for var in all_errors:
+        all_errors[var] = np.array(all_errors[var])
 
-    return errors
+    return all_errors
 
 
-def plot_error_distributions(errors: Dict):
-    """Create comprehensive error distribution plots."""
-    # Select key variables to analyze
-    key_vars = ['net_thermal_flux', 'net_reflected_flux'] if 'net_thermal_flux' in errors else list(errors.keys())[:2]
+def plot_error_analysis(errors):
+    """Create percent error and percentile plots with log scale."""
+    # Select key variables
+    key_vars = ['net_thermal_flux', 'net_reflected_flux']
+    if 'net_thermal_flux' not in errors:
+        key_vars = list(errors.keys())[:2]
 
-    fig, axes = plt.subplots(3, 2, figsize=(15, 12))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
-    for col, var_name in enumerate(key_vars):
-        if var_name not in errors:
+    for col, var_name in enumerate(key_vars[:2]):
+        if var_name not in errors or len(errors[var_name]) == 0:
             continue
 
-        var_errors = errors[var_name]
+        percent_errors = errors[var_name]
+        percent_errors = percent_errors[percent_errors > 0]  # Remove zeros for log scale
 
-        # 1. Histogram of absolute errors with fitted distribution
+        # Top plot: Percent error histogram with log y-axis
         ax = axes[0, col]
-        abs_errors = var_errors['absolute']
 
-        # Remove outliers for better visualization (keep 99%)
-        q99 = np.percentile(abs_errors, 99)
-        abs_errors_plot = abs_errors[abs_errors <= q99]
+        counts, bins, _ = ax.hist(percent_errors, bins=50, alpha=0.7,
+                                  color='steelblue', edgecolor='black')
+        ax.set_xlabel('Percent Error (%)')
+        ax.set_ylabel('Count')
+        ax.set_yscale('log')
+        ax.set_title(f'{var_name}')
+        ax.grid(True, alpha=0.3, which='both')
 
-        n, bins, patches = ax.hist(abs_errors_plot, bins=50, density=True,
-                                   alpha=0.7, color='blue', edgecolor='black')
+        # Add percentile lines
+        percentiles = [50, 75, 90, 95]
+        colors = ['green', 'orange', 'darkorange', 'red']
+        for p, c in zip(percentiles, colors):
+            val = np.percentile(percent_errors, p)
+            ax.axvline(val, color=c, linestyle='--', alpha=0.7, label=f'{p}th: {val:.1f}%')
 
-        # Fit and plot exponential distribution
-        if len(abs_errors_plot) > 0:
-            loc, scale = stats.expon.fit(abs_errors_plot)
-            x = np.linspace(0, abs_errors_plot.max(), 100)
-            ax.plot(x, stats.expon.pdf(x, loc, scale), 'r-', lw=2,
-                    label=f'Exponential fit\nλ={1 / scale:.2e}')
+        ax.legend(loc='upper right')
 
-        ax.set_xlabel('Absolute Error')
-        ax.set_ylabel('Density')
-        ax.set_title(f'{var_name}\nAbsolute Error Distribution')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-
-        # Add statistics text
-        ax.text(0.95, 0.95, f'Mean: {np.mean(abs_errors):.2e}\n'
-                            f'Median: {np.median(abs_errors):.2e}\n'
-                            f'95%: {np.percentile(abs_errors, 95):.2e}',
-                transform=ax.transAxes, va='top', ha='right',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-        # 2. Q-Q plot for normality check of signed errors
+        # Bottom plot: Percentile curve with log y-axis
         ax = axes[1, col]
-        signed_errors = var_errors['signed']
 
-        # Standardize errors
-        if len(signed_errors) > 0 and np.std(signed_errors) > 0:
-            standardized = (signed_errors - np.mean(signed_errors)) / np.std(signed_errors)
-            stats.probplot(standardized, dist="norm", plot=ax)
-            ax.set_title(f'{var_name}\nQ-Q Plot (Normality Check)')
-            ax.grid(True, alpha=0.3)
+        percentile_range = np.arange(0, 100, 1)
+        percentile_values = np.percentile(percent_errors, percentile_range)
 
-            # Add Shapiro-Wilk test result
-            if len(standardized) < 5000:  # Shapiro-Wilk has sample size limit
-                statistic, p_value = stats.shapiro(standardized[:5000])
-                ax.text(0.05, 0.95, f'Shapiro-Wilk p={p_value:.3f}\n'
-                                    f'{"Normal" if p_value > 0.05 else "Non-normal"}',
-                        transform=ax.transAxes, va='top',
-                        bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.3))
+        ax.plot(percentile_range, percentile_values, 'b-', linewidth=2)
+        ax.set_xlabel('Percentile')
+        ax.set_ylabel('Percent Error (%)')
+        ax.set_yscale('log')
+        ax.set_title(f'{var_name} Percentiles')
+        ax.grid(True, alpha=0.3, which='both')
 
-        # 3. Box plot comparing error quantiles
-        ax = axes[2, col]
+        # Mark key percentiles
+        key_percentiles = [50, 75, 90, 95, 99]
+        for p in key_percentiles:
+            val = np.percentile(percent_errors, p)
+            ax.plot(p, val, 'ro', markersize=6)
 
-        # Prepare data for box plot
-        rel_errors = var_errors['relative'] * 100  # Convert to percentage
-
-        # Create box plot with outliers
-        bp = ax.boxplot([abs_errors, np.abs(signed_errors)],
-                        labels=['Absolute', '|Signed|'],
-                        showfliers=True, patch_artist=True)
-
-        # Color the boxes
-        colors = ['lightblue', 'lightgreen']
-        for patch, color in zip(bp['boxes'], colors):
-            patch.set_facecolor(color)
-
-        ax.set_ylabel('Error Magnitude')
-        ax.set_title(f'{var_name}\nError Comparison')
-        ax.grid(True, alpha=0.3, axis='y')
-
-        # Add a second y-axis for relative errors
-        ax2 = ax.twinx()
-        bp2 = ax2.boxplot([rel_errors], positions=[3], widths=0.6,
-                          labels=['Relative (%)'], patch_artist=True)
-        bp2['boxes'][0].set_facecolor('lightyellow')
-        ax2.set_ylabel('Relative Error (%)')
-        ax2.tick_params(axis='y', labelcolor='orange')
-
-    plt.suptitle('Error Distribution Analysis', fontsize=16, y=1.02)
+    plt.suptitle('Model Error Analysis', fontsize=14)
     plt.tight_layout()
 
-    # Save plot
-    save_path = MODEL_DIR / "plots" / "error_distributions.png"
+    # Save
+    save_path = MODEL_DIR / "plots" / "error_analysis.png"
     save_path.parent.mkdir(exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"Saved: {save_path}")
 
 
-def plot_error_heatmap(errors: Dict, config: Dict):
-    """Create heatmap showing error patterns across variables."""
-    target_vars = config["data_specification"]["target_variables"]
-
-    # Create error summary matrix
-    metrics = ['Mean Abs', 'Median Abs', 'Std', '95th %ile', 'Max']
-    error_matrix = np.zeros((len(target_vars), len(metrics)))
-
-    for i, var in enumerate(target_vars):
-        if var in errors:
-            abs_err = errors[var]['absolute']
-            if len(abs_err) > 0:
-                error_matrix[i, 0] = np.mean(abs_err)
-                error_matrix[i, 1] = np.median(abs_err)
-                error_matrix[i, 2] = np.std(abs_err)
-                error_matrix[i, 3] = np.percentile(abs_err, 95)
-                error_matrix[i, 4] = np.max(abs_err)
-
-    # Normalize each column to [0, 1] for better visualization
-    for j in range(len(metrics)):
-        col_max = error_matrix[:, j].max()
-        if col_max > 0:
-            error_matrix[:, j] /= col_max
-
-    # Create heatmap
-    fig, ax = plt.subplots(figsize=(10, 8))
-    im = ax.imshow(error_matrix, cmap='YlOrRd', aspect='auto')
-
-    # Set ticks and labels
-    ax.set_xticks(np.arange(len(metrics)))
-    ax.set_yticks(np.arange(len(target_vars)))
-    ax.set_xticklabels(metrics)
-    ax.set_yticklabels(target_vars)
-
-    # Rotate the tick labels
-    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-
-    # Add colorbar
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label('Normalized Error Magnitude', rotation=270, labelpad=20)
-
-    # Add text annotations
-    for i in range(len(target_vars)):
-        for j in range(len(metrics)):
-            text = ax.text(j, i, f'{error_matrix[i, j]:.2f}',
-                           ha="center", va="center", color="black" if error_matrix[i, j] < 0.5 else "white")
-
-    ax.set_title('Error Metrics Heatmap (Normalized per Column)', fontsize=14, pad=20)
-    plt.tight_layout()
-
-    # Save
-    save_path = MODEL_DIR / "plots" / "error_heatmap.png"
-    save_path.parent.mkdir(exist_ok=True)
-    plt.savefig(save_path, dpi=150)
-    print(f"Saved: {save_path}")
-
-
 def main():
-    """Main analysis function."""
+    """Main analysis."""
     print("=" * 60)
-    print("ERROR DISTRIBUTION ANALYSIS")
+    print("ERROR ANALYSIS")
     print("=" * 60)
 
     print("\nLoading model and data...")
     model, dataset, collate_fn, config, norm_metadata, device = load_model_and_data()
 
-    print(f"Analyzing {len(dataset)} test samples...")
+    print(f"Analyzing {len(dataset)} samples...")
     errors = collect_errors(model, dataset, collate_fn, config, norm_metadata, device)
 
-    # Print summary statistics
+    # Print summary
     print("\n" + "=" * 60)
-    print("ERROR SUMMARY STATISTICS")
+    print("PERCENT ERROR SUMMARY")
     print("=" * 60)
 
-    for var_name in list(errors.keys())[:5]:  # Show first 5 variables
-        abs_err = errors[var_name]['absolute']
-        rel_err = errors[var_name]['relative'] * 100
+    for var_name in list(errors.keys())[:4]:
+        if len(errors[var_name]) > 0:
+            err = errors[var_name]
+            print(f"\n{var_name}:")
+            print(f"  Mean:   {np.mean(err):.1f}%")
+            print(f"  Median: {np.median(err):.1f}%")
+            print(f"  75th:   {np.percentile(err, 75):.1f}%")
+            print(f"  90th:   {np.percentile(err, 90):.1f}%")
+            print(f"  95th:   {np.percentile(err, 95):.1f}%")
+            print(f"  99th:   {np.percentile(err, 99):.1f}%")
 
-        print(f"\n{var_name}:")
-        print(f"  Absolute Error:")
-        print(f"    Mean:   {np.mean(abs_err):.3e}")
-        print(f"    Median: {np.median(abs_err):.3e}")
-        print(f"    95%:    {np.percentile(abs_err, 95):.3e}")
-        print(f"  Relative Error:")
-        print(f"    Mean:   {np.mean(rel_err):.1f}%")
-        print(f"    Median: {np.median(rel_err):.1f}%")
+    print("\nGenerating plots...")
+    plot_error_analysis(errors)
 
-    # Create visualizations
-    print("\nGenerating error distribution plots...")
-    plot_error_distributions(errors)
-
-    print("Generating error heatmap...")
-    plot_error_heatmap(errors, config)
-
-    print("\nAnalysis complete!")
+    print("\nComplete!")
 
 
 if __name__ == "__main__":
