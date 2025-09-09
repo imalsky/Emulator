@@ -23,7 +23,7 @@ WARMUP_ITERS: int = 5
 TIMING_ITERS: int = 20
 
 # Features
-ENABLE_COMPILE: bool = False   # Try torch.compile (Inductor) on CPU
+ENABLE_COMPILE: bool = True   # Try torch.compile (Inductor) on CPU
 
 # ========= ENV (set BEFORE heavy imports) =========
 # Keep CPU-only and minimize OpenMP drama (macOS/Homebrew/Conda mix)

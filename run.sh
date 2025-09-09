@@ -8,9 +8,9 @@
 #SBATCH -n 1
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=40G
+#SBATCH --mem=80G
 #SBATCH -A exoweather
-#SBATCH -t 24:00:00
+#SBATCH -t 48:00:00
 
 cd "$SLURM_SUBMIT_DIR"
 
@@ -38,5 +38,5 @@ done
 
 echo "------------------------------------------------"
 echo "Starting Python application..."
-python -u src/main.py train 2>&1
+python -u src/main.py --tune 2>&1
 echo "Job completed successfully."

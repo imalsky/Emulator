@@ -197,9 +197,9 @@ class ModelTrainer:
         if self.device.type == "cuda":
             logger.info("Applying GPU performance optimizations")
 
-            if not train_params.get("use_amp", False):
-                logger.info("Enabling AMP")
-                train_params["use_amp"] = True
+            # Respect config: do not auto-enable AMP
+            if train_params.get("use_amp", False):
+                logger.info("AMP enabled per config")
 
             current_batch_size = train_params.get("batch_size", DEFAULT_BATCH_SIZE)
             if self.trial is None and current_batch_size < 256:
@@ -300,11 +300,12 @@ class ModelTrainer:
         pin_memory = should_pin_memory()
         num_workers = misc_cfg.get("num_workers", DEFAULT_NUM_WORKERS)
         
-        # Ensure enough workers for GPU
-        if num_workers < 8 and self.device.type == "cuda":
-            logger.info(f"Increasing num_workers from {num_workers} to 8 for better GPU utilization")
-            num_workers = 8
-        
+        if misc_cfg.get("autotune_num_workers", False) and num_workers < 8 and self.device.type == "cuda":
+            new_workers = 8
+            logger.info(f"autotune_num_workers=True → increasing num_workers from {num_workers} to {new_workers}")
+            num_workers = new_workers        
+
+
         # Common DataLoader arguments
         dl_common = dict(
             batch_size=train_cfg.get("batch_size", DEFAULT_BATCH_SIZE),
@@ -313,10 +314,13 @@ class ModelTrainer:
             pin_memory=pin_memory,
         )
         
-        # Add persistent workers if using multiple workers
-        if num_workers > 0:
+
+        # Optional: persistent workers / prefetch only if explicitly enabled
+        if num_workers > 0 and misc_cfg.get("persistent_workers", False):
             dl_common["persistent_workers"] = True
-            dl_common["prefetch_factor"] = 4
+            dl_common["prefetch_factor"] = int(misc_cfg.get("prefetch_factor", 2))
+
+
         
         # Create DataLoaders
         self.train_loader = DataLoader(
@@ -381,7 +385,7 @@ class ModelTrainer:
         elif opt_name == "sgd":
             self.optimizer = optim.SGD(groups, lr=lr, momentum=0.9)
         else:  # Default to AdamW
-            self.optimizer = optim.AdamW(groups, lr=lr)
+            self.optimizer = optim.AdamW(groups, lr=lr, fused=(self.device.type == "cuda"))
         
         logger.info(f"Optimizer: {opt_name}  lr={lr:.2e}  wd={wd:.2e}")
     
@@ -450,10 +454,17 @@ class ModelTrainer:
         
         # Mixed precision training
         self.use_amp = tp.get("use_amp", False) and self.device.type == "cuda"
-        self.scaler = GradScaler(enabled=self.use_amp)
-        
         if self.use_amp:
-            logger.info("AMP (Automatic Mixed Precision) enabled.")
+            dev_name = torch.cuda.get_device_name(0)
+            self.amp_dtype = torch.bfloat16 if "A100" in dev_name else torch.float16
+        else:
+            self.amp_dtype = None
+        # GradScaler only for fp16; bf16 does not need scaling
+        self.scaler = GradScaler(enabled=self.use_amp and self.amp_dtype == torch.float16)
+
+        if self.use_amp:
+            logger.info(f"AMP (Automatic Mixed Precision) enabled with dtype={self.amp_dtype}.")
+
     
     def _setup_logging(self) -> None:
         """Setup training log file."""
@@ -664,7 +675,7 @@ class ModelTrainer:
             
             # Forward pass with autocast
             with torch.set_grad_enabled(is_train), autocast(
-                device_type=device_type, enabled=self.use_amp
+                device_type=device_type, enabled=self.use_amp, dtype=(self.amp_dtype if self.use_amp else torch.float32)
             ):
                 # Model forward
                 predictions = self.model(sequence, global_features, sequence_mask)

@@ -31,7 +31,7 @@ BATCH_SIZES: List[int] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
 # Warmup/timing (amortize Python overhead)
 WARMUP_CALLS = 20                # forwards per warmup block
-CALLS_PER_MEASUREMENT = 32       # forwards per timed block
+CALLS_PER_MEASUREMENT = 5       # forwards per timed block
 REPEATS = 5                      # number of timed blocks (for mean/std)
 
 # Plotting
@@ -112,29 +112,29 @@ def benchmark_bs(fn, batch: Dict[str, torch.Tensor]) -> Tuple[float, float]:
 
 def plot_results(batch_sizes: List[int], mean_ms: List[float], std_ms: List[float], threads: int) -> None:
     _safe_style()
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    fig, (ax2) = plt.subplots(1, 1, figsize=(8, 6))
 
     per_sample_mean = [m / bs for m, bs in zip(mean_ms, batch_sizes)]
     per_sample_std = [s / bs for s, bs in zip(std_ms, batch_sizes)]
-    ax1.errorbar(batch_sizes, per_sample_mean, yerr=per_sample_std, marker="o", markersize=6, capsize=4, linewidth=2)
-    ax1.set_xscale("log", base=2)
-    ax1.set_xlabel("Batch size")
-    ax1.set_ylabel("Time per sample (ms)")
-    ax1.set_title("Inference time per sample")
-    ax1.grid(True, alpha=0.3)
+    #ax1.errorbar(batch_sizes, per_sample_mean, yerr=per_sample_std, marker="o", markersize=6, capsize=4, linewidth=2)
+    #ax1.set_xscale("log", base=2)
+    #ax1.set_xlabel("Batch size")
+    #ax1.set_ylabel("Time per sample (ms)")
+    #ax1.set_title("Inference time per sample")
+    #ax1.grid(True, alpha=0.3)
 
     throughput = [bs / (m / 1000.0) for bs, m in zip(batch_sizes, mean_ms)]
     ax2.plot(batch_sizes, throughput, marker="s", markersize=6, linewidth=2)
     ax2.set_xscale("log", base=2)
     ax2.set_xlabel("Batch size")
     ax2.set_ylabel("Throughput (samples/s)")
-    ax2.set_title("Inference throughput")
-    ax2.grid(True, alpha=0.3)
+    #ax2.set_title("Inference throughput")
+    #ax2.grid(True, alpha=0.3)
 
-    best = int(np.argmax(throughput))
-    ax2.scatter(batch_sizes[best], throughput[best], s=160, marker="*", zorder=5)
+    #best = int(np.argmax(throughput))
+    #ax2.scatter(batch_sizes[best], throughput[best], s=160, marker="*", zorder=5)
 
-    fig.suptitle(f"CPU Inference Benchmark (threads={threads})")
+    #fig.suptitle(f"CPU Inference Benchmark (threads={threads})")
     fig.tight_layout()
 
     out_png = PLOT_DIR / "benchmark_cpu.png"

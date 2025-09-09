@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Test model predictions with denormalization and visualization."""
 import os
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import sys
 from pathlib import Path
@@ -22,8 +23,52 @@ plt.style.use('science.mplstyle')
 MODEL_DIR = Path("../models/trained_model")
 PROCESSED_DIR = Path("../data/processed/test")
 MODEL_FILE = 'final_model.pt2'
-N_SAMPLES = 5
+
+# Sample selection - specify exact indices to plot
+# Can be:
+#   - A list of specific indices: [0, 2, 5, 10, 15]
+#   - A range: list(range(0, 10, 2)) for even indices from 0-8
+#   - A slice: list(range(5))[:3] for first 3 of first 5
+SAMPLE_INDICES = [2, 4, 5, 6, 7]  # Modify this list to select specific samples
+
+
+# Alternatively, use these helper functions:
+def select_samples(mode='first', n=5, indices=None, total_samples=None):
+    """
+    Helper to select sample indices.
+
+    Args:
+        mode: 'first', 'last', 'random', 'custom', or 'evenly_spaced'
+        n: number of samples for 'first', 'last', 'random', 'evenly_spaced'
+        indices: list of specific indices for 'custom' mode
+        total_samples: total number of available samples (for 'last', 'random', 'evenly_spaced')
+
+    Returns:
+        List of sample indices
+    """
+    if mode == 'custom':
+        return indices if indices else []
+    elif mode == 'first':
+        return list(range(n))
+    elif mode == 'last' and total_samples:
+        return list(range(max(0, total_samples - n), total_samples))
+    elif mode == 'random' and total_samples:
+        import random
+        return sorted(random.sample(range(total_samples), min(n, total_samples)))
+    elif mode == 'evenly_spaced' and total_samples:
+        step = max(1, total_samples // n)
+        return list(range(0, total_samples, step))[:n]
+    else:
+        return list(range(n))
+
+
+# Example usage (uncomment one):
+# SAMPLE_INDICES = select_samples('first', n=5)
+# SAMPLE_INDICES = select_samples('custom', indices=[0, 5, 10, 15, 20])
+# SAMPLE_INDICES = select_samples('evenly_spaced', n=5, total_samples=100)
+
 plt.style.use('science.mplstyle')
+
 
 def load_normalization_metadata():
     """Load normalization metadata for denormalization."""
@@ -43,7 +88,7 @@ def denormalize_variable(data, var_name, norm_metadata):
     return data
 
 
-def load_model_and_data():
+def load_model_and_data(sample_indices):
     """Load exported model and test data."""
     # Find config file
     config_path = MODEL_DIR / "train_config.json"
@@ -61,8 +106,9 @@ def load_model_and_data():
     print(f"Loading exported model from: {model_path}")
     exported_model = torch.export.load(str(model_path))
 
-    # Load test dataset
-    test_dataset = create_dataset(PROCESSED_DIR, config, list(range(N_SAMPLES)))
+    # Load test dataset with all required indices
+    max_idx = max(sample_indices) if sample_indices else 0
+    test_dataset = create_dataset(PROCESSED_DIR, config, list(range(max_idx + 1)))
     collate_fn = create_collate_fn(PADDING_VALUE)
 
     return exported_model, test_dataset, collate_fn, config, device
@@ -85,10 +131,37 @@ def run_inference(model, batch_inputs, batch_masks, device):
     return output
 
 
-def test_predictions():
-    """Test model on samples and visualize results."""
-    model, dataset, collate_fn, config, device = load_model_and_data()
+def test_predictions(sample_indices=None):
+    """
+    Test model on samples and visualize results.
+
+    Args:
+        sample_indices: List of specific sample indices to plot.
+                       If None, uses global SAMPLE_INDICES.
+    """
+    if sample_indices is None:
+        sample_indices = SAMPLE_INDICES
+
+    if not sample_indices:
+        raise ValueError("No sample indices specified")
+
+    print(f"Processing samples at indices: {sample_indices}")
+
+    model, dataset, collate_fn, config, device = load_model_and_data(sample_indices)
     norm_metadata = load_normalization_metadata()
+
+    # Validate indices
+    available_samples = len(dataset)
+    valid_indices = [idx for idx in sample_indices if 0 <= idx < available_samples]
+
+    if not valid_indices:
+        raise ValueError(f"No valid indices. Dataset has {available_samples} samples, "
+                         f"but requested indices were: {sample_indices}")
+
+    if len(valid_indices) < len(sample_indices):
+        invalid = [idx for idx in sample_indices if idx not in valid_indices]
+        print(f"Warning: Skipping invalid indices {invalid} (dataset has {available_samples} samples)")
+        sample_indices = valid_indices
 
     # Get variable indices
     input_vars = config["data_specification"]["input_variables"]
@@ -105,12 +178,17 @@ def test_predictions():
         raise ValueError(f"Required flux variables not found. Available: {target_vars}")
 
     # Create figure
+    n_samples = len(sample_indices)
     fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
 
-    # Process samples
-    for i in range(min(N_SAMPLES, len(dataset))):
-        inputs, targets = dataset[i]
+    # Use viridis colormap for consistent, scientific visualization
+    colors = plt.cm.viridis(np.linspace(0, 0.9, n_samples))  # 0 to 0.9 to avoid very light yellows
+
+    # Process selected samples
+    for plot_idx, sample_idx in enumerate(sample_indices):
+        print(f"  Processing sample {sample_idx}...")
+
+        inputs, targets = dataset[sample_idx]
         batch_inputs, batch_masks, batch_targets, target_masks = collate_fn([(inputs, targets)])
 
         # Get predictions
@@ -123,6 +201,7 @@ def test_predictions():
         valid_idx = np.where(valid_mask)[0]
 
         if len(valid_idx) == 0:
+            print(f"    Warning: Sample {sample_idx} has no valid data points")
             continue
 
         # Get and denormalize pressure
@@ -149,77 +228,96 @@ def test_predictions():
         thermal_error = 100 * np.abs(thermal_pred - thermal_target) / (np.abs(thermal_target) + 1)
         reflected_error = 100 * np.abs(reflected_pred - reflected_target) / (np.abs(reflected_target) + 1)
 
-        color = colors[i % len(colors)]
+        color = colors[plot_idx]
 
-        # Plot thermal flux
+        # Use actual sample index in labels
+        label_suffix = f"Sample {sample_idx}"
+
+        # Plot thermal flux - only add label for first sample
+        thermal_target_label = "Target" if plot_idx == 0 else ""
+        thermal_pred_label = "Prediction" if plot_idx == 0 else ""
+
         axes[0, 0].plot(pressure_denorm, thermal_target, '-', color=color,
-                        label=f"Target {i + 1}", alpha=0.7, linewidth=2)
+                        label=thermal_target_label, alpha=0.7, linewidth=3)
         axes[0, 0].plot(pressure_denorm, thermal_pred, '--', color=color,
-                        label=f"Pred {i + 1}", alpha=0.7, linewidth=2)
+                        label=thermal_pred_label, alpha=0.7, linewidth=3)
 
-        # Plot thermal error
+        # Plot thermal error - keep individual sample labels
         axes[1, 0].plot(pressure_denorm, thermal_error, color=color,
-                        label=f"Sample {i + 1}", alpha=0.7, linewidth=2)
+                        label=label_suffix, alpha=0.7, linewidth=3)
 
-        # Plot reflected flux
+        # Plot reflected flux - only add label for first sample
+        reflected_target_label = "Target" if plot_idx == 0 else ""
+        reflected_pred_label = "Prediction" if plot_idx == 0 else ""
+
         axes[0, 1].plot(pressure_denorm, reflected_target, '-', color=color,
-                        label=f"Target {i + 1}", alpha=0.7, linewidth=2)
+                        label=reflected_target_label, alpha=0.7, linewidth=3)
         axes[0, 1].plot(pressure_denorm, reflected_pred, '--', color=color,
-                        label=f"Pred {i + 1}", alpha=0.7, linewidth=2)
+                        label=reflected_pred_label, alpha=0.7, linewidth=3)
 
-        # Plot reflected error
+        # Plot reflected error - keep individual sample labels
         axes[1, 1].plot(pressure_denorm, reflected_error, color=color,
-                        label=f"Sample {i + 1}", alpha=0.7, linewidth=2)
+                        label=label_suffix, alpha=0.7, linewidth=3)
 
     # Format subplots
     for ax in axes.flat:
         ax.set_xscale('log')
-        ax.grid(True, alpha=0.3, which='both')
 
     # Thermal flux
     axes[0, 0].set_yscale('symlog')
     axes[0, 0].set_xlabel("Pressure (bar)")
     axes[0, 0].set_ylabel("Net Thermal Flux (Ergs/cm²)")
-    axes[0, 0].set_title("Net Thermal Flux")
-    axes[0, 0].legend(fontsize=8)
+    #axes[0, 0].set_title("Net Thermal Flux")
+    axes[0, 0].set_ylim(-1e10, 1e10)
+    axes[0, 0].legend(fontsize=10, loc='best')
 
     axes[1, 0].set_yscale('log')
     axes[1, 0].set_xlabel("Pressure (bar)")
     axes[1, 0].set_ylabel("Percent Error (%)")
-    axes[1, 0].set_title("Thermal Flux Error")
-    axes[1, 0].legend(fontsize=8)
+    axes[1, 0].set_ylim(1e-3, 100)
+    #axes[1, 0].set_title("Thermal Flux Error")
+    #if n_samples <= 8:
+    #    axes[1, 0].legend(fontsize=8, loc='best')
 
     # Reflected flux
     axes[0, 1].set_yscale('symlog')
     axes[0, 1].set_xlabel("Pressure (bar)")
     axes[0, 1].set_ylabel("Net Reflected Flux (Ergs/cm²)")
-    axes[0, 1].set_title("Net Reflected Flux")
-    axes[0, 1].legend(fontsize=8)
+    #axes[0, 1].set_title("Net Reflected Flux")
+    axes[0, 1].set_ylim(-1e10, 1e1)
+    axes[0, 1].legend(fontsize=10, loc='best')
 
     axes[1, 1].set_yscale('log')
     axes[1, 1].set_xlabel("Pressure (bar)")
     axes[1, 1].set_ylabel("Percent Error (%)")
-    axes[1, 1].set_title("Reflected Flux Error")
-    axes[1, 1].legend(fontsize=8)
+    #axes[1, 1].set_title("Reflected Flux Error")
+    axes[1, 1].set_ylim(1e-3, 100)
+    #if n_samples <= 8:
+    #    axes[1, 1].legend(fontsize=8, loc='best')
 
     plt.tight_layout()
 
-    # Save plot
-    save_path = MODEL_DIR / "plots" / "flux_predictions.png"
+    # Save plot with informative filename
+    indices_str = "_".join(map(str, sample_indices[:5]))  # First 5 indices in filename
+    if len(sample_indices) > 5:
+        indices_str += f"_and_{len(sample_indices) - 5}_more"
+
+    save_path = MODEL_DIR / "plots" / f"flux_predictions_samples_{indices_str}.png"
     save_path.parent.mkdir(exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"Saved plot: {save_path}")
+    print(f"\nSaved plot: {save_path}")
 
     # Calculate and print metrics
-    print_metrics(model, dataset, collate_fn, config, norm_metadata, device)
+    print_metrics(model, dataset, collate_fn, config, norm_metadata, device, sample_indices)
 
 
-def print_metrics(model, dataset, collate_fn, config, norm_metadata, device):
-    """Calculate and print denormalized metrics."""
+def print_metrics(model, dataset, collate_fn, config, norm_metadata, device, sample_indices):
+    """Calculate and print denormalized metrics for specified samples."""
     target_vars = config["data_specification"]["target_variables"]
 
     print("\n" + "=" * 60)
-    print("DENORMALIZED METRICS (Physical Units)")
+    print(f"DENORMALIZED METRICS (Physical Units)")
+    print(f"Samples analyzed: {sample_indices}")
     print("=" * 60)
 
     for flux_name in ["net_thermal_flux", "net_reflected_flux"]:
@@ -230,9 +328,12 @@ def print_metrics(model, dataset, collate_fn, config, norm_metadata, device):
         all_preds = []
         all_targets = []
 
-        # Collect predictions
-        for i in range(min(N_SAMPLES, len(dataset))):
-            inputs, targets = dataset[i]
+        # Collect predictions for specified samples only
+        for sample_idx in sample_indices:
+            if sample_idx >= len(dataset):
+                continue
+
+            inputs, targets = dataset[sample_idx]
             batch_inputs, batch_masks, batch_targets, target_masks = collate_fn([(inputs, targets)])
 
             preds = run_inference(model, batch_inputs, batch_masks, device)
@@ -263,7 +364,12 @@ def print_metrics(model, dataset, collate_fn, config, norm_metadata, device):
             print(f"  MAE:  {mae:.3e} Ergs/cm²")
             print(f"  Target range: [{np.min(all_targets):.3e}, {np.max(all_targets):.3e}]")
             print(f"  Pred range:   [{np.min(all_preds):.3e}, {np.max(all_preds):.3e}]")
+            print(f"  Number of points: {len(all_preds)}")
 
 
 if __name__ == "__main__":
-    test_predictions()
+    # You can override the indices here or use the global SAMPLE_INDICES
+    # Examples:
+    # test_predictions([0, 10, 20, 30, 40])  # Specific indices
+    # test_predictions(select_samples('random', n=10, total_samples=100))  # Random selection
+    test_predictions()  # Uses SAMPLE_INDICES defined at top

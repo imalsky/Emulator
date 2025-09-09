@@ -18,7 +18,7 @@ def plot_training():
     
     df = pd.read_csv(log_path)
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     
     # Loss curves
     ax1.scatter(df["epoch"], df["train_loss"], color='black', label="Train", alpha=0.7)
@@ -35,15 +35,12 @@ def plot_training():
     ax1.set_ylabel("Loss (MSE)")
     ax1.set_yscale('log')
     ax1.legend()
-    ax1.set_title("Training Progression")
     
     # Learning rate
     ax2.semilogy(df["epoch"], df["lr"], color="black")
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Learning Rate")
-    ax2.grid(True, alpha=0.3)
-    ax2.set_title("Learning Rate Schedule")
-    
+
     plt.tight_layout()
     save_path = MODEL_DIR / "plots" / "training_curves.png"
     save_path.parent.mkdir(exist_ok=True)

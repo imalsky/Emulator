@@ -159,7 +159,7 @@ def create_reduced_config(
         original_epochs = config["training_hyperparameters"]["epochs"]
         logger.info(f"Keeping original epochs setting: {original_epochs}")
         reduced_config["training_hyperparameters"]["early_stopping_patience"] = min(10, original_epochs // 3)
-        reduced_config["training_hyperparameters"]["min_delta"] = 1e-4
+        reduced_config["training_hyperparameters"]["min_delta"] = 1e-8
 
     # Log what we're disabling for tuning
     logger.info("=== Settings disabled for hyperparameter tuning ===")
