@@ -3,7 +3,6 @@
 train.py - Optimized model training with correct padding mask handling.
 
 Features:
-- Async device prefetching for better GPU utilization
 - Mixed precision training with AMP
 - Gradient accumulation for large effective batch sizes
 - Early stopping with patience
