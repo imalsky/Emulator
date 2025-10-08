@@ -20,5 +20,9 @@ codebase_v*
 tuning_results/
 
 models/*
+testing/*
+
 
 rt_util/*
+# Local-only
+/testing/
