@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """
 main.py - Entry point with separate normalize, train, and tune commands.
-
-Commands:
-- normalize: Preprocess and normalize the data
-- train: Train a model with current configuration
-- tune: Run hyperparameter optimization with Optuna
 """
 from __future__ import annotations
 
@@ -14,7 +9,7 @@ import sys
 import argparse
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple
 
 import torch
 from torch.profiler import profile, ProfilerActivity, schedule
@@ -222,7 +217,7 @@ def run_normalize(
         config, processed_dir.parent, raw_hdf5_paths, model_save_dir
     )
 
-    # Force reprocessing if requested
+    # Force reprocessing
     if force:
         logger.info("Force flag set - removing existing processed data")
         import shutil

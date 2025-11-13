@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """
 hyperparam_search.py - Flexible Optuna hyperparameter optimization.
-
-Features:
-- Supports optional parameters (comment out in config to use defaults)
-- Reasonable pruning for efficiency
-- Automatic handling of d_model/nhead compatibility
-- Preserves config values unless explicitly in search space
-- Trial logging to text file
 """
 from __future__ import annotations
 
@@ -195,9 +188,6 @@ def suggest_parameter(
     """
     Suggest a parameter value or use default if not in search space.
 
-    IMPORTANT: Only suggests values if parameter is in search space,
-    otherwise returns the default (config) value unchanged.
-
     Args:
         trial: Optuna trial
         name: Parameter name
@@ -249,7 +239,7 @@ def run_optuna(
         padding_val: float,
         model_save_dir: Path,
 ) -> None:
-    """Run Optuna hyperparameter search with flexible parameter selection."""
+    """Run Optuna hyperparameter search"""
 
     # Check if directory already exists
     if model_save_dir.exists() and any(model_save_dir.iterdir()):
@@ -290,7 +280,7 @@ def run_optuna(
     # Check for very high film_clamp
     film_clamp = config.get("model_hyperparameters", {}).get("film_clamp", 2.0)
     if film_clamp > 100:
-        logger.warning(f"WARNING: film_clamp is very high ({film_clamp}). This essentially disables FiLM modulation.")
+        logger.warning(f"Film_clamp is very high ({film_clamp}). This essentially disables FiLM modulation.")
         logger.warning("         Consider adding 'film_clamp': {'low': 1.0, 'high': 5.0} to hyperparameter_search")
 
     # Check for disabled early stopping
@@ -534,13 +524,13 @@ def run_optuna(
     # Adjust pruner based on actual epochs being used
     actual_epochs = trial_config_base["training_hyperparameters"]["epochs"]
     warmup_epochs = trial_config_base["training_hyperparameters"].get("warmup_epochs", 0)
-    warmup_steps = max(warmup_epochs + 5, 12)  # was: min(8, actual_epochs // 4)
+    warmup_steps = max(warmup_epochs + 5, 12)
 
     pruner = AggressivePruner(
-        n_startup_trials=10,  # keep
+        n_startup_trials=10,
         n_warmup_steps=warmup_steps,
-        patience=10,  # was 5
-        min_improvement=5e-5,  # was 1e-5; avoid death by noise
+        patience=10,
+        min_improvement=5e-5,
     )
 
     logger.info(f"Pruner settings: warmup_steps={warmup_steps} (based on {actual_epochs} epochs)")

@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
 utils.py - Helper functions for configuration, logging, and data handling.
-
-This module provides utilities for:
-- Configuration file loading and validation (with JSON5 support)
-- Logging setup with file and console handlers
-- Random seed management for reproducibility
-- Dataset split generation and loading
-- JSON serialization with custom type handlers
-- Data integrity checking via hashing
 """
 from __future__ import annotations
 

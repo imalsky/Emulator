@@ -15,7 +15,6 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from hardware import setup_device
 from utils import DTYPE, PADDING_VALUE
 
 logger = logging.getLogger(__name__)
@@ -47,7 +46,8 @@ class DataNormalizer:
     def __init__(self, *, config_data: Dict[str, Any]):
         """Initialize normalizer with configuration."""
         self.config = config_data
-        # FORCE CPU for statistics calculation - MPS is inefficient for this
+
+        # FORCE CPU for statistics calculation
         self.device = torch.device("cpu")  # Changed from setup_device()
         self.norm_config = self.config.get("normalization", {})
         self.eps = float(self.norm_config.get("epsilon", DEFAULT_EPSILON))
@@ -288,7 +288,6 @@ class DataNormalizer:
             if "values" in key_acc:
                 vals = valid_data.flatten()
                 if vals.numel() == 0:
-                    # nothing to do; do NOT change total_values_seen
                     pass
                 else:
                     # Use the previous total (do not pre-increment anywhere else)
@@ -434,14 +433,9 @@ class DataNormalizer:
                     if tensor.numel() <= fallback_size:
                         raise e
                     
-                    logger.warning(
-                        f"Quantile failed for '{key}' on {tensor.numel():,} elements. "
-                        f"Subsampling to {fallback_size:,}."
-                    )
+                    logger.warning(f"Quantile failed for '{key}' on {tensor.numel():,} elements.")
                     
-                    perm = torch.randperm(tensor.numel(), device=tensor.device)[
-                        :fallback_size
-                    ]
+                    perm = torch.randperm(tensor.numel(), device=tensor.device)[:fallback_size]
                     subsampled = tensor.flatten()[perm]
                     return torch.quantile(subsampled, q_values)
                 raise e

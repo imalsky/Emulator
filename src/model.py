@@ -5,7 +5,6 @@ model.py - Optimized transformer model with FiLM conditioning and export compati
 Architecture:
 - Transformer encoder with sinusoidal positional encoding
 - FiLM (Feature-wise Linear Modulation) for global context conditioning
-- Export-friendly implementation avoiding dynamic control flow
 - Support for torch.compile and torch.export
 
 PADDING CONVENTION:
@@ -31,7 +30,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch.export import Dim, export as texport, save as tsave
 
-from utils import DTYPE, PADDING_VALUE, validate_config
+from utils import PADDING_VALUE, validate_config
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +165,7 @@ class DecomposedTransformerEncoderLayer(nn.Module):
             nhead: int,
             dim_feedforward: int = 2048,
             dropout: float = 0.1,
-            attention_dropout: float = 0.1,  # Separate attention dropout
+            attention_dropout: float = 0.1,
             activation: str = "gelu",
             norm_first: bool = True,
             batch_first: bool = True,
@@ -223,8 +222,7 @@ class DecomposedTransformerEncoderLayer(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Initialize weights with improved strategy."""
-        # Attention weights are initialized by MultiheadAttention
+        """Initialize weights."""
         # Initialize feedforward weights
         nn.init.xavier_uniform_(self.linear1.weight, gain=math.sqrt(2))
         nn.init.xavier_uniform_(self.linear2.weight)
@@ -257,7 +255,7 @@ class DecomposedTransformerEncoderLayer(nn.Module):
             x2, _ = self.self_attn(
                 x2, x2, x2,
                 attn_mask=src_mask,
-                key_padding_mask=src_key_padding_mask,  # True = padding
+                key_padding_mask=src_key_padding_mask,
                 need_weights=False
             )
             x = x + self.dropout1(x2)
@@ -274,7 +272,7 @@ class DecomposedTransformerEncoderLayer(nn.Module):
             x2, _ = self.self_attn(
                 x, x, x,
                 attn_mask=src_mask,
-                key_padding_mask=src_key_padding_mask,  # True = padding
+                key_padding_mask=src_key_padding_mask,
                 need_weights=False
             )
             x = x + self.dropout1(x2)
@@ -374,9 +372,6 @@ class PredictionModel(nn.Module):
     - Export-friendly implementation
     - Proper padding mask handling (no output overwriting)
     - Improved initialization and normalization
-
-    IMPORTANT: This model does NOT overwrite outputs at padding positions.
-    The loss function handles masking, following industry standards.
     """
 
     def __init__(
@@ -417,21 +412,18 @@ class PredictionModel(nn.Module):
         self.d_model = d_model
         self.has_global_features = global_input_dim > 0
 
-        # Set defaults following industry standards
+        # These really should be set
         if dim_feedforward is None:
-            dim_feedforward = 4 * d_model  # Standard ratio
+            dim_feedforward = 4 * d_model
         if attention_dropout is None:
             attention_dropout = dropout
 
-        # Note: We store padding_value for reference but don't use it for output masking
         self.padding_value = padding_value
 
-        # IMPROVED: Simplified input projection without activation after LayerNorm
-        # This is more standard and stable for transformers
+
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.LayerNorm(d_model)
-            # Removed GELU - LayerNorm as final step is cleaner
         )
 
         # Positional encoding
@@ -461,7 +453,6 @@ class PredictionModel(nn.Module):
         # Final normalization (important for stability)
         self.final_norm = nn.LayerNorm(d_model)
 
-        # IMPROVED: Better output projection for regression
         # - Intermediate layer with activation and dropout
         # - Final layer without activation (standard for regression)
         # - Lighter dropout before final projection
@@ -476,24 +467,16 @@ class PredictionModel(nn.Module):
         # Initialize weights
         self._init_weights()
 
-        # Log model statistics
-        # trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        # logger.info(
-        #    f"PredictionModel created with {trainable_params:,} trainable parameters. "
-        #    f"Architecture: d_model={d_model}, nhead={nhead}, layers={num_encoder_layers}, "
-        #    f"ffn_dim={dim_feedforward}, attn_dropout={attention_dropout:.2f}"
-        # )
-
     def _init_weights(self) -> None:
-        """Initialize weights with improved strategies per layer type."""
+        """Initialize weights"""
         for name, module in self.named_modules():
             # Skip already initialized layers
             if isinstance(module, (FiLMLayer, DecomposedTransformerEncoderLayer, TransformerBlock)):
-                continue  # These have their own initialization
+                continue
 
             if isinstance(module, nn.Linear):
                 # Check if this is the final output layer
-                if "output_proj" in name and "3" in name:  # Final layer in output_proj
+                if "output_proj" in name and "3" in name:
                     # Very small initialization for final regression layer
                     nn.init.trunc_normal_(module.weight, std=0.01)
                 elif "output_proj" in name:
@@ -550,12 +533,6 @@ class PredictionModel(nn.Module):
         # Project to output dimension
         output = self.output_proj(x)
 
-        # IMPORTANT: We do NOT mask the output here.
-        # The loss function handles masking, following industry standards.
-        # This allows the model to produce predictions for all positions,
-        # which can be useful for analysis, while the loss correctly
-        # ignores padding positions during training.
-
         return output
 
 
@@ -587,7 +564,7 @@ def create_prediction_model(
     d_model = model_params.get("d_model", 256)
     dim_feedforward = model_params.get("dim_feedforward")
     if dim_feedforward is None:
-        dim_feedforward = 4 * d_model  # Industry standard ratio
+        dim_feedforward = 4 * d_model
 
     # Create model with improved parameters
     model = PredictionModel(
@@ -637,9 +614,7 @@ def create_prediction_model(
         elif compile_enabled and device.type != "cuda":
             logger.info("torch.compile is only enabled for CUDA devices.")
 
-    # logger.info(f"Model moved to device: {device}")
     return model
-
 
 def export_model(
         model: nn.Module,
@@ -666,7 +641,6 @@ def export_model(
     if config is not None:
         export_enabled = config.get("miscellaneous_settings", {}).get("torch_export", True)
         if not export_enabled:
-            # logger.info("Model export disabled in config - skipping.")
             return
 
     model.eval()
@@ -694,7 +668,6 @@ def export_model(
     # Ensure batch size > 1 for dynamic shapes
     batch_size = sequence.shape[0]
     if batch_size == 1:
-        # Duplicate inputs for batch size 2
         export_sequence = torch.cat([sequence, sequence], dim=0)
         export_global = (
             torch.cat([global_features, global_features], dim=0)

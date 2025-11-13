@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
 """
-dataset.py - Optimized data loader with intelligent memory management.
-
-Features:
-- Automatic RAM vs disk-cache decision based on available memory
-- Memory mapping for large files
-- LRU cache for frequently accessed shards
-- Safe padding detection with epsilon tolerance
-
 PADDING CONVENTION:
 - Padding value: -9999.0 (defined in config)
 - Mask convention: True = padding position, False = valid position
@@ -39,6 +31,7 @@ from utils import DTYPE, PADDING_VALUE
 
 logger = logging.getLogger(__name__)
 
+FLOAT_COMPARISON = 1e-6
 
 class AtmosphericDataset(Dataset):
     """
@@ -50,7 +43,6 @@ class AtmosphericDataset(Dataset):
     Padding Convention:
     - Sequences are right-padded (padding at the end)
     - Padding positions have all features set to padding_value
-    - This is enforced during preprocessing
     """
     
     def __init__(
@@ -77,7 +69,6 @@ class AtmosphericDataset(Dataset):
         self.dir_path = dir_path
         self.config = config
 
-        # Keep the *requested* indices for reporting, but load using validated indices
         self.indices = list(indices)
         self.force_disk_loading = force_disk_loading
         
@@ -91,7 +82,7 @@ class AtmosphericDataset(Dataset):
         self.padding_value = float(data_spec.get("padding_value", PADDING_VALUE))
 
         # Tolerance for floating-point comparison
-        self.padding_epsilon = 1e-6  
+        self.padding_epsilon = FLOAT_COMPARISON
         
         # Load shard metadata first to determine structure
         self._load_metadata()
@@ -456,10 +447,6 @@ def pad_collate(
     Creates padding masks by comparing values to padding sentinel
     within an epsilon tolerance to handle floating point precision.
     
-    IMPORTANT MASK CONVENTION:
-    - True = padding position (should be ignored)
-    - False = valid position (should be processed)
-    
     This follows PyTorch's convention for key_padding_mask in attention.
     
     Args:
@@ -478,7 +465,6 @@ def pad_collate(
     
     # Create padding mask (True = padding position)
     # A timestep is considered padding if ALL features equal padding_value
-    # This is correct because preprocessing pads all features together
     seq_mask = (torch.abs(seq - padding_value) < padding_epsilon).all(dim=-1)
     
     # Build batched inputs and masks
@@ -499,10 +485,7 @@ def pad_collate(
     # Validate that sequence and target masks match
     # (padding positions should be the same for inputs and targets)
     if not torch.equal(seq_mask, tgt_mask):
-        logger.warning(
-            "Sequence and target padding masks don't match! "
-            "This indicates a preprocessing issue."
-        )
+        logger.warning("Sequence and target padding masks don't match!")
     
     return batched, masks, tgt, tgt_mask
 

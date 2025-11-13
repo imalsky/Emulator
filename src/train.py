@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""
-train.py - Optimized model training with correct padding mask handling.
-
-Features:
-- Mixed precision training with AMP
-- Gradient accumulation for large effective batch sizes
-- Early stopping with patience
-- Learning rate scheduling
-- Hardware-specific optimizations
-- Proper loss masking for padded sequences
-
-PADDING CONVENTION:
-- Mask values: True = padding position, False = valid position
-- Loss computation only includes valid positions
-- No output overwriting - follows industry standards
-"""
 from __future__ import annotations
 
 import gc
@@ -312,15 +296,12 @@ class ModelTrainer:
             collate_fn=collate_fn,
             pin_memory=pin_memory,
         )
-        
 
         # Optional: persistent workers / prefetch only if explicitly enabled
         if num_workers > 0 and misc_cfg.get("persistent_workers", False):
             dl_common["persistent_workers"] = True
             dl_common["prefetch_factor"] = int(misc_cfg.get("prefetch_factor", 2))
 
-
-        
         # Create DataLoaders
         self.train_loader = DataLoader(
             self.train_ds, shuffle=True, drop_last=False, **dl_common
@@ -636,12 +617,7 @@ class ModelTrainer:
     def _run_epoch(self, loader: Optional[DataLoader], is_train: bool) -> Optional[float]:
         """
         Run one epoch of training or validation.
-        
-        IMPORTANT: This method correctly handles padding masks:
-        - target_masks has True for padding positions
-        - valid_mask = ~target_masks (True for valid positions)
-        - Loss is computed only on valid positions
-        
+
         Args:
             loader: DataLoader for the epoch
             is_train: Whether this is a training epoch
@@ -682,8 +658,7 @@ class ModelTrainer:
                 # Compute unreduced loss
                 unreduced_loss = self.criterion(predictions, targets)
                 
-                # IMPORTANT: Create valid mask (inverse of padding mask)
-                # target_masks has True for padding, we want True for valid
+                # Target_masks has True for padding, but need True for valid
                 valid_mask = (~target_masks).unsqueeze(-1).expand_as(unreduced_loss)
                 
                 # Count valid elements
@@ -715,9 +690,7 @@ class ModelTrainer:
                     
                     # Gradient clipping
                     if self.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.max_grad_norm
-                        )
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     
                     # Optimizer step
                     if self.use_amp:
@@ -809,9 +782,6 @@ class ModelTrainer:
         # Save checkpoint
         checkpoint_path = self.save_dir / "best_model.pt"
         torch.save(checkpoint, checkpoint_path)
-        #logger.info(f"Saved best model (epoch {self.best_epoch}).")
-        
-        # Export model for deployment
         self._export_model()
     
     def _export_model(self) -> None:
@@ -850,7 +820,6 @@ class ModelTrainer:
         except Exception as e:
             logger.error(f"Model export failed: {e}", exc_info=True)
         finally:
-            # CRITICAL: Clean up the temporary model
             if 'model_for_export' in locals():
                 del model_for_export
             

@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """
 preprocess.py - Preprocess raw HDF5 data into normalized NPY shards.
-
-This module handles:
-- Loading raw atmospheric profile data from HDF5 files
-- Applying normalization using computed statistics
-- Padding sequences to maximum length
-- Saving processed data as NPY shards for efficient loading
 """
 from __future__ import annotations
 
@@ -254,9 +248,7 @@ def preprocess_data(
         logger.error("Failed to save normalization metadata.")
         return False
     
-    logger.info(
-        f"Normalization metadata computed and saved in {time.time() - start_time:.2f}s."
-    )
+    logger.info(f"Normalization metadata computed and saved in {time.time() - start_time:.2f}s.")
     
     # Prepare for processing
     file_map = {path.stem: path for path in raw_hdf5_paths if path.is_file()}

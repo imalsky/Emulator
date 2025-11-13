@@ -56,7 +56,7 @@
       "net_reflected_flux": "symlog"
     },
     "default_method": "standard",
-    "epsilon": 1e-09,
+    "epsilon": 1e-9,
     "quantile_max_values_in_memory": 100000,
     "symlog_percentile": 0.01
   },
@@ -67,7 +67,7 @@
     "dim_feedforward": 1024,
     "dropout": 0.0,
     "attention_dropout": 0.0,
-    "film_clamp": 1000.0,
+    "film_clamp": 10.0,
     "max_sequence_length": 100
   },
   "training_hyperparameters": {
